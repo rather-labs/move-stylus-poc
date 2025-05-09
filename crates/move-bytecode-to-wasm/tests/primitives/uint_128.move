@@ -1,4 +1,4 @@
-module 0x01::hello_world;
+module 0x01::uint_128;
 
 const INT_AS_CONST: u128 = 128128;
 
@@ -21,7 +21,7 @@ public fun get_local(_z: u128): u128 {
 }
 
 // Forces the compiler to store literals on locals
-public fun get_copied_local(): u128 {
+public fun get_copied_local(): (u128, u128) {
   let x: u128 = 100;
   
   let y = x; // copy
@@ -30,7 +30,7 @@ public fun get_copied_local(): u128 {
   identity(z);
 
   z = 111;
-  y
+  (y, z)
 }
 
 public fun echo(x: u128): u128 {

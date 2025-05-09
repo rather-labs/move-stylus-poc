@@ -1,5 +1,8 @@
-use move_binary_format::file_format::Signature;
 use walrus::{FunctionId, InstrSeqBuilder, LocalId, Module, ValType, ir::BinaryOp};
+
+use crate::translation::{
+    functions::add_unpack_function_return_values_instructions, intermediate_types::ISignature,
+};
 
 use super::{
     function_encoding::{AbiFunctionSelector, move_signature_to_abi_selector},
@@ -12,29 +15,20 @@ use super::{
 ///
 /// It allows functions to be executed as contracts calls, by unpacking the arguments using `read_args` from the host,
 /// injecting these arguments in the functions and packing the return values using `write_result` host function.
-#[derive(Clone)]
 pub struct PublicFunction {
     function_id: FunctionId,
     function_selector: AbiFunctionSelector,
-    function_arguments_signature: Signature,
-    function_return_signature: Signature,
+    signature: ISignature,
 }
 
 impl PublicFunction {
-    pub fn new(
-        function_id: FunctionId,
-        function_name: &str,
-        function_arguments_signature: &Signature,
-        function_return_signature: &Signature,
-    ) -> Self {
-        let function_selector =
-            move_signature_to_abi_selector(function_name, function_arguments_signature);
+    pub fn new(function_id: FunctionId, function_name: &str, signature: ISignature) -> Self {
+        let function_selector = move_signature_to_abi_selector(function_name, &signature.arguments);
 
         Self {
             function_id,
             function_selector,
-            function_arguments_signature: function_arguments_signature.clone(),
-            function_return_signature: function_return_signature.clone(),
+            signature,
         }
     }
 
@@ -55,6 +49,7 @@ impl PublicFunction {
         args_pointer: LocalId,
         args_len: LocalId,
         write_return_data_function: FunctionId,
+        storage_flush_cache_function: FunctionId,
         allocator_func: FunctionId,
     ) {
         router_builder.block(None, |block| {
@@ -78,7 +73,7 @@ impl PublicFunction {
             block.local_set(args_len);
 
             // Wrap function to pack/unpack parameters
-            self.wrap_public_function(module, block, args_pointer, args_len, allocator_func);
+            self.wrap_public_function(module, block, args_pointer, allocator_func);
 
             // Stack: [return_data_pointer] [return_data_length] [status]
             let status = module.locals.add(ValType::I32);
@@ -88,7 +83,8 @@ impl PublicFunction {
             // Stack: [return_data_pointer] [return_data_length]
             block.call(write_return_data_function);
 
-            // TODO: flush cache??
+            block.i32_const(0); // Do not clear cache
+            block.call(storage_flush_cache_function);
 
             // Return status
             block.local_get(status);
@@ -105,7 +101,6 @@ impl PublicFunction {
         module: &mut Module,
         block: &mut InstrSeqBuilder,
         args_pointer: LocalId,
-        args_length: LocalId,
         allocator_func: FunctionId,
     ) {
         let memory_id = module.get_memory_id().expect("memory not found");
@@ -113,16 +108,22 @@ impl PublicFunction {
         build_unpack_instructions(
             block,
             module,
-            &self.function_arguments_signature,
+            &self.signature.arguments,
             args_pointer,
-            args_length,
             memory_id,
+            allocator_func,
         );
         block.call(self.function_id);
+        add_unpack_function_return_values_instructions(
+            block,
+            &mut module.locals,
+            &self.signature.returns,
+            memory_id,
+        );
 
         build_pack_instructions(
             block,
-            &self.function_return_signature,
+            &self.signature.returns,
             module,
             memory_id,
             allocator_func,
@@ -137,14 +138,18 @@ impl PublicFunction {
 #[cfg(test)]
 mod tests {
     use alloy::{dyn_abi::SolType, sol};
-    use move_binary_format::file_format::{Signature, SignatureToken};
     use walrus::{
         FunctionBuilder, MemoryId, ModuleConfig,
         ir::{LoadKind, MemArg},
     };
     use wasmtime::{Caller, Engine, Extern, Linker, Module as WasmModule, Store, TypedFunc};
 
-    use crate::{hostio::host_functions, memory::setup_module_memory, utils::display_module};
+    use crate::{
+        hostio::host_functions,
+        memory::setup_module_memory,
+        translation::{functions::prepare_function_return, intermediate_types::IntermediateType},
+        utils::display_module,
+    };
 
     use super::*;
 
@@ -196,6 +201,10 @@ mod tests {
             )
             .unwrap();
 
+        linker
+            .func_wrap("vm_hooks", "storage_flush_cache", |_: i32| Ok(()))
+            .unwrap();
+
         let mut store = Store::new(&engine, ());
         let instance = linker.instantiate(&mut store, &module).unwrap();
 
@@ -224,6 +233,7 @@ mod tests {
     ) {
         // Build mock router
         let (write_return_data_function, _) = host_functions::write_result(module);
+        let (storage_flush_cache_function, _) = host_functions::storage_flush_cache(module);
 
         let selector = module.locals.add(ValType::I32);
         let args_pointer = module.locals.add(ValType::I32);
@@ -263,6 +273,7 @@ mod tests {
             args_pointer,
             args_len,
             write_return_data_function,
+            storage_flush_cache_function,
             allocator_func,
         );
 
@@ -281,7 +292,7 @@ mod tests {
         let mut function_builder = FunctionBuilder::new(
             &mut raw_module.types,
             &[ValType::I32, ValType::I32, ValType::I64],
-            &[ValType::I32, ValType::I32, ValType::I64],
+            &[ValType::I32],
         );
 
         let param1 = raw_module.locals.add(ValType::I32);
@@ -303,22 +314,33 @@ mod tests {
         func_body.i64_const(1);
         func_body.binop(BinaryOp::I64Add);
 
+        let returns = vec![
+            IntermediateType::IU32,
+            IntermediateType::IU16,
+            IntermediateType::IU64,
+        ];
+        prepare_function_return(
+            &mut raw_module.locals,
+            &mut func_body,
+            &returns,
+            memory_id,
+            allocator_func,
+        );
+
         let function = function_builder.finish(vec![param1, param2, param3], &mut raw_module.funcs);
         raw_module.exports.add("test_function", function);
 
         let public_function = PublicFunction::new(
             function,
             "test_function",
-            &Signature(vec![
-                SignatureToken::Bool,
-                SignatureToken::U16,
-                SignatureToken::U64,
-            ]),
-            &Signature(vec![
-                SignatureToken::U32,
-                SignatureToken::U16,
-                SignatureToken::U64,
-            ]),
+            ISignature {
+                arguments: vec![
+                    IntermediateType::IBool,
+                    IntermediateType::IU16,
+                    IntermediateType::IU64,
+                ],
+                returns,
+            },
         );
 
         let mut data =
@@ -354,7 +376,7 @@ mod tests {
         let mut function_builder = FunctionBuilder::new(
             &mut raw_module.types,
             &[ValType::I32, ValType::I32, ValType::I64],
-            &[ValType::I32, ValType::I32, ValType::I64],
+            &[ValType::I32],
         );
 
         let param1 = raw_module.locals.add(ValType::I32);
@@ -371,10 +393,12 @@ mod tests {
         func_body.local_get(param2);
         func_body.i32_const(1);
         func_body.binop(BinaryOp::I32Add);
+        func_body.drop();
 
         func_body.local_get(param3);
         func_body.i64_const(1);
         func_body.binop(BinaryOp::I64Add);
+        func_body.drop();
 
         let function = function_builder.finish(vec![param1, param2, param3], &mut raw_module.funcs);
         raw_module.exports.add("test_function", function);
@@ -382,16 +406,14 @@ mod tests {
         let public_function = PublicFunction::new(
             function,
             "test_function",
-            &Signature(vec![
-                SignatureToken::U32,
-                SignatureToken::U32,
-                SignatureToken::U64,
-            ]),
-            &Signature(vec![
-                SignatureToken::U32,
-                SignatureToken::U32,
-                SignatureToken::U64,
-            ]),
+            ISignature {
+                arguments: vec![
+                    IntermediateType::IU32,
+                    IntermediateType::IU32,
+                    IntermediateType::IU64,
+                ],
+                returns: vec![IntermediateType::IU32],
+            },
         );
 
         let mut data =

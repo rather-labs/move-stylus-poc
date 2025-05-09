@@ -4,7 +4,7 @@
 use super::reroot_path;
 use clap::*;
 use move_bytecode_source_map::utils::serialize_to_json_string;
-use move_bytecode_to_wasm::translate_package;
+use move_bytecode_to_wasm::translate_package_cli;
 use move_compiler::compiled_unit::NamedCompiledModule;
 use move_disassembler::disassembler::Disassembler;
 use move_package::{compilation::compiled_package::CompiledUnitWithSource, BuildConfig};
@@ -43,8 +43,6 @@ impl Disassemble {
         } = self;
         // Make sure the package is built
         let package = config.compile_package(&rerooted_path, &mut Vec::new())?;
-
-        translate_package(&package, &rerooted_path);
 
         let needle_package = package_name
             .as_deref()
@@ -87,6 +85,8 @@ impl Disassemble {
                 }
             }
         }
+
+        translate_package_cli(&package, &rerooted_path);
         Ok(())
     }
 }

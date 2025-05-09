@@ -1,207 +1,156 @@
-use alloy_sol_types::{SolType, sol_data};
-use move_binary_format::file_format::{Signature, SignatureToken};
-use walrus::{
-    InstrSeqBuilder, LocalId, MemoryId, Module, ValType,
-    ir::{BinaryOp, LoadKind, MemArg},
+use walrus::{FunctionId, InstrSeqBuilder, LocalId, MemoryId, Module, ValType};
+
+use crate::translation::intermediate_types::{
+    IntermediateType,
+    address::IAddress,
+    boolean::IBool,
+    heap_integers::{IU128, IU256},
+    simple_integers::{IU8, IU16, IU32, IU64},
+    vector::IVector,
 };
 
-use crate::utils::{add_swap_i32_bytes_function, add_swap_i64_bytes_function};
+mod unpack_heap_int;
+mod unpack_native_int;
+mod unpack_vector;
+
+pub trait Unpackable {
+    /// Adds the instructions to unpack the abi encoded type to WASM function parameters
+    ///
+    /// Each parameter is decoded and loaded in the WASM stack. Complex data types are kept in memory
+    /// and the pointer is pushed onto the stack in the parameter location.
+    ///
+    /// The reader pointer should be updated internally when a value is read from the args
+    /// The calldata reader pointer should never be updated, it is considered static for each type value
+    ///
+    /// The stack at the end contains the value(or pointer to the value) as **i32/i64**
+    fn add_unpack_instructions(
+        &self,
+        function_builder: &mut InstrSeqBuilder,
+        module: &mut Module,
+        reader_pointer: LocalId,
+        calldata_reader_pointer: LocalId,
+        memory: MemoryId,
+        allocator: FunctionId,
+    );
+}
 
 /// Builds the instructions to unpack the abi encoded values to WASM function parameters
 ///
 /// Each parameter is decoded and loaded in the WASM stack. Complex data types are kept in memory
 /// and the pointer is pushed onto the stack in the parameter location.
-pub fn build_unpack_instructions(
+pub fn build_unpack_instructions<T: Unpackable>(
     function_builder: &mut InstrSeqBuilder,
     module: &mut Module,
-    function_arguments_signature: &Signature,
+    function_arguments_signature: &[T],
     args_pointer: LocalId,
-    args_len: LocalId,
     memory: MemoryId,
+    allocator: FunctionId,
 ) {
-    let length = module.locals.add(ValType::I32);
-    function_builder.i32_const(0);
-    function_builder.local_set(length);
+    let reader_pointer = module.locals.add(ValType::I32);
+    let calldata_reader_pointer = module.locals.add(ValType::I32);
 
-    for signature_token in function_arguments_signature.0.iter() {
-        add_unpack_instruction_for_signature_token(
+    function_builder.local_get(args_pointer);
+    function_builder.local_tee(reader_pointer);
+    function_builder.local_set(calldata_reader_pointer);
+
+    // The ABI encoded params are always a tuple
+    // Static types are stored in-place, but dynamic types are referenced to the call data
+    for signature_token in function_arguments_signature.iter() {
+        signature_token.add_unpack_instructions(
             function_builder,
-            signature_token,
-            args_pointer,
-            memory,
-            length,
             module,
+            reader_pointer,
+            calldata_reader_pointer,
+            memory,
+            allocator,
         );
-
-        function_builder.local_get(length);
-        function_builder.binop(BinaryOp::I32Add);
-        function_builder.local_set(length);
     }
-
-    // Validation block
-    function_builder.block(None, |block| {
-        let block_id = block.id();
-
-        // Validate that current offset matches (args_pointer + args_len)
-        // To ensure all bytes are consumed and no extra bytes are left
-        block.local_get(args_len);
-        block.local_get(length);
-        block.binop(BinaryOp::I32Eq);
-        block.br_if(block_id);
-        block.unreachable(); // Throws an error
-    });
 }
 
-/// Adds the instructions to unpack the abi type
-///
-/// Each parameter is decoded and loaded in the WASM stack. Complex data types are kept in memory
-/// and a pointer is pushed onto the stack in the parameter location.
-///
-/// Each block will leave the length of the unpacked value in the WASM stack.
-fn add_unpack_instruction_for_signature_token(
-    block: &mut InstrSeqBuilder,
-    signature_token: &SignatureToken,
-    args_pointer: LocalId,
-    memory: MemoryId,
-    prev_length: LocalId,
-    module: &mut Module,
-) {
-    match signature_token {
-        SignatureToken::Bool => {
-            let encoded_size = sol_data::Bool::ENCODED_SIZE.expect("Bool should have a fixed size");
-
-            // Load the value
-            block.local_get(args_pointer);
-            block.local_get(prev_length);
-            block.binop(BinaryOp::I32Add);
-            block.load(
+impl Unpackable for IntermediateType {
+    fn add_unpack_instructions(
+        &self,
+        function_builder: &mut InstrSeqBuilder,
+        module: &mut Module,
+        reader_pointer: LocalId,
+        calldata_reader_pointer: LocalId,
+        memory: MemoryId,
+        allocator: FunctionId,
+    ) {
+        match self {
+            IntermediateType::IBool => IBool::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
                 memory,
-                LoadKind::I32 { atomic: false },
-                MemArg {
-                    align: 0,
-                    // Abi is left-padded to 32 bytes
-                    offset: 28,
-                },
-            );
-            // Big-endian to Little-endian
-            let swap_i32_bytes_function = add_swap_i32_bytes_function(module);
-            block.call(swap_i32_bytes_function);
-
-            block.i32_const(encoded_size as i32);
-        }
-        SignatureToken::U8 => {
-            let encoded_size =
-                sol_data::Uint::<8>::ENCODED_SIZE.expect("U8 should have a fixed size");
-
-            // Load the value
-            block.local_get(args_pointer);
-            block.local_get(prev_length);
-            block.binop(BinaryOp::I32Add);
-            block.load(
+                allocator,
+            ),
+            IntermediateType::IU8 => IU8::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
                 memory,
-                LoadKind::I32 { atomic: false },
-                MemArg {
-                    align: 0,
-                    // Abi is left-padded to 32 bytes
-                    offset: 28,
-                },
-            );
-            // Big-endian to Little-endian
-            let swap_i32_bytes_function = add_swap_i32_bytes_function(module);
-            block.call(swap_i32_bytes_function);
-
-            block.i32_const(encoded_size as i32);
-        }
-        SignatureToken::U16 => {
-            let encoded_size =
-                sol_data::Uint::<16>::ENCODED_SIZE.expect("U16 should have a fixed size");
-
-            // Load the value
-            block.local_get(args_pointer);
-            block.local_get(prev_length);
-            block.binop(BinaryOp::I32Add);
-            block.load(
+                allocator,
+            ),
+            IntermediateType::IU16 => IU16::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
                 memory,
-                LoadKind::I32 { atomic: false },
-                MemArg {
-                    align: 0,
-                    // Abi is left-padded to 32 bytes
-                    offset: 28,
-                },
-            );
-            // Big-endian to Little-endian
-            let swap_i32_bytes_function = add_swap_i32_bytes_function(module);
-            block.call(swap_i32_bytes_function);
-
-            block.i32_const(encoded_size as i32);
-        }
-        SignatureToken::U32 => {
-            let encoded_size =
-                sol_data::Uint::<32>::ENCODED_SIZE.expect("U32 should have a fixed size");
-
-            // Load the value
-            block.local_get(args_pointer);
-            block.local_get(prev_length);
-            block.binop(BinaryOp::I32Add);
-            block.load(
+                allocator,
+            ),
+            IntermediateType::IU32 => IU32::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
                 memory,
-                LoadKind::I32 { atomic: false },
-                MemArg {
-                    align: 0,
-                    // Abi is left-padded to 32 bytes
-                    offset: 28,
-                },
-            );
-            // Big-endian to Little-endian
-            let swap_i32_bytes_function = add_swap_i32_bytes_function(module);
-            block.call(swap_i32_bytes_function);
-
-            block.i32_const(encoded_size as i32);
-        }
-        SignatureToken::U64 => {
-            let encoded_size =
-                sol_data::Uint::<64>::ENCODED_SIZE.expect("U64 should have a fixed size");
-
-            // Load the value
-            block.local_get(args_pointer);
-            block.local_get(prev_length);
-            block.binop(BinaryOp::I32Add);
-            block.load(
+                allocator,
+            ),
+            IntermediateType::IU64 => IU64::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
                 memory,
-                LoadKind::I64 { atomic: false },
-                MemArg {
-                    align: 0,
-                    // Abi is left-padded to 32 bytes
-                    offset: 24,
-                },
-            );
-            // Big-endian to Little-endian
-            let swap_i64_bytes_function = add_swap_i64_bytes_function(module);
-            block.call(swap_i64_bytes_function);
-
-            block.i32_const(encoded_size as i32);
-        }
-        SignatureToken::U128 => {
-            panic!("U128 is not supported yet"); // TODO
-        }
-        SignatureToken::U256 => {
-            panic!("U256 is not supported yet"); // TODO
-        }
-        SignatureToken::Address => {
-            panic!("Address is not supported yet"); // TODO
-        }
-        SignatureToken::Vector(_) => panic!("Vector is not supported"), // TODO
-        SignatureToken::Signer => panic!("Signer is not supported"), // TODO: review how to handle this on public functions
-        SignatureToken::Datatype(_) => panic!("Datatype is not supported yet"), // TODO
-        SignatureToken::TypeParameter(_) => panic!("TypeParameter is not supported"), // TODO
-        SignatureToken::DatatypeInstantiation(_) => {
-            panic!("DatatypeInstantiation is not supported") // TODO
-        }
-        SignatureToken::Reference(_) => {
-            panic!("Reference is not allowed as a public function argument")
-        }
-        SignatureToken::MutableReference(_) => {
-            panic!("MutableReference is not allowed as a public function argument")
+                allocator,
+            ),
+            IntermediateType::IU128 => IU128::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
+                memory,
+                allocator,
+            ),
+            IntermediateType::IU256 => IU256::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
+                memory,
+                allocator,
+            ),
+            IntermediateType::IAddress => IAddress::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
+                memory,
+                allocator,
+            ),
+            IntermediateType::IVector(inner) => IVector::add_unpack_instructions(
+                inner,
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
+                memory,
+                allocator,
+            ),
         }
     }
 }
@@ -209,7 +158,6 @@ fn add_unpack_instruction_for_signature_token(
 #[cfg(test)]
 mod tests {
     use alloy::{dyn_abi::SolType, sol};
-    use move_binary_format::file_format::Signature;
     use walrus::{FunctionBuilder, FunctionId, MemoryId, ModuleConfig, ValType};
     use wasmtime::{Engine, IntoFunc, Linker, Module as WasmModule, Store, TypedFunc, WasmParams};
 
@@ -259,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_build_unpack_instructions() {
-        let (mut raw_module, _, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module();
 
         let validator_func_type = raw_module
             .types
@@ -277,14 +225,14 @@ mod tests {
         build_unpack_instructions(
             &mut func_body,
             &mut raw_module,
-            &Signature(vec![
-                SignatureToken::Bool,
-                SignatureToken::U16,
-                SignatureToken::U64,
-            ]),
+            &[
+                IntermediateType::IBool,
+                IntermediateType::IU16,
+                IntermediateType::IU64,
+            ],
             args_pointer,
-            args_len,
             memory_id,
+            allocator_func,
         );
 
         // validation
@@ -317,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_build_unpack_instructions_reversed() {
-        let (mut raw_module, _, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module();
 
         let validator_func_type = raw_module
             .types
@@ -335,14 +283,14 @@ mod tests {
         build_unpack_instructions(
             &mut func_body,
             &mut raw_module,
-            &Signature(vec![
-                SignatureToken::U64,
-                SignatureToken::U16,
-                SignatureToken::Bool,
-            ]),
+            &[
+                IntermediateType::IU64,
+                IntermediateType::IU16,
+                IntermediateType::IBool,
+            ],
             args_pointer,
-            args_len,
             memory_id,
+            allocator_func,
         );
 
         // validation
@@ -374,60 +322,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unreachable")]
-    fn test_build_unpack_instructions_invalid_data_length() {
-        let (mut raw_module, _, memory_id) = build_module();
-
-        let validator_func_type = raw_module
-            .types
-            .add(&[ValType::I64, ValType::I32, ValType::I32], &[]);
-        let (validator_func, _) = raw_module.add_import_func("", "validator", validator_func_type);
-
-        let mut function_builder =
-            FunctionBuilder::new(&mut raw_module.types, &[ValType::I32, ValType::I32], &[]);
-
-        let args_len = raw_module.locals.add(ValType::I32);
-        let args_pointer = raw_module.locals.add(ValType::I32);
-
-        let mut func_body = function_builder.func_body();
-        // Args data should already be stored in memory
-        build_unpack_instructions(
-            &mut func_body,
-            &mut raw_module,
-            &Signature(vec![
-                SignatureToken::U64,
-                SignatureToken::U16,
-                SignatureToken::Bool,
-            ]),
-            args_pointer,
-            args_len,
-            memory_id,
-        );
-
-        // validation
-        func_body.call(validator_func);
-
-        let function = function_builder.finish(vec![args_pointer, args_len], &mut raw_module.funcs);
-        raw_module.exports.add("test_function", function);
-
-        display_module(&mut raw_module);
-
-        let data = <sol!((uint64, uint16))>::abi_encode_params(&(123456789012345, 1234));
-        println!("data: {:?}", data);
-        let data_len = data.len() as i32;
-        let (_, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), _>(
-            &mut raw_module,
-            data,
-            "test_function",
-            |_: u64, _: u32, _: u32| {},
-        );
-
-        entrypoint.call(&mut store, (0, data_len)).unwrap();
-    }
-
-    #[test]
     fn test_build_unpack_instructions_offset_memory() {
-        let (mut raw_module, _, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module();
 
         let validator_func_type = raw_module
             .types
@@ -445,14 +341,14 @@ mod tests {
         build_unpack_instructions(
             &mut func_body,
             &mut raw_module,
-            &Signature(vec![
-                SignatureToken::Bool,
-                SignatureToken::U16,
-                SignatureToken::U64,
-            ]),
+            &[
+                IntermediateType::IBool,
+                IntermediateType::IU16,
+                IntermediateType::IU64,
+            ],
             args_pointer,
-            args_len,
             memory_id,
+            allocator_func,
         );
 
         // validation

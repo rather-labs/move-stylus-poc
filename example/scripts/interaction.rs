@@ -26,8 +26,8 @@ async fn main() -> eyre::Result<()> {
     abigen!(
         Example,
         r#"[
-            function hello_world() external view returns (uint32)
-            function echo(uint32 x) external view returns (uint32)
+            function echo(uint128 x) external view returns (uint128)
+            function getCopiedLocal() external view returns (uint128)
         ]"#
     );
 
@@ -46,8 +46,8 @@ async fn main() -> eyre::Result<()> {
     let num = example.echo(123).call().await;
     println!("Example echo = {:?}", num);
 
-    let num = example.hello_world().call().await;
-    println!("Example hello_world = {:?}", num);
+    let num = example.get_copied_local().call().await;
+    println!("Example getCopiedLocal = {:?}", num);
 
     Ok(())
 }
