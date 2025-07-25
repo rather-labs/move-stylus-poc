@@ -1,10 +1,11 @@
 use walrus::{
-    FunctionBuilder, FunctionId, MemoryId, Module, ValType,
+    FunctionBuilder, FunctionId, Module, ValType,
     ir::{BinaryOp, LoadKind, MemArg},
 };
 
 use crate::{
-    abi_types::public_function::PublicFunction, runtime_error_codes::ERROR_NO_FUNCTION_MATCH,
+    CompilationContext, abi_types::public_function::PublicFunction,
+    runtime_error_codes::ERROR_NO_FUNCTION_MATCH,
 };
 
 use super::host_functions;
@@ -15,13 +16,14 @@ use super::host_functions;
 /// Status is 0 for success and non-zero for failure.
 pub fn build_entrypoint_router(
     module: &mut Module,
-    allocator_func: FunctionId,
-    memory_id: MemoryId,
     functions: &[PublicFunction],
+    compilation_ctx: &CompilationContext,
 ) {
     let (read_args_function, _) = host_functions::read_args(module);
     let (write_return_data_function, _) = host_functions::write_result(module);
     let (storage_flush_cache_function, _) = host_functions::storage_flush_cache(module);
+    let (tx_origin_function, _) = host_functions::tx_origin(module);
+    let (emit_log_function, _) = host_functions::emit_log(module);
 
     let args_len = module.locals.add(ValType::I32);
     let selector_variable = module.locals.add(ValType::I32);
@@ -45,14 +47,14 @@ pub fn build_entrypoint_router(
 
     // Load function args to memory
     router_builder.local_get(args_len);
-    router_builder.call(allocator_func);
+    router_builder.call(compilation_ctx.allocator);
     router_builder.local_tee(args_pointer);
     router_builder.call(read_args_function);
 
     // Load selector from first 4 bytes of args
     router_builder.local_get(args_pointer);
     router_builder.load(
-        memory_id,
+        compilation_ctx.memory_id,
         LoadKind::I32 { atomic: false },
         MemArg {
             align: 0,
@@ -70,7 +72,9 @@ pub fn build_entrypoint_router(
             args_len,
             write_return_data_function,
             storage_flush_cache_function,
-            allocator_func,
+            tx_origin_function,
+            emit_log_function,
+            compilation_ctx,
         );
     }
 
@@ -90,56 +94,41 @@ pub fn add_entrypoint(module: &mut Module, func: FunctionId) {
 
 #[cfg(test)]
 mod tests {
-    use walrus::{MemoryId, ModuleConfig};
     use wasmtime::{Caller, Engine, Extern, Linker, Module as WasmModule, Store, TypedFunc};
 
     use crate::{
-        memory::setup_module_memory, translation::intermediate_types::ISignature,
-        utils::display_module,
+        test_compilation_context, test_tools::build_module,
+        translation::intermediate_types::ISignature, utils::display_module,
     };
 
     use super::*;
 
-    fn build_module() -> (Module, FunctionId, MemoryId) {
-        let config = ModuleConfig::new();
-        let mut module = Module::with_config(config);
-        let (allocator_func, memory_id) = setup_module_memory(&mut module);
-
-        (module, allocator_func, memory_id)
-    }
-
-    fn add_noop_function(module: &mut Module) -> PublicFunction {
+    fn add_noop_function<'a>(
+        module: &mut Module,
+        signature: &'a ISignature,
+        compilation_ctx: &CompilationContext,
+    ) -> PublicFunction<'a> {
         // Noop function
         let mut noop_builder = FunctionBuilder::new(&mut module.types, &[], &[]);
         noop_builder.func_body();
 
         let noop = noop_builder.finish(vec![], &mut module.funcs);
 
-        PublicFunction::new(
-            noop,
-            "noop",
-            ISignature {
-                arguments: vec![],
-                returns: vec![],
-            },
-        )
+        PublicFunction::new(noop, "noop", signature, compilation_ctx)
     }
 
-    fn add_noop_2_function(module: &mut Module) -> PublicFunction {
+    fn add_noop_2_function<'a>(
+        module: &mut Module,
+        signature: &'a ISignature,
+        compilation_ctx: &CompilationContext,
+    ) -> PublicFunction<'a> {
         // Noop function
         let mut noop_builder = FunctionBuilder::new(&mut module.types, &[], &[]);
         noop_builder.func_body();
 
         let noop = noop_builder.finish(vec![], &mut module.funcs);
 
-        PublicFunction::new(
-            noop,
-            "noop_2",
-            ISignature {
-                arguments: vec![],
-                returns: vec![],
-            },
-        )
+        PublicFunction::new(noop, "noop_2", signature, compilation_ctx)
     }
 
     struct ReadArgsData {
@@ -160,6 +149,12 @@ mod tests {
         let mut linker = Linker::new(&engine);
 
         let mem_export = module.get_export_index("memory").unwrap();
+        let get_memory = move |caller: &mut Caller<'_, ReadArgsData>| match caller
+            .get_module_export(&mem_export)
+        {
+            Some(Extern::Memory(mem)) => mem,
+            _ => panic!("failed to find host memory"),
+        };
 
         linker
             .func_wrap(
@@ -168,10 +163,7 @@ mod tests {
                 move |mut caller: Caller<'_, ReadArgsData>, args_ptr: u32| {
                     println!("read_args");
 
-                    let mem = match caller.get_module_export(&mem_export) {
-                        Some(Extern::Memory(mem)) => mem,
-                        _ => panic!("failed to find host memory"),
-                    };
+                    let mem = get_memory(&mut caller);
 
                     let args_data = caller.data().data.clone();
                     println!("args_data: {:?}", args_data);
@@ -196,6 +188,41 @@ mod tests {
             .func_wrap("vm_hooks", "storage_flush_cache", |_: i32| {})
             .unwrap();
 
+        linker
+            .func_wrap(
+                "vm_hooks",
+                "tx_origin",
+                move |mut caller: Caller<'_, ReadArgsData>, ptr: u32| {
+                    println!("tx_origin, writing in {ptr}");
+
+                    let mem = get_memory(&mut caller);
+
+                    // Write 0x7357 address
+                    let test_address =
+                        &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 3, 5, 7];
+
+                    mem.write(&mut caller, ptr as usize, test_address).unwrap();
+                },
+            )
+            .unwrap();
+
+        linker
+            .func_wrap(
+                "vm_hooks",
+                "emit_log",
+                move |mut caller: Caller<'_, ReadArgsData>, ptr: u32, len: u32, _topic: u32| {
+                    println!("emit_log, reading from {ptr}, length: {len}");
+
+                    let mem = get_memory(&mut caller);
+                    let mut buffer = vec![0; len as usize];
+
+                    mem.read(&mut caller, ptr as usize, &mut buffer).unwrap();
+
+                    println!("read memory: {buffer:?}");
+                },
+            )
+            .unwrap();
+
         let mut store = Store::new(&engine, data);
         let instance = linker.instantiate(&mut store, &module).unwrap();
 
@@ -208,15 +235,19 @@ mod tests {
 
     #[test]
     fn test_build_entrypoint_router_noop() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
-
-        let noop = add_noop_function(&mut raw_module);
-        let noop_2 = add_noop_2_function(&mut raw_module);
+        let (mut raw_module, allocator_func, memory_id) = build_module(None);
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let signature = ISignature {
+            arguments: vec![],
+            returns: vec![],
+        };
+        let noop = add_noop_function(&mut raw_module, &signature, &compilation_ctx);
+        let noop_2 = add_noop_2_function(&mut raw_module, &signature, &compilation_ctx);
 
         let noop_selector_data = noop.get_selector().to_vec();
         let noop_2_selector_data = noop_2.get_selector().to_vec();
 
-        build_entrypoint_router(&mut raw_module, allocator_func, memory_id, &[noop, noop_2]);
+        build_entrypoint_router(&mut raw_module, &[noop, noop_2], &compilation_ctx);
         display_module(&mut raw_module);
 
         let data = ReadArgsData {
@@ -243,12 +274,16 @@ mod tests {
     #[test]
     #[should_panic(expected = "unreachable")]
     fn test_build_entrypoint_router_no_data() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module(None);
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let signature = ISignature {
+            arguments: vec![],
+            returns: vec![],
+        };
+        let noop = add_noop_function(&mut raw_module, &signature, &compilation_ctx);
+        let noop_2 = add_noop_2_function(&mut raw_module, &signature, &compilation_ctx);
 
-        let noop = add_noop_function(&mut raw_module);
-        let noop_2 = add_noop_2_function(&mut raw_module);
-
-        build_entrypoint_router(&mut raw_module, allocator_func, memory_id, &[noop, noop_2]);
+        build_entrypoint_router(&mut raw_module, &[noop, noop_2], &compilation_ctx);
         display_module(&mut raw_module);
 
         // Invalid selector
@@ -262,12 +297,16 @@ mod tests {
 
     #[test]
     fn test_build_entrypoint_router_no_match() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module(None);
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let signature = ISignature {
+            arguments: vec![],
+            returns: vec![],
+        };
+        let noop = add_noop_function(&mut raw_module, &signature, &compilation_ctx);
+        let noop_2 = add_noop_2_function(&mut raw_module, &signature, &compilation_ctx);
 
-        let noop = add_noop_function(&mut raw_module);
-        let noop_2 = add_noop_2_function(&mut raw_module);
-
-        build_entrypoint_router(&mut raw_module, allocator_func, memory_id, &[noop, noop_2]);
+        build_entrypoint_router(&mut raw_module, &[noop, noop_2], &compilation_ctx);
         display_module(&mut raw_module);
 
         // Invalid selector

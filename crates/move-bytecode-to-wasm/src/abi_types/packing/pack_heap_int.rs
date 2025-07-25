@@ -4,11 +4,12 @@ use walrus::{
 };
 
 use crate::{
+    runtime::RuntimeFunction,
     translation::intermediate_types::{
         address::IAddress,
         heap_integers::{IU128, IU256},
+        signer::ISigner,
     },
-    utils::add_swap_i64_bytes_function,
 };
 
 impl IU128 {
@@ -20,7 +21,7 @@ impl IU128 {
         memory: MemoryId,
     ) {
         // Little-endian to Big-endian
-        let swap_i64_bytes_function = add_swap_i64_bytes_function(module);
+        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None);
 
         for i in 0..2 {
             block.local_get(writer_pointer);
@@ -60,7 +61,7 @@ impl IU256 {
         memory: MemoryId,
     ) {
         // Little-endian to Big-endian
-        let swap_i64_bytes_function = add_swap_i64_bytes_function(module);
+        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None);
 
         for i in 0..4 {
             block.local_get(writer_pointer);
@@ -123,60 +124,37 @@ impl IAddress {
     }
 }
 
+impl ISigner {
+    pub fn add_pack_instructions(
+        block: &mut InstrSeqBuilder,
+        module: &mut Module,
+        local: LocalId,
+        writer_pointer: LocalId,
+        memory: MemoryId,
+    ) {
+        IAddress::add_pack_instructions(block, module, local, writer_pointer, memory)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use alloy::{
-        dyn_abi::SolType,
-        hex::FromHex,
-        primitives::{Address, U256},
-        sol,
-    };
-    use walrus::{FunctionBuilder, FunctionId, MemoryId, ModuleConfig, ValType};
-    use wasmtime::{Engine, Instance, Linker, Module as WasmModule, Store, TypedFunc, WasmResults};
+    use alloy_primitives::{Address, U256, address};
+    use alloy_sol_types::{SolType, sol};
+    use walrus::{FunctionBuilder, ValType};
 
     use crate::{
-        abi_types::packing::Packable, memory::setup_module_memory,
+        abi_types::packing::Packable,
+        test_compilation_context,
+        test_tools::{build_module, setup_wasmtime_module},
         translation::intermediate_types::IntermediateType,
     };
 
-    use super::*;
-
-    fn build_module() -> (Module, FunctionId, MemoryId) {
-        let config = ModuleConfig::new();
-        let mut module = Module::with_config(config);
-        let (allocator_func, memory_id) = setup_module_memory(&mut module);
-
-        (module, allocator_func, memory_id)
-    }
-
-    fn setup_wasmtime_module<R: WasmResults>(
-        module: &mut Module,
-        function_name: &str,
-        initial_memory_data: Vec<u8>,
-    ) -> (Linker<()>, Instance, Store<()>, TypedFunc<(), R>) {
-        let engine = Engine::default();
-        let module = WasmModule::from_binary(&engine, &module.emit_wasm()).unwrap();
-
-        let linker = Linker::new(&engine);
-
-        let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).unwrap();
-
-        let entrypoint = instance
-            .get_typed_func::<(), R>(&mut store, function_name)
-            .unwrap();
-
-        let memory = instance.get_memory(&mut store, "memory").unwrap();
-        memory.write(&mut store, 0, &initial_memory_data).unwrap();
-
-        (linker, instance, store, entrypoint)
-    }
-
     fn test_uint(int_type: impl Packable, data: &[u8], expected_result: &[u8]) {
-        let (mut raw_module, alloc_function, memory_id) = build_module();
+        let (mut raw_module, alloc_function, memory_id) = build_module(None);
 
         let mut function_builder =
             FunctionBuilder::new(&mut raw_module.types, &[], &[ValType::I32]);
+        let compilation_ctx = test_compilation_context!(memory_id, alloc_function);
 
         let local = raw_module.locals.add(ValType::I32);
         let writer_pointer = raw_module.locals.add(ValType::I32);
@@ -188,7 +166,7 @@ mod tests {
         func_body.call(alloc_function);
         func_body.local_set(local);
 
-        func_body.i32_const(int_type.encoded_size() as i32);
+        func_body.i32_const(int_type.encoded_size(&compilation_ctx) as i32);
         func_body.call(alloc_function);
         func_body.local_set(writer_pointer);
 
@@ -199,8 +177,7 @@ mod tests {
             local,
             writer_pointer,
             writer_pointer, // unused for this type
-            memory_id,
-            alloc_function,
+            &compilation_ctx,
         );
 
         func_body.local_get(writer_pointer);
@@ -209,10 +186,10 @@ mod tests {
         raw_module.exports.add("test_function", function);
 
         let (_, instance, mut store, entrypoint) =
-            setup_wasmtime_module::<i32>(&mut raw_module, "test_function", data.to_vec());
+            setup_wasmtime_module(&mut raw_module, data.to_vec(), "test_function", None);
 
         // the return is the pointer to the packed value
-        let result = entrypoint.call(&mut store, ()).unwrap();
+        let result: i32 = entrypoint.call(&mut store, ()).unwrap();
 
         let memory = instance.get_memory(&mut store, "memory").unwrap();
         let mut result_memory_data = vec![0; expected_result.len()];
@@ -300,22 +277,37 @@ mod tests {
         let expected_result = SolType::abi_encode_params(&(Address::ZERO,));
         test_uint(int_type.clone(), &expected_result, &expected_result);
 
-        let expected_result = SolType::abi_encode_params(&(Address::from_hex(
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .unwrap(),));
+        let expected_result =
+            SolType::abi_encode_params(&(address!("0x1234567890abcdef1234567890abcdef12345678"),));
         test_uint(int_type.clone(), &expected_result, &expected_result);
 
-        let expected_result = SolType::abi_encode_params(&(Address::from_hex(
-            "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        )
-        .unwrap(),));
+        let expected_result =
+            SolType::abi_encode_params(&(address!("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),));
         test_uint(int_type.clone(), &expected_result, &expected_result);
 
-        let expected_result = SolType::abi_encode_params(&(Address::from_hex(
-            "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE",
-        )
-        .unwrap(),));
+        let expected_result =
+            SolType::abi_encode_params(&(address!("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE"),));
+        test_uint(int_type.clone(), &expected_result, &expected_result);
+    }
+
+    #[test]
+    fn test_pack_signer() {
+        type SolType = sol!((address,));
+        let int_type = IntermediateType::ISigner;
+
+        let expected_result = SolType::abi_encode_params(&(Address::ZERO,));
+        test_uint(int_type.clone(), &expected_result, &expected_result);
+
+        let expected_result =
+            SolType::abi_encode_params(&(address!("0x1234567890abcdef1234567890abcdef12345678"),));
+        test_uint(int_type.clone(), &expected_result, &expected_result);
+
+        let expected_result =
+            SolType::abi_encode_params(&(address!("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),));
+        test_uint(int_type.clone(), &expected_result, &expected_result);
+
+        let expected_result =
+            SolType::abi_encode_params(&(address!("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE"),));
         test_uint(int_type.clone(), &expected_result, &expected_result);
     }
 }

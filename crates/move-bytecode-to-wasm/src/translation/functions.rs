@@ -1,122 +1,82 @@
-use anyhow::Result;
-use move_binary_format::file_format::{CodeUnit, Constant, FunctionDefinition, Signature};
+use std::collections::HashMap;
+
+use move_binary_format::file_format::{
+    DatatypeHandleIndex, FunctionDefinition, Signature, SignatureToken, Visibility,
+};
 use walrus::{
-    FunctionBuilder, FunctionId, InstrSeqBuilder, LocalId, MemoryId, Module, ModuleLocals, ValType,
+    InstrSeqBuilder, MemoryId, Module, ValType,
     ir::{LoadKind, MemArg, StoreKind},
 };
 
-use crate::translation::{intermediate_types::ISignature, map_bytecode_instruction};
+use crate::{CompilationContext, UserDefinedType, translation::intermediate_types::ISignature};
 
-use super::intermediate_types::{IntermediateType, SignatureTokenToIntermediateType};
+use super::{intermediate_types::IntermediateType, table::FunctionId};
 
+#[derive(Debug)]
 pub struct MappedFunction {
-    pub id: FunctionId,
-    pub name: String,
+    pub function_id: FunctionId,
     pub signature: ISignature,
-    pub move_definition: FunctionDefinition,
-    pub move_code_unit: CodeUnit,
-    pub local_variables: Vec<LocalId>,
+    pub locals: Vec<IntermediateType>,
+    pub arguments: Vec<IntermediateType>,
+    pub results: Vec<ValType>,
+
+    /// Flag that tells us if the function can be used as an entrypoint
+    pub is_entry: bool,
+
+    /// Flag that tells us if the function is a native function
+    pub is_native: bool,
 }
 
 impl MappedFunction {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        name: String,
-        move_arguments: &Signature,
-        move_returns: &Signature,
-        move_definition: &FunctionDefinition,
-        module: &mut Module,
-        move_module_signatures: &[Signature],
+        function_id: FunctionId,
+        move_args: &Signature,
+        move_rets: &Signature,
+        move_locals: &[SignatureToken],
+        function_definition: &FunctionDefinition,
+        handles_map: &HashMap<DatatypeHandleIndex, UserDefinedType>,
     ) -> Self {
-        assert!(
-            move_definition.acquires_global_resources.is_empty(),
-            "Acquiring global resources is not supported yet"
-        );
+        let signature = ISignature::from_signatures(move_args, move_rets, handles_map);
+        let results = signature.get_return_wasm_types();
 
-        let code = move_definition.code.clone().expect("Function has no code");
+        assert!(results.len() <= 1, "Multiple return values not supported");
 
-        let signature = ISignature::from_signatures(move_arguments, move_returns);
-        let function_arguments = signature.get_argument_wasm_types();
-        let function_returns = signature.get_return_wasm_types();
-
-        assert!(
-            function_returns.len() <= 1,
-            "Multiple return values is not enabled in Stylus VM"
-        );
-
-        let mut local_variables: Vec<LocalId> = function_arguments
+        let arguments = move_args
+            .0
             .iter()
-            .map(|arg| module.locals.add(*arg))
-            .collect();
+            .map(|s| IntermediateType::try_from_signature_token(s, handles_map))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
-        let function_builder =
-            FunctionBuilder::new(&mut module.types, &function_arguments, &function_returns);
-
-        // Building an empty function to get the function id
-        let id = function_builder.finish(local_variables.clone(), &mut module.funcs);
-
-        let move_locals = &code.locals;
-        let mapped_locals = map_signature(&move_module_signatures[move_locals.0 as usize]);
-        let mapped_locals: Vec<LocalId> = mapped_locals
+        // Declared locals
+        let locals = move_locals
             .iter()
-            .map(|arg| module.locals.add(*arg))
-            .collect();
-
-        local_variables.extend(mapped_locals);
+            .map(|s| IntermediateType::try_from_signature_token(s, handles_map))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         Self {
-            id,
-            name,
+            function_id,
             signature,
-            move_definition: move_definition.clone(),
-            move_code_unit: code,
-            local_variables,
+            locals,
+            arguments,
+            results,
+            // TODO: change to function_definition.is_entry
+            is_entry: function_definition.visibility == Visibility::Public,
+            is_native: function_definition.is_native(),
         }
-    }
-
-    pub fn translate_function(
-        &self,
-        module: &mut Module,
-        constant_pool: &[Constant],
-        function_ids: &[FunctionId],
-        memory: MemoryId,
-        allocator: FunctionId,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            self.move_code_unit.jump_tables.is_empty(),
-            "Jump tables are not supported yet"
-        );
-
-        let mut builder = module
-            .funcs
-            .get_mut(self.id)
-            .kind
-            .unwrap_local_mut()
-            .builder_mut()
-            .func_body();
-
-        for instruction in self.move_code_unit.code.iter() {
-            map_bytecode_instruction(
-                instruction,
-                constant_pool,
-                function_ids,
-                &mut builder,
-                self,
-                &mut module.locals,
-                allocator,
-                memory,
-            );
-        }
-
-        Ok(())
     }
 }
 
-pub fn map_signature(signature: &Signature) -> Vec<ValType> {
-    signature
-        .0
-        .iter()
-        .map(|token| token.to_intermediate_type().to_wasm_type())
-        .collect()
+impl MappedFunction {
+    pub fn get_local_ir(&self, local_index: usize) -> &IntermediateType {
+        if local_index < self.arguments.len() {
+            &self.arguments[local_index]
+        } else {
+            &self.locals[local_index - self.arguments.len()]
+        }
+    }
 }
 
 /// Adds the instructions to unpack the return values from memory
@@ -124,7 +84,7 @@ pub fn map_signature(signature: &Signature) -> Vec<ValType> {
 /// The returns values are read from memory and pushed to the stack
 pub fn add_unpack_function_return_values_instructions(
     builder: &mut InstrSeqBuilder,
-    module_locals: &mut ModuleLocals,
+    module: &mut Module,
     returns: &[IntermediateType],
     memory: MemoryId,
 ) {
@@ -132,7 +92,7 @@ pub fn add_unpack_function_return_values_instructions(
         return;
     }
 
-    let pointer = module_locals.add(ValType::I32);
+    let pointer = module.locals.add(ValType::I32);
     builder.local_set(pointer);
 
     let mut offset = 0;
@@ -162,26 +122,25 @@ pub fn add_unpack_function_return_values_instructions(
 /// This is necessary because the Stylus VM does not support multiple return values
 /// Values are written to memory and a pointer to the first value is returned
 pub fn prepare_function_return(
-    module_locals: &mut ModuleLocals,
+    module: &mut Module,
     builder: &mut InstrSeqBuilder,
     returns: &[IntermediateType],
-    memory: MemoryId,
-    allocator: FunctionId,
+    compilation_ctx: &CompilationContext,
 ) {
     if !returns.is_empty() {
         let mut locals = Vec::new();
         let mut total_size = 0;
         for return_ty in returns.iter().rev() {
-            let local = return_ty.add_stack_to_local_instructions(module_locals, builder);
+            let local = return_ty.add_stack_to_local_instructions(module, builder);
             locals.push(local);
             total_size += return_ty.stack_data_size();
         }
         locals.reverse();
 
-        let pointer = module_locals.add(ValType::I32);
+        let pointer = module.locals.add(ValType::I32);
 
         builder.i32_const(total_size as i32);
-        builder.call(allocator);
+        builder.call(compilation_ctx.allocator);
         builder.local_set(pointer);
 
         let mut offset = 0;
@@ -190,13 +149,13 @@ pub fn prepare_function_return(
             builder.local_get(*local);
             if return_ty.stack_data_size() == 4 {
                 builder.store(
-                    memory,
+                    compilation_ctx.memory_id,
                     StoreKind::I32 { atomic: false },
                     MemArg { align: 0, offset },
                 );
             } else if return_ty.stack_data_size() == 8 {
                 builder.store(
-                    memory,
+                    compilation_ctx.memory_id,
                     StoreKind::I64 { atomic: false },
                     MemArg { align: 0, offset },
                 );

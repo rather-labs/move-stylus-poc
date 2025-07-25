@@ -1,16 +1,27 @@
-use walrus::{FunctionId, InstrSeqBuilder, LocalId, MemoryId, Module, ValType};
+use walrus::{InstrSeqBuilder, LocalId, Module, ValType};
 
-use crate::translation::intermediate_types::{
-    IntermediateType,
-    address::IAddress,
-    boolean::IBool,
-    heap_integers::{IU128, IU256},
-    simple_integers::{IU8, IU16, IU32, IU64},
-    vector::IVector,
+use crate::{
+    CompilationContext,
+    compilation_context::ExternalModuleData,
+    translation::intermediate_types::{
+        IntermediateType,
+        address::IAddress,
+        boolean::IBool,
+        enums::IEnum,
+        heap_integers::{IU128, IU256},
+        reference::{IMutRef, IRef},
+        simple_integers::{IU8, IU16, IU32, IU64},
+        vector::IVector,
+    },
 };
 
+use super::vm_handled_datatypes::TxContext;
+
+mod unpack_enum;
 mod unpack_heap_int;
 mod unpack_native_int;
+mod unpack_reference;
+mod unpack_struct;
 mod unpack_vector;
 
 pub trait Unpackable {
@@ -29,8 +40,7 @@ pub trait Unpackable {
         module: &mut Module,
         reader_pointer: LocalId,
         calldata_reader_pointer: LocalId,
-        memory: MemoryId,
-        allocator: FunctionId,
+        compilation_ctx: &CompilationContext,
     );
 }
 
@@ -43,8 +53,7 @@ pub fn build_unpack_instructions<T: Unpackable>(
     module: &mut Module,
     function_arguments_signature: &[T],
     args_pointer: LocalId,
-    memory: MemoryId,
-    allocator: FunctionId,
+    compilation_ctx: &CompilationContext,
 ) {
     let reader_pointer = module.locals.add(ValType::I32);
     let calldata_reader_pointer = module.locals.add(ValType::I32);
@@ -61,8 +70,7 @@ pub fn build_unpack_instructions<T: Unpackable>(
             module,
             reader_pointer,
             calldata_reader_pointer,
-            memory,
-            allocator,
+            compilation_ctx,
         );
     }
 }
@@ -74,8 +82,7 @@ impl Unpackable for IntermediateType {
         module: &mut Module,
         reader_pointer: LocalId,
         calldata_reader_pointer: LocalId,
-        memory: MemoryId,
-        allocator: FunctionId,
+        compilation_ctx: &CompilationContext,
     ) {
         match self {
             IntermediateType::IBool => IBool::add_unpack_instructions(
@@ -83,64 +90,56 @@ impl Unpackable for IntermediateType {
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IU8 => IU8::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IU16 => IU16::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IU32 => IU32::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IU64 => IU64::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IU128 => IU128::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IU256 => IU256::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IAddress => IAddress::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
             IntermediateType::IVector(inner) => IVector::add_unpack_instructions(
                 inner,
@@ -148,66 +147,153 @@ impl Unpackable for IntermediateType {
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
-                memory,
-                allocator,
+                compilation_ctx,
             ),
+            // The signer must not be unpacked here, since it can't be part of the calldata. It is
+            // injected directly by the VM into the stack
+            IntermediateType::ISigner => (),
+            IntermediateType::IRef(inner) => IRef::add_unpack_instructions(
+                inner,
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
+                compilation_ctx,
+            ),
+            IntermediateType::IMutRef(inner) => IMutRef::add_unpack_instructions(
+                inner,
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
+                compilation_ctx,
+            ),
+            IntermediateType::IStruct(index) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+
+                // TODO: Check if the struct is TxContext. If it is, panic since the only valid
+                // TxContext is the one defined in the stylus framework.
+
+                struct_.add_unpack_instructions(
+                    function_builder,
+                    module,
+                    reader_pointer,
+                    calldata_reader_pointer,
+                    compilation_ctx,
+                );
+            }
+            IntermediateType::IGenericStructInstance(index, types) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                let struct_instance = struct_.instantiate(types);
+                struct_instance.add_unpack_instructions(
+                    function_builder,
+                    module,
+                    reader_pointer,
+                    calldata_reader_pointer,
+                    compilation_ctx,
+                )
+            }
+            IntermediateType::IEnum(enum_index) => {
+                let enum_ = compilation_ctx
+                    .root_module_data
+                    .enums
+                    .get_enum_by_index(*enum_index)
+                    .unwrap();
+                if !enum_.is_simple {
+                    panic!(
+                        "cannot abi unpack enum with index {enum_index}, it contains at least one variant with fields"
+                    );
+                }
+                IEnum::add_unpack_instructions(
+                    enum_,
+                    function_builder,
+                    module,
+                    reader_pointer,
+                    compilation_ctx,
+                )
+            }
+            IntermediateType::IExternalUserData {
+                module_id,
+                identifier,
+            } => {
+                let external_data = compilation_ctx
+                    .get_external_module_data(module_id, identifier)
+                    .unwrap();
+
+                match external_data {
+                    ExternalModuleData::Struct(istruct) => {
+                        if TxContext::struct_is_tx_context(module_id, identifier) {
+                            TxContext::inject_tx_context(
+                                function_builder,
+                                compilation_ctx.allocator,
+                            );
+                        } else {
+                            istruct.add_unpack_instructions(
+                                function_builder,
+                                module,
+                                reader_pointer,
+                                calldata_reader_pointer,
+                                compilation_ctx,
+                            )
+                        }
+                    }
+                    ExternalModuleData::Enum(ienum) => {
+                        if !ienum.is_simple {
+                            panic!(
+                                "cannot abi external module's enum {identifier}, it contains at least one variant with fields"
+                            );
+                        }
+                        IEnum::add_unpack_instructions(
+                            ienum,
+                            function_builder,
+                            module,
+                            reader_pointer,
+                            compilation_ctx,
+                        )
+                    }
+                }
+            }
+            IntermediateType::ITypeParameter(_) => {
+                panic!("cannot unpack generic type parameter");
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::{dyn_abi::SolType, sol};
-    use walrus::{FunctionBuilder, FunctionId, MemoryId, ModuleConfig, ValType};
-    use wasmtime::{Engine, IntoFunc, Linker, Module as WasmModule, Store, TypedFunc, WasmParams};
+    use alloy_sol_types::{SolType, sol};
+    use walrus::{FunctionBuilder, ValType};
+    use wasmtime::{Engine, Linker};
 
-    use crate::{memory::setup_module_memory, utils::display_module};
+    use crate::{
+        test_compilation_context,
+        test_tools::{build_module, setup_wasmtime_module},
+        utils::display_module,
+    };
 
     use super::*;
 
-    fn build_module() -> (Module, FunctionId, MemoryId) {
-        let config = ModuleConfig::new();
-        let mut module = Module::with_config(config);
-        let (allocator_func, memory_id) = setup_module_memory(&mut module);
+    fn validator(param: u32, param2: u32, param3: u64) {
+        println!("validator: {}, {}, {}", param, param2, param3);
 
-        (module, allocator_func, memory_id)
-    }
-
-    fn setup_wasmtime_module<A: WasmParams, V>(
-        module: &mut Module,
-        initial_memory_data: Vec<u8>,
-        function_name: &str,
-        validator_func: impl IntoFunc<(), V, ()>,
-    ) -> (Linker<()>, Store<()>, TypedFunc<A, ()>) {
-        let engine = Engine::default();
-        let module = WasmModule::from_binary(&engine, &module.emit_wasm()).unwrap();
-
-        let mut linker = Linker::new(&engine);
-
-        linker.func_wrap("", "validator", validator_func).unwrap();
-
-        let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).unwrap();
-
-        let entrypoint = instance
-            .get_typed_func::<A, ()>(&mut store, function_name)
-            .unwrap();
-
-        let memory = instance.get_memory(&mut store, "memory").unwrap();
-        memory.write(&mut store, 0, &initial_memory_data).unwrap();
-        // Print current memory
-        let memory_data = memory.data(&mut store);
-        println!(
-            "Current memory: {:?}",
-            memory_data.iter().take(64).collect::<Vec<_>>()
-        );
-
-        (linker, store, entrypoint)
+        assert_eq!(param, 1);
+        assert_eq!(param2, 1234);
+        assert_eq!(param3, 123456789012345);
     }
 
     #[test]
     fn test_build_unpack_instructions() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module(None);
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
 
         let validator_func_type = raw_module
             .types
@@ -231,8 +317,7 @@ mod tests {
                 IntermediateType::IU64,
             ],
             args_pointer,
-            memory_id,
-            allocator_func,
+            &compilation_ctx,
         );
 
         // validation
@@ -247,17 +332,16 @@ mod tests {
             <sol!((bool, uint16, uint64))>::abi_encode_params(&(true, 1234, 123456789012345));
         println!("data: {:?}", data);
         let data_len = data.len() as i32;
-        let (_, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), _>(
+
+        // Define validator function
+        let mut linker = Linker::new(&Engine::default());
+        linker.func_wrap("", "validator", validator).unwrap();
+
+        let (_, _, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), ()>(
             &mut raw_module,
             data,
             "test_function",
-            |param: u32, param2: u32, param3: u64| {
-                println!("validator: {}, {}, {}", param, param2, param3);
-
-                assert_eq!(param, 1);
-                assert_eq!(param2, 1234);
-                assert_eq!(param3, 123456789012345);
-            },
+            Some(linker),
         );
 
         entrypoint.call(&mut store, (0, data_len)).unwrap();
@@ -265,7 +349,8 @@ mod tests {
 
     #[test]
     fn test_build_unpack_instructions_reversed() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module(None);
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
 
         let validator_func_type = raw_module
             .types
@@ -289,8 +374,7 @@ mod tests {
                 IntermediateType::IBool,
             ],
             args_pointer,
-            memory_id,
-            allocator_func,
+            &compilation_ctx,
         );
 
         // validation
@@ -305,25 +389,32 @@ mod tests {
             <sol!((uint64, uint16, bool))>::abi_encode_params(&(123456789012345, 1234, true));
         println!("data: {:?}", data);
         let data_len = data.len() as i32;
-        let (_, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), _>(
+
+        // Define validator function
+        let mut linker = Linker::new(&Engine::default());
+        linker
+            .func_wrap("", "validator", |param: u64, param2: u32, param3: u32| {
+                println!("validator: {}, {}, {}", param, param2, param3);
+
+                assert_eq!(param3, 1);
+                assert_eq!(param2, 1234);
+                assert_eq!(param, 123456789012345);
+            })
+            .unwrap();
+
+        let (_, _, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), ()>(
             &mut raw_module,
             data,
             "test_function",
-            |param: u64, param2: u32, param3: u32| {
-                println!("validator: {}, {}, {}", param, param2, param3);
-
-                assert_eq!(param, 123456789012345);
-                assert_eq!(param2, 1234);
-                assert_eq!(param3, 1);
-            },
+            Some(linker),
         );
-
         entrypoint.call(&mut store, (0, data_len)).unwrap();
     }
 
     #[test]
     fn test_build_unpack_instructions_offset_memory() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module(None);
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
 
         let validator_func_type = raw_module
             .types
@@ -347,8 +438,7 @@ mod tests {
                 IntermediateType::IU64,
             ],
             args_pointer,
-            memory_id,
-            allocator_func,
+            &compilation_ctx,
         );
 
         // validation
@@ -365,19 +455,17 @@ mod tests {
         data = [vec![0; 10], data].concat();
         println!("data: {:?}", data);
         let data_len = data.len() as i32;
-        let (_, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), _>(
+
+        // Define validator function
+        let mut linker = Linker::new(&Engine::default());
+        linker.func_wrap("", "validator", validator).unwrap();
+
+        let (_, _, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), ()>(
             &mut raw_module,
             data,
             "test_function",
-            |param: u32, param2: u32, param3: u64| {
-                println!("validator: {}, {}, {}", param, param2, param3);
-
-                assert_eq!(param, 1);
-                assert_eq!(param2, 1234);
-                assert_eq!(param3, 123456789012345);
-            },
+            Some(linker),
         );
-
         entrypoint.call(&mut store, (10, data_len - 10)).unwrap();
     }
 }

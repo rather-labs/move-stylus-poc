@@ -15,6 +15,32 @@ Currently supported features:
   - [x] bool
   - [x] address
   - [x] vector
+  - [x] structs
+- **Primitive types**: The following primitive types are supported:
+  - [x] integers (u8, u16, u32, u64, u128, u256)
+  - [x] booleans
+  - [x] address
+  - [x] signer
+  - [x] references
+  - [x] tuples and unit
+  - [x] vector
+- **User defined datatypes**: Structs and Enums
+  - [x] Structs (with and without generic types and phantom generic types)
+  - [x] Enums - partially supported
+- **Operations**: The following operations are supported:
+  - [x] Arithmetic operations (addition, subtraction, multiplication, division, mod)
+  - [x] Boolean operations (and, or)
+  - [x] Bitwise/bitshift operations (left/right shift, and, or, xor)
+  - [x] Equality operations
+  - [x] Comparisons (less than, less or equal, more than, more or equal) on all integer types
+  - [x] Casting
+- **Vector operations**: The following vector operations are supported:
+  - [x] Push back
+  - [x] Pop back
+  - [x] Length
+  - [x] Borrow fields (mutable and immutable)
+- Struct packing and unpacking, mutable/immutable borrow of fields
+- Enums packing
 
 ## Disclaimer
 
@@ -40,14 +66,17 @@ make disassemble
 check web assembly output at arbitrum dev node:
 ```bash
 make check-example
+make check-example-primitives
 ```
 
 deploy to arbitrum dev node (local):
 ```bash
 make deploy-example
+make deploy-example-primitives
 ```
 
 run test interactions (make sure to setup a `.env` file):
 ```bash
 make example-interaction
+make example-interaction-primitives
 ```

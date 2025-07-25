@@ -23,7 +23,7 @@ public fun get_local(_z: u64): u64 {
 // Forces the compiler to store literals on locals
 public fun get_copied_local(): (u64, u64) {
   let x: u64 = 100;
-  
+
   let y = x; // copy
   let mut z = x; // move
   identity(y);
@@ -47,4 +47,24 @@ fun identity(x: u64): u64 {
 
 fun identity_2(_x: u64, y: u64): u64 {
   y
+}
+
+public fun sum(x: u64, y: u64): u64 {
+    x + y
+}
+
+public fun sub(x: u64, y: u64): u64 {
+    x - y
+}
+
+public fun div(x: u64, y: u64): u64 {
+    x / y
+}
+
+public fun mul(x: u64, y: u64): u64 {
+    x * y
+}
+
+public fun mod_(x: u64, y: u64): u64 {
+    x % y
 }

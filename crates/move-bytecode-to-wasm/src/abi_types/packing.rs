@@ -1,16 +1,26 @@
 use alloy_sol_types::{SolType, sol_data};
 use pack_native_int::{pack_i32_type_instructions, pack_i64_type_instructions};
-use walrus::{FunctionId, InstrSeqBuilder, LocalId, MemoryId, Module, ValType, ir::BinaryOp};
+use walrus::{InstrSeqBuilder, LocalId, Module, ValType, ir::BinaryOp};
 
-use crate::translation::intermediate_types::{
-    IntermediateType,
-    address::IAddress,
-    heap_integers::{IU128, IU256},
-    vector::IVector,
+use crate::{
+    CompilationContext,
+    compilation_context::ExternalModuleData,
+    translation::intermediate_types::{
+        IntermediateType,
+        address::IAddress,
+        enums::IEnum,
+        heap_integers::{IU128, IU256},
+        reference::{IMutRef, IRef},
+        signer::ISigner,
+        vector::IVector,
+    },
 };
 
+mod pack_enum;
 mod pack_heap_int;
 mod pack_native_int;
+mod pack_reference;
+mod pack_struct;
 mod pack_vector;
 
 pub trait Packable {
@@ -29,8 +39,35 @@ pub trait Packable {
         local: LocalId,
         writer_pointer: LocalId,
         calldata_reference_pointer: LocalId,
-        memory: MemoryId,
-        alloc_function: FunctionId,
+        compilation_ctx: &CompilationContext,
+    );
+
+    /// Adds the instructions to pack the value into memory according to Solidity's ABI encoding.
+    ///
+    /// The writer pointer is the pointer to the memory where the value will be written, should be
+    /// incremented on each write.
+    ///
+    /// The calldata reference pointer is the pointer to the start of the calldata portion
+    /// in order to calculate the params offset. Should never be modified internally.
+    ///
+    /// This function forces the dynamic encoding (pointer to the location of packed values +
+    /// packed values). It is useful for types that can be encoded as dynamic or static depending
+    /// on the context.
+    ///
+    /// For example, given a struct `Foo` that can be encoded dynamically (because it contains one
+    /// or more values that are dynamically encoded).
+    /// - If `Foo` is returned in a function that returns multiple values `(v1, v2, .., Foo, .., vn)`,
+    ///   `Foo` must be encoded dynamically, because it a tuple member.
+    /// - If `Foo` is the only return value in a function, it should be encoded statically.
+    #[allow(clippy::too_many_arguments)]
+    fn add_pack_instructions_dynamic(
+        &self,
+        builder: &mut InstrSeqBuilder,
+        module: &mut Module,
+        local: LocalId,
+        writer_pointer: LocalId,
+        calldata_reference_pointer: LocalId,
+        compilation_ctx: &CompilationContext,
     );
 
     /// Adds the instructions to load the value into a local variable.
@@ -45,7 +82,20 @@ pub trait Packable {
     ) -> LocalId;
 
     /// Returns the ABI encoded size of the type
-    fn encoded_size(&self) -> usize;
+    fn encoded_size(&self, compilation_ctx: &CompilationContext) -> usize;
+
+    /// Returns true if the type to be encoded is dynamic
+    ///
+    /// According to documentation, dynamic types are:
+    /// - bytes
+    /// - string
+    /// - T[] for any T
+    /// - T[k] for any dynamic T and any k >= 0
+    /// - (T1,...,Tk) if Ti is dynamic for some 1 <= i <= k
+    ///
+    /// For more information:
+    /// https://docs.soliditylang.org/en/develop/abi-spec.html#formal-specification-of-the-encoding
+    fn is_dynamic(&self, compilation_ctx: &CompilationContext) -> bool;
 }
 
 /// Builds the instructions to pack WASM return values into memory according to Solidity's ABI encoding.
@@ -60,14 +110,16 @@ pub fn build_pack_instructions<T: Packable>(
     builder: &mut InstrSeqBuilder,
     function_return_signature: &[T],
     module: &mut Module,
-    memory: MemoryId,
-    alloc_function: FunctionId,
+    compilation_ctx: &CompilationContext,
 ) {
     if function_return_signature.is_empty() {
         builder.i32_const(0);
         builder.i32_const(0);
         return;
     }
+
+    // Indicates if the function returns multiple values
+    let returns_multiple_values = function_return_signature.len() > 1;
 
     // We need to load all return types into locals in order to reverse the read order
     // Otherwise they would be popped in reverse order
@@ -76,50 +128,87 @@ pub fn build_pack_instructions<T: Packable>(
     for signature_token in function_return_signature.iter().rev() {
         let local = signature_token.add_load_local_instructions(builder, module);
         locals.push(local);
-        args_size += signature_token.encoded_size();
+
+        // If the function returns multiple values, those values will be encoded as a tuple. By
+        // definition, a tuple T is dynamic (T1,...,Tk) if Ti is dynamic for some 1 <= i <= k.
+        // The encode size for a dynamically encoded field inside a dynamically encoded tuple is
+        // just 32 bytes (the value is the offset to where the values are packed)
+        args_size += if returns_multiple_values && signature_token.is_dynamic(compilation_ctx) {
+            32
+        } else {
+            signature_token.encoded_size(compilation_ctx)
+        };
     }
     locals.reverse();
 
     let pointer = module.locals.add(ValType::I32);
     let writer_pointer = module.locals.add(ValType::I32);
+    let calldata_reference_pointer = module.locals.add(ValType::I32);
 
     // Allocate memory for the first level arguments
-    builder.i32_const(args_size as i32);
-    builder.call(alloc_function);
-    builder.local_tee(pointer);
+    builder
+        .i32_const(args_size as i32)
+        .call(compilation_ctx.allocator)
+        .local_tee(pointer);
 
     // Store the writer pointer
     builder.local_set(writer_pointer);
 
     for (local, signature_token) in locals.iter().zip(function_return_signature.iter()) {
         // Copy the reference just to be safe in case in internal function modifies it
-        let calldata_reference_pointer = module.locals.add(ValType::I32);
-        builder.local_get(pointer);
-        builder.local_set(calldata_reference_pointer);
+        builder
+            .local_get(pointer)
+            .local_set(calldata_reference_pointer);
 
-        signature_token.add_pack_instructions(
-            builder,
-            module,
-            *local,
-            writer_pointer,
-            calldata_reference_pointer,
-            memory,
-            alloc_function,
-        );
+        // If the function returns multiple values, those values will be encoded as a tuple. By
+        // definition, a tuple T is dynamic (T1,...,Tk) if Ti is dynamic for some 1 <= i <= k.
+        // Given that the return tuple is encoded dynamically, for the values that are dynamic
+        // inside the tuple, we must force a dynamic encoding.
+        if returns_multiple_values && signature_token.is_dynamic(compilation_ctx) {
+            signature_token.add_pack_instructions_dynamic(
+                builder,
+                module,
+                *local,
+                writer_pointer,
+                calldata_reference_pointer,
+                compilation_ctx,
+            );
 
-        builder.local_get(writer_pointer);
-        builder.i32_const(signature_token.encoded_size() as i32);
-        builder.binop(BinaryOp::I32Add);
-        builder.local_set(writer_pointer);
+            // A dynamic value will only save the offset to where the values are located, so, we
+            // just use 32 bytes
+            builder
+                .local_get(writer_pointer)
+                .i32_const(32)
+                .binop(BinaryOp::I32Add)
+                .local_set(writer_pointer);
+        } else {
+            signature_token.add_pack_instructions(
+                builder,
+                module,
+                *local,
+                writer_pointer,
+                calldata_reference_pointer,
+                compilation_ctx,
+            );
+
+            builder
+                .local_get(writer_pointer)
+                .i32_const(signature_token.encoded_size(compilation_ctx) as i32)
+                .binop(BinaryOp::I32Add)
+                .local_set(writer_pointer);
+        }
     }
 
-    builder.local_get(pointer); // This will remain in the stack as return value
-
-    // use the allocator to get a pointer to the end of the calldata
-    builder.i32_const(0);
-    builder.call(alloc_function);
+    // This will remain in the stack as return value
     builder.local_get(pointer);
-    builder.binop(BinaryOp::I32Sub);
+
+    // Use the allocator to get a pointer to the end of the calldata
+    builder
+        .i32_const(0)
+        .call(compilation_ctx.allocator)
+        .local_get(pointer)
+        .binop(BinaryOp::I32Sub);
+
     // The value remaining in the stack is the length of the encoded data
 }
 
@@ -136,8 +225,14 @@ impl Packable for IntermediateType {
             | IntermediateType::IU32
             | IntermediateType::IU128
             | IntermediateType::IU256
+            | IntermediateType::ISigner
+            | IntermediateType::IAddress
             | IntermediateType::IVector(_)
-            | IntermediateType::IAddress => {
+            | IntermediateType::IRef(_)
+            | IntermediateType::IMutRef(_)
+            | IntermediateType::IStruct(_)
+            | IntermediateType::IGenericStructInstance(_, _)
+            | IntermediateType::IEnum(_) => {
                 let local = module.locals.add(ValType::I32);
                 builder.local_set(local);
                 local
@@ -147,6 +242,10 @@ impl Packable for IntermediateType {
                 builder.local_set(local);
                 local
             }
+            IntermediateType::ITypeParameter(_) => {
+                panic!("cannot pack generic type parameter");
+            }
+            IntermediateType::IExternalUserData { .. } => todo!(),
         }
     }
 
@@ -157,28 +256,58 @@ impl Packable for IntermediateType {
         local: LocalId,
         writer_pointer: LocalId,
         calldata_reference_pointer: LocalId,
-        memory: MemoryId,
-        alloc_function: FunctionId,
+        compilation_ctx: &CompilationContext,
     ) {
         match self {
             IntermediateType::IBool
             | IntermediateType::IU8
             | IntermediateType::IU16
             | IntermediateType::IU32 => {
-                pack_i32_type_instructions(builder, module, memory, local, writer_pointer);
+                pack_i32_type_instructions(
+                    builder,
+                    module,
+                    compilation_ctx.memory_id,
+                    local,
+                    writer_pointer,
+                );
             }
             IntermediateType::IU64 => {
-                pack_i64_type_instructions(builder, module, memory, local, writer_pointer);
+                pack_i64_type_instructions(
+                    builder,
+                    module,
+                    compilation_ctx.memory_id,
+                    local,
+                    writer_pointer,
+                );
             }
-            IntermediateType::IU128 => {
-                IU128::add_pack_instructions(builder, module, local, writer_pointer, memory)
-            }
-            IntermediateType::IU256 => {
-                IU256::add_pack_instructions(builder, module, local, writer_pointer, memory)
-            }
-            IntermediateType::IAddress => {
-                IAddress::add_pack_instructions(builder, module, local, writer_pointer, memory)
-            }
+            IntermediateType::IU128 => IU128::add_pack_instructions(
+                builder,
+                module,
+                local,
+                writer_pointer,
+                compilation_ctx.memory_id,
+            ),
+            IntermediateType::IU256 => IU256::add_pack_instructions(
+                builder,
+                module,
+                local,
+                writer_pointer,
+                compilation_ctx.memory_id,
+            ),
+            IntermediateType::ISigner => ISigner::add_pack_instructions(
+                builder,
+                module,
+                local,
+                writer_pointer,
+                compilation_ctx.memory_id,
+            ),
+            IntermediateType::IAddress => IAddress::add_pack_instructions(
+                builder,
+                module,
+                local,
+                writer_pointer,
+                compilation_ctx.memory_id,
+            ),
             IntermediateType::IVector(inner) => IVector::add_pack_instructions(
                 inner,
                 builder,
@@ -186,83 +315,278 @@ impl Packable for IntermediateType {
                 local,
                 writer_pointer,
                 calldata_reference_pointer,
-                memory,
-                alloc_function,
+                compilation_ctx,
+            ),
+            IntermediateType::IRef(inner) => IRef::add_pack_instructions(
+                inner,
+                builder,
+                module,
+                local,
+                writer_pointer,
+                calldata_reference_pointer,
+                compilation_ctx,
+            ),
+            IntermediateType::IMutRef(inner) => IMutRef::add_pack_instructions(
+                inner,
+                builder,
+                module,
+                local,
+                writer_pointer,
+                calldata_reference_pointer,
+                compilation_ctx,
+            ),
+            IntermediateType::IStruct(index) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                struct_.add_pack_instructions(
+                    builder,
+                    module,
+                    local,
+                    writer_pointer,
+                    calldata_reference_pointer,
+                    compilation_ctx,
+                    None,
+                )
+            }
+            IntermediateType::IGenericStructInstance(index, types) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                let struct_instance = struct_.instantiate(types);
+                struct_instance.add_pack_instructions(
+                    builder,
+                    module,
+                    local,
+                    writer_pointer,
+                    calldata_reference_pointer,
+                    compilation_ctx,
+                    None,
+                )
+            }
+            IntermediateType::IEnum(enum_index) => {
+                let enum_ = compilation_ctx
+                    .root_module_data
+                    .enums
+                    .get_enum_by_index(*enum_index)
+                    .unwrap();
+                if !enum_.is_simple {
+                    panic!(
+                        "cannot abi pack enum with index {enum_index}, it contains at least one variant with fields"
+                    );
+                }
+                IEnum::add_pack_instructions(
+                    builder,
+                    module,
+                    local,
+                    writer_pointer,
+                    compilation_ctx,
+                )
+            }
+            IntermediateType::ITypeParameter(_) => {
+                panic!("cannot pack generic type parameter");
+            }
+            IntermediateType::IExternalUserData { .. } => todo!(),
+        }
+    }
+
+    fn add_pack_instructions_dynamic(
+        &self,
+        builder: &mut InstrSeqBuilder,
+        module: &mut Module,
+        local: LocalId,
+        writer_pointer: LocalId,
+        calldata_reference_pointer: LocalId,
+        compilation_ctx: &CompilationContext,
+    ) {
+        match self {
+            IntermediateType::IStruct(index) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                struct_.add_pack_instructions(
+                    builder,
+                    module,
+                    local,
+                    writer_pointer,
+                    calldata_reference_pointer,
+                    compilation_ctx,
+                    Some(calldata_reference_pointer),
+                );
+            }
+            IntermediateType::IGenericStructInstance(index, types) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                let struct_instance = struct_.instantiate(types);
+                struct_instance.add_pack_instructions(
+                    builder,
+                    module,
+                    local,
+                    writer_pointer,
+                    calldata_reference_pointer,
+                    compilation_ctx,
+                    Some(calldata_reference_pointer),
+                );
+            }
+            _ => self.add_pack_instructions(
+                builder,
+                module,
+                local,
+                writer_pointer,
+                calldata_reference_pointer,
+                compilation_ctx,
             ),
         }
     }
 
-    fn encoded_size(&self) -> usize {
+    fn encoded_size(&self, compilation_ctx: &CompilationContext) -> usize {
         match self {
             IntermediateType::IBool => sol_data::Bool::ENCODED_SIZE.unwrap(),
-            IntermediateType::IU8 => sol_data::Uint::<8>::ENCODED_SIZE.unwrap(),
+            // According to the official documentation, enum types are encoded as uint8
+            IntermediateType::IU8 | IntermediateType::IEnum(_) => {
+                sol_data::Uint::<8>::ENCODED_SIZE.unwrap()
+            }
             IntermediateType::IU16 => sol_data::Uint::<16>::ENCODED_SIZE.unwrap(),
             IntermediateType::IU32 => sol_data::Uint::<32>::ENCODED_SIZE.unwrap(),
             IntermediateType::IU64 => sol_data::Uint::<64>::ENCODED_SIZE.unwrap(),
             IntermediateType::IU128 => sol_data::Uint::<128>::ENCODED_SIZE.unwrap(),
             IntermediateType::IU256 => sol_data::Uint::<256>::ENCODED_SIZE.unwrap(),
             IntermediateType::IAddress => sol_data::Address::ENCODED_SIZE.unwrap(),
+            IntermediateType::ISigner => sol_data::Address::ENCODED_SIZE.unwrap(),
             IntermediateType::IVector(_) => 32,
+            IntermediateType::IRef(inner) => inner.encoded_size(compilation_ctx),
+            IntermediateType::IMutRef(inner) => inner.encoded_size(compilation_ctx),
+            IntermediateType::IGenericStructInstance(index, types) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                let struct_instance = struct_.instantiate(types);
+                struct_instance.solidity_abi_encode_size(compilation_ctx)
+            }
+            IntermediateType::IStruct(index) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                struct_.solidity_abi_encode_size(compilation_ctx)
+            }
+            IntermediateType::ITypeParameter(_) => {
+                panic!("can't know the size of a generic type parameter at compile time");
+            }
+            IntermediateType::IExternalUserData {
+                module_id,
+                identifier,
+            } => {
+                let external_data = compilation_ctx
+                    .get_external_module_data(module_id, identifier)
+                    .unwrap();
+
+                match external_data {
+                    ExternalModuleData::Struct(external_struct) => {
+                        external_struct.solidity_abi_encode_size(compilation_ctx)
+                    }
+                    ExternalModuleData::Enum(_) => sol_data::Uint::<8>::ENCODED_SIZE.unwrap(),
+                }
+            }
+        }
+    }
+
+    fn is_dynamic(&self, compilation_ctx: &CompilationContext) -> bool {
+        match self {
+            IntermediateType::IBool
+            | IntermediateType::IU8
+            | IntermediateType::IU16
+            | IntermediateType::IU32
+            | IntermediateType::IU64
+            | IntermediateType::IU128
+            | IntermediateType::IU256
+            | IntermediateType::IAddress
+            | IntermediateType::ISigner
+            | IntermediateType::IRef(_)
+            | IntermediateType::IMutRef(_) => false,
+            IntermediateType::IVector(_) => true,
+            IntermediateType::IStruct(index) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                struct_.solidity_abi_encode_is_dynamic(compilation_ctx)
+            }
+            IntermediateType::IGenericStructInstance(index, types) => {
+                let struct_ = compilation_ctx
+                    .root_module_data
+                    .structs
+                    .get_by_index(*index)
+                    .unwrap();
+                let struct_instance = struct_.instantiate(types);
+                struct_instance.solidity_abi_encode_is_dynamic(compilation_ctx)
+            }
+            IntermediateType::ITypeParameter(_) => {
+                panic!("cannot check if generic type parameter is dynamic at compile time");
+            }
+            IntermediateType::IEnum(_) => todo!(),
+            IntermediateType::IExternalUserData { .. } => todo!(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::{dyn_abi::SolType, primitives::U256, sol};
-    use walrus::{FunctionBuilder, FunctionId, MemoryId, ModuleConfig, ValType};
-    use wasmtime::{
-        Caller, Engine, Extern, IntoFunc, Linker, Module as WasmModule, Store, TypedFunc,
-        WasmParams,
-    };
+    use alloy_primitives::U256;
+    use alloy_sol_types::sol;
+    use walrus::{FunctionBuilder, ValType};
+    use wasmtime::{Caller, Engine, Extern, Linker};
 
-    use crate::{memory::setup_module_memory, utils::display_module};
+    use crate::{
+        test_compilation_context,
+        test_tools::{build_module, setup_wasmtime_module},
+        utils::display_module,
+    };
 
     use super::*;
 
-    fn build_module() -> (Module, FunctionId, MemoryId) {
-        let config = ModuleConfig::new();
-        let mut module = Module::with_config(config);
-        let (allocator_func, memory_id) = setup_module_memory(&mut module);
+    fn get_validator(
+        pointer_addr: u32,
+        data_len: i32,
+        data: Vec<u8>,
+    ) -> impl Fn(Caller<()>, u32, u32) {
+        move |mut caller: Caller<()>, pointer: u32, length: u32| {
+            println!("validator: {}, {}", pointer, length);
 
-        (module, allocator_func, memory_id)
-    }
+            assert_eq!(pointer, pointer_addr);
+            assert_eq!(length, data_len as u32);
 
-    fn setup_wasmtime_module<A: WasmParams, V>(
-        module: &mut Module,
-        initial_memory_data: Vec<u8>,
-        function_name: &str,
-        validator_func: impl IntoFunc<(), V, ()>,
-    ) -> (Linker<()>, Store<()>, TypedFunc<A, ()>) {
-        let engine = Engine::default();
-        let module = WasmModule::from_binary(&engine, &module.emit_wasm()).unwrap();
+            let memory = caller.get_export("memory").unwrap();
+            let memory = match memory {
+                Extern::Memory(memory) => memory,
+                _ => panic!("memory not found"),
+            };
 
-        let mut linker = Linker::new(&engine);
-
-        linker.func_wrap("", "validator", validator_func).unwrap();
-
-        let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).unwrap();
-
-        let entrypoint = instance
-            .get_typed_func::<A, ()>(&mut store, function_name)
-            .unwrap();
-
-        let memory = instance.get_memory(&mut store, "memory").unwrap();
-        memory.write(&mut store, 0, &initial_memory_data).unwrap();
-        // Print current memory
-        let memory_data = memory.data(&mut store);
-        println!(
-            "Current memory: {:?}",
-            memory_data.iter().take(64).collect::<Vec<_>>()
-        );
-
-        (linker, store, entrypoint)
+            let mut buffer = vec![0; length as usize];
+            memory
+                .read(&mut caller, pointer as usize, &mut buffer)
+                .unwrap();
+            assert_eq!(buffer, data);
+        }
     }
 
     #[test]
     fn test_build_pack_instructions() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module(None);
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
 
         let validator_func_type = raw_module.types.add(&[ValType::I32, ValType::I32], &[]);
         let (validator_func, _) = raw_module.add_import_func("", "validator", validator_func_type);
@@ -288,8 +612,7 @@ mod tests {
                 IntermediateType::IU64,
             ],
             &mut raw_module,
-            memory_id,
-            allocator_func,
+            &compilation_ctx,
         );
 
         // validation
@@ -304,28 +627,18 @@ mod tests {
             <sol!((bool, uint16, uint64))>::abi_encode_params(&(true, 1234, 123456789012345));
         println!("data: {:?}", data);
         let data_len = data.len() as i32;
-        let (_, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), _>(
+
+        // Define validator function
+        let mut linker = Linker::new(&Engine::default());
+        linker
+            .func_wrap("", "validator", get_validator(0, data_len, data))
+            .unwrap();
+
+        let (_, _, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), ()>(
             &mut raw_module,
             vec![],
             "test_function",
-            move |mut caller: Caller<()>, pointer: u32, length: u32| {
-                println!("validator: {}, {}", pointer, length);
-
-                assert_eq!(pointer, 0);
-                assert_eq!(length, data_len as u32);
-
-                let memory = caller.get_export("memory").unwrap();
-                let memory = match memory {
-                    Extern::Memory(memory) => memory,
-                    _ => panic!("memory not found"),
-                };
-
-                let mut buffer = vec![0; length as usize];
-                memory
-                    .read(&mut caller, pointer as usize, &mut buffer)
-                    .unwrap();
-                assert_eq!(buffer, data);
-            },
+            Some(linker),
         );
 
         entrypoint.call(&mut store, (0, data_len)).unwrap();
@@ -333,7 +646,9 @@ mod tests {
 
     #[test]
     fn test_build_pack_instructions_memory_offset() {
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        // Memory offset starts at 100
+        let (mut raw_module, allocator_func, memory_id) = build_module(Some(100));
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
 
         let validator_func_type = raw_module.types.add(&[ValType::I32, ValType::I32], &[]);
         let (validator_func, _) = raw_module.add_import_func("", "validator", validator_func_type);
@@ -345,11 +660,6 @@ mod tests {
         let args_pointer = raw_module.locals.add(ValType::I32);
 
         let mut func_body = function_builder.func_body();
-
-        // Allocate some memory just to increase the offset
-        func_body.i32_const(100);
-        func_body.call(allocator_func);
-        func_body.drop();
 
         // Load arguments to stack
         func_body.i32_const(1);
@@ -364,8 +674,7 @@ mod tests {
                 IntermediateType::IU64,
             ],
             &mut raw_module,
-            memory_id,
-            allocator_func,
+            &compilation_ctx,
         );
 
         // validation
@@ -381,27 +690,17 @@ mod tests {
         println!("data: {:?}", data);
         let data_len = data.len() as i32;
 
-        let (_, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), _>(
+        // Define validator function
+        let mut linker = Linker::new(&Engine::default());
+        linker
+            .func_wrap("", "validator", get_validator(100, data_len, data))
+            .unwrap();
+
+        let (_, _, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), ()>(
             &mut raw_module,
             vec![],
             "test_function",
-            move |mut caller: Caller<()>, pointer: u32, length: u32| {
-                println!("validator: {}, {}", pointer, length);
-                assert_eq!(pointer, 100);
-                assert_eq!(length, data_len as u32);
-
-                let memory = caller.get_export("memory").unwrap();
-                let memory = match memory {
-                    Extern::Memory(memory) => memory,
-                    _ => panic!("memory not found"),
-                };
-
-                let mut buffer = vec![0; length as usize];
-                memory
-                    .read(&mut caller, pointer as usize, &mut buffer)
-                    .unwrap();
-                assert_eq!(buffer, data);
-            },
+            Some(linker),
         );
 
         entrypoint.call(&mut store, (0, data_len)).unwrap();
@@ -411,19 +710,22 @@ mod tests {
     fn test_build_pack_instructions_dynamic_types() {
         let data = [
             2u32.to_le_bytes().as_slice(),
-            12u32.to_le_bytes().as_slice(),
-            76u32.to_le_bytes().as_slice(),
+            2u32.to_le_bytes().as_slice(),
+            16u32.to_le_bytes().as_slice(),
+            84u32.to_le_bytes().as_slice(),
             3u32.to_le_bytes().as_slice(),
-            28u32.to_le_bytes().as_slice(),
-            44u32.to_le_bytes().as_slice(),
-            60u32.to_le_bytes().as_slice(),
+            3u32.to_le_bytes().as_slice(),
+            36u32.to_le_bytes().as_slice(),
+            52u32.to_le_bytes().as_slice(),
+            68u32.to_le_bytes().as_slice(),
             1u128.to_le_bytes().as_slice(),
             2u128.to_le_bytes().as_slice(),
             3u128.to_le_bytes().as_slice(),
             3u32.to_le_bytes().as_slice(),
-            92u32.to_le_bytes().as_slice(),
-            108u32.to_le_bytes().as_slice(),
-            124u32.to_le_bytes().as_slice(),
+            3u32.to_le_bytes().as_slice(),
+            104u32.to_le_bytes().as_slice(),
+            120u32.to_le_bytes().as_slice(),
+            136u32.to_le_bytes().as_slice(),
             4u128.to_le_bytes().as_slice(),
             5u128.to_le_bytes().as_slice(),
             6u128.to_le_bytes().as_slice(),
@@ -434,7 +736,8 @@ mod tests {
         .concat();
         let data_len = data.len() as i32;
 
-        let (mut raw_module, allocator_func, memory_id) = build_module();
+        let (mut raw_module, allocator_func, memory_id) = build_module(Some(data_len));
+        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
 
         let validator_func_type = raw_module.types.add(&[ValType::I32, ValType::I32], &[]);
         let (validator_func, _) = raw_module.add_import_func("", "validator", validator_func_type);
@@ -447,15 +750,10 @@ mod tests {
 
         let mut func_body = function_builder.func_body();
 
-        // allocate memory to match the expected data length
-        func_body.i32_const(data_len);
-        func_body.call(allocator_func);
-        func_body.drop();
-
         // Load arguments to stack
         func_body.i32_const(1234);
         func_body.i32_const(0); // vector pointer
-        func_body.i32_const(140); // u256 pointer
+        func_body.i32_const(152); // u256 pointer
 
         build_pack_instructions(
             &mut func_body,
@@ -467,8 +765,7 @@ mod tests {
                 IntermediateType::IU256,
             ],
             &mut raw_module,
-            memory_id,
-            allocator_func,
+            &compilation_ctx,
         );
 
         // validation
@@ -485,28 +782,26 @@ mod tests {
             U256::from(123456789012345u128),
         ));
         println!("expected_data: {:?}", expected_data);
-        let (_, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), _>(
+
+        // Define validator function
+        let mut linker = Linker::new(&Engine::default());
+        linker
+            .func_wrap(
+                "",
+                "validator",
+                get_validator(
+                    data_len as u32,
+                    expected_data.len() as i32,
+                    expected_data.clone(),
+                ),
+            )
+            .unwrap();
+
+        let (_, _, mut store, entrypoint) = setup_wasmtime_module::<(i32, i32), ()>(
             &mut raw_module,
             data.to_vec(),
             "test_function",
-            move |mut caller: Caller<()>, pointer: u32, length: u32| {
-                println!("validator: {}, {}", pointer, length);
-
-                assert_eq!(pointer, data_len as u32);
-                assert_eq!(length, expected_data.len() as u32);
-
-                let memory = caller.get_export("memory").unwrap();
-                let memory = match memory {
-                    Extern::Memory(memory) => memory,
-                    _ => panic!("memory not found"),
-                };
-
-                let mut buffer = vec![0; length as usize];
-                memory
-                    .read(&mut caller, pointer as usize, &mut buffer)
-                    .unwrap();
-                assert_eq!(buffer, expected_data);
-            },
+            Some(linker),
         );
 
         entrypoint.call(&mut store, (0, data_len)).unwrap();

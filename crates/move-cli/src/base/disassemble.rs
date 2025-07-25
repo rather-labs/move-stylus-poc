@@ -7,7 +7,7 @@ use move_bytecode_source_map::utils::serialize_to_json_string;
 use move_bytecode_to_wasm::translate_package_cli;
 use move_compiler::compiled_unit::NamedCompiledModule;
 use move_disassembler::disassembler::Disassembler;
-use move_package::{compilation::compiled_package::CompiledUnitWithSource, BuildConfig};
+use move_package::{BuildConfig, compilation::compiled_package::CompiledUnitWithSource};
 use std::path::Path;
 
 /// Disassemble the Move bytecode pointed to
@@ -76,9 +76,9 @@ impl Disassemble {
                     let d = Disassembler::from_unit(&unit.unit);
                     let (disassemble_string, bcode_map) = d.disassemble_with_source_map()?;
                     if bytecode_map {
-                        println!("{}", serialize_to_json_string(&bcode_map)?);
+                        println!("==========> {}", serialize_to_json_string(&bcode_map)?);
                     }
-                    println!("{}", disassemble_string);
+                    println!("--> {}", disassemble_string);
                     if debug {
                         println!("\n{:#?}", &unit.unit.module)
                     }
@@ -86,7 +86,7 @@ impl Disassemble {
             }
         }
 
-        translate_package_cli(&package, &rerooted_path);
+        translate_package_cli(package, &rerooted_path);
         Ok(())
     }
 }

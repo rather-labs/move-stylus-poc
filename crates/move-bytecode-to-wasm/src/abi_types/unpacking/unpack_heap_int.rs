@@ -1,15 +1,16 @@
 use alloy_sol_types::{SolType, sol_data};
 use walrus::{
-    FunctionId, InstrSeqBuilder, LocalId, MemoryId, Module, ValType,
+    InstrSeqBuilder, LocalId, Module, ValType,
     ir::{BinaryOp, LoadKind, MemArg, StoreKind},
 };
 
 use crate::{
+    CompilationContext,
+    runtime::RuntimeFunction,
     translation::intermediate_types::{
         address::IAddress,
         heap_integers::{IU128, IU256},
     },
-    utils::add_swap_i64_bytes_function,
 };
 
 impl IU128 {
@@ -18,17 +19,16 @@ impl IU128 {
         module: &mut Module,
         reader_pointer: LocalId,
         _calldata_reader_pointer: LocalId,
-        memory: MemoryId,
-        allocator: FunctionId,
+        compilation_ctx: &CompilationContext,
     ) {
         let encoded_size =
             sol_data::Uint::<128>::ENCODED_SIZE.expect("U128 should have a fixed size");
 
         // Big-endian to Little-endian
-        let swap_i64_bytes_function = add_swap_i64_bytes_function(module);
+        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None);
 
         block.i32_const(16);
-        block.call(allocator);
+        block.call(compilation_ctx.allocator);
 
         let unpacked_pointer = module.locals.add(ValType::I32);
         block.local_set(unpacked_pointer);
@@ -37,7 +37,7 @@ impl IU128 {
             block.local_get(unpacked_pointer);
             block.local_get(reader_pointer);
             block.load(
-                memory,
+                compilation_ctx.memory_id,
                 LoadKind::I64 { atomic: false },
                 MemArg {
                     align: 0,
@@ -51,7 +51,7 @@ impl IU128 {
         // store in reverse order
         for i in 0..2 {
             block.store(
-                memory,
+                compilation_ctx.memory_id,
                 StoreKind::I64 { atomic: false },
                 MemArg {
                     align: 0,
@@ -76,17 +76,16 @@ impl IU256 {
         module: &mut Module,
         reader_pointer: LocalId,
         _calldata_reader_pointer: LocalId,
-        memory: MemoryId,
-        allocator: FunctionId,
+        compilation_ctx: &CompilationContext,
     ) {
         let encoded_size =
             sol_data::Uint::<256>::ENCODED_SIZE.expect("U256 should have a fixed size");
 
         // Big-endian to Little-endian
-        let swap_i64_bytes_function = add_swap_i64_bytes_function(module);
+        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None);
 
         block.i32_const(32);
-        block.call(allocator);
+        block.call(compilation_ctx.allocator);
 
         let unpacked_pointer = module.locals.add(ValType::I32);
         block.local_set(unpacked_pointer);
@@ -95,7 +94,7 @@ impl IU256 {
             block.local_get(unpacked_pointer);
             block.local_get(reader_pointer);
             block.load(
-                memory,
+                compilation_ctx.memory_id,
                 LoadKind::I64 { atomic: false },
                 MemArg {
                     align: 0,
@@ -108,7 +107,7 @@ impl IU256 {
         // store in reverse order
         for i in 0..4 {
             block.store(
-                memory,
+                compilation_ctx.memory_id,
                 StoreKind::I64 { atomic: false },
                 MemArg {
                     align: 0,
@@ -134,14 +133,13 @@ impl IAddress {
         module: &mut Module,
         reader_pointer: LocalId,
         _calldata_reader_pointer: LocalId,
-        memory: MemoryId,
-        allocator: FunctionId,
+        compilation_ctx: &CompilationContext,
     ) {
         let encoded_size =
             sol_data::Address::ENCODED_SIZE.expect("Address should have a fixed size");
 
         block.i32_const(32);
-        block.call(allocator);
+        block.call(compilation_ctx.allocator);
 
         let unpacked_pointer = module.locals.add(ValType::I32);
         block.local_set(unpacked_pointer);
@@ -150,7 +148,7 @@ impl IAddress {
             block.local_get(unpacked_pointer);
             block.local_get(reader_pointer);
             block.load(
-                memory,
+                compilation_ctx.memory_id,
                 LoadKind::I64 { atomic: false },
                 MemArg {
                     align: 0,
@@ -159,7 +157,7 @@ impl IAddress {
             );
 
             block.store(
-                memory,
+                compilation_ctx.memory_id,
                 StoreKind::I64 { atomic: false },
                 MemArg {
                     align: 0,
@@ -180,67 +178,20 @@ impl IAddress {
 
 #[cfg(test)]
 mod tests {
-    use alloy::{
-        dyn_abi::SolType,
-        hex::FromHex,
-        primitives::{Address, U256},
-        sol,
-    };
-    use walrus::{FunctionBuilder, FunctionId, MemoryId, ModuleConfig, ValType};
-    use wasmtime::{
-        Engine, Global, Instance, Linker, Module as WasmModule, Store, TypedFunc, WasmResults,
-    };
+    use alloy_primitives::{Address, U256, address};
+    use alloy_sol_types::{SolType, sol};
+    use walrus::{FunctionBuilder, ValType};
 
     use crate::{
-        abi_types::unpacking::Unpackable, memory::setup_module_memory,
+        abi_types::unpacking::Unpackable,
+        test_compilation_context,
+        test_tools::{build_module, setup_wasmtime_module},
         translation::intermediate_types::IntermediateType,
     };
 
-    use super::*;
-
-    fn build_module() -> (Module, FunctionId, MemoryId) {
-        let config = ModuleConfig::new();
-        let mut module = Module::with_config(config);
-        let (allocator_func, memory_id) = setup_module_memory(&mut module);
-
-        (module, allocator_func, memory_id)
-    }
-
-    fn setup_wasmtime_module<R: WasmResults>(
-        module: &mut Module,
-        initial_memory_data: Vec<u8>,
-        function_name: &str,
-    ) -> (Linker<()>, Instance, Store<()>, TypedFunc<(), R>, Global) {
-        let engine = Engine::default();
-        let module = WasmModule::from_binary(&engine, &module.emit_wasm()).unwrap();
-
-        let linker = Linker::new(&engine);
-
-        let mut store = Store::new(&engine, ());
-        let instance = linker.instantiate(&mut store, &module).unwrap();
-
-        let entrypoint = instance
-            .get_typed_func::<(), R>(&mut store, function_name)
-            .unwrap();
-
-        let global_next_free_memory_pointer = instance
-            .get_global(&mut store, "global_next_free_memory_pointer")
-            .unwrap();
-
-        let memory = instance.get_memory(&mut store, "memory").unwrap();
-        memory.write(&mut store, 0, &initial_memory_data).unwrap();
-
-        (
-            linker,
-            instance,
-            store,
-            entrypoint,
-            global_next_free_memory_pointer,
-        )
-    }
-
     fn test_uint(data: &[u8], int_type: IntermediateType, expected_result_bytes: &[u8]) {
-        let (mut raw_module, allocator, memory_id) = build_module();
+        let (mut raw_module, allocator, memory_id) = build_module(Some(data.len() as i32));
+        let compilation_ctx = test_compilation_context!(memory_id, allocator);
 
         let mut function_builder =
             FunctionBuilder::new(&mut raw_module.types, &[], &[ValType::I32]);
@@ -251,28 +202,26 @@ mod tests {
         func_body.i32_const(0);
         func_body.local_set(args_pointer);
 
-        // Mock args allocation
-        func_body.i32_const(data.len() as i32);
-        func_body.call(allocator);
-        func_body.drop();
-
         // Args data should already be stored in memory
         int_type.add_unpack_instructions(
             &mut func_body,
             &mut raw_module,
             args_pointer,
             args_pointer,
-            memory_id,
-            allocator,
+            &compilation_ctx,
         );
 
         let function = function_builder.finish(vec![], &mut raw_module.funcs);
         raw_module.exports.add("test_function", function);
 
-        let (_, instance, mut store, entrypoint, global_next_free_memory_pointer) =
-            setup_wasmtime_module::<i32>(&mut raw_module, data.to_vec(), "test_function");
+        let (_, instance, mut store, entrypoint) =
+            setup_wasmtime_module(&mut raw_module, data.to_vec(), "test_function", None);
 
-        let result = entrypoint.call(&mut store, ()).unwrap();
+        let global_next_free_memory_pointer = instance
+            .get_global(&mut store, "global_next_free_memory_pointer")
+            .unwrap();
+
+        let result: i32 = entrypoint.call(&mut store, ()).unwrap();
         assert_eq!(result, data.len() as i32);
 
         let global_next_free_memory_pointer = global_next_free_memory_pointer
@@ -342,22 +291,16 @@ mod tests {
         let data = SolType::abi_encode_params(&(Address::ZERO,));
         test_uint(&data, int_type.clone(), &data);
 
-        let data = SolType::abi_encode_params(&(Address::from_hex(
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .unwrap(),));
+        let data =
+            SolType::abi_encode_params(&(address!("0x1234567890abcdef1234567890abcdef12345678"),));
         test_uint(&data, int_type.clone(), &data);
 
-        let data = SolType::abi_encode_params(&(Address::from_hex(
-            "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        )
-        .unwrap(),));
+        let data =
+            SolType::abi_encode_params(&(address!("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),));
         test_uint(&data, int_type.clone(), &data);
 
-        let data = SolType::abi_encode_params(&(Address::from_hex(
-            "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE",
-        )
-        .unwrap(),));
+        let data =
+            SolType::abi_encode_params(&(address!("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE"),));
         test_uint(&data, int_type.clone(), &data);
     }
 }
