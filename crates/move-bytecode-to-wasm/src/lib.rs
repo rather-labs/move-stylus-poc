@@ -1,32 +1,46 @@
-use std::{collections::HashMap, path::Path};
-
 use abi_types::public_function::PublicFunction;
 pub(crate) use compilation_context::{CompilationContext, UserDefinedType};
 use compilation_context::{ModuleData, ModuleId};
+use constructor::inject_constructor;
 use move_binary_format::file_format::FunctionDefinition;
 use move_package::{
     compilation::compiled_package::{CompiledPackage, CompiledUnitWithSource},
     source_package::parsed_manifest::PackageName,
 };
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::Path,
+};
 use translation::{
+    intermediate_types::IntermediateType,
     table::{FunctionId, FunctionTable},
     translate_function,
 };
-use walrus::{Module, RefType, ValType};
+
+use walrus::{Module, RefType};
 use wasm_validation::validate_stylus_wasm;
 
 pub(crate) mod abi_types;
 mod compilation_context;
+mod constructor;
+mod data;
+mod generics;
 mod hostio;
 mod memory;
 mod native_functions;
 mod runtime;
 mod runtime_error_codes;
+mod storage;
 mod translation;
 mod utils;
+mod vm_handled_types;
 mod wasm_builder_extensions;
 mod wasm_helpers;
 mod wasm_validation;
+
+#[cfg(feature = "inject-host-debug-fns")]
+use walrus::ValType;
 
 #[cfg(test)]
 mod test_tools;
@@ -80,6 +94,8 @@ pub fn translate_package(
         };
 
         let (mut module, allocator_func, memory_id) = hostio::new_module_with_host();
+
+        #[cfg(feature = "inject-host-debug-fns")]
         inject_debug_fns(&mut module);
 
         // Function table
@@ -90,6 +106,7 @@ pub fn translate_package(
         process_dependency_tree(
             &mut modules_data,
             &package.deps_compiled_units,
+            &root_compiled_units,
             &root_compiled_module.immediate_dependencies(),
             &mut function_definitions,
         );
@@ -97,22 +114,20 @@ pub fn translate_package(
         let root_module_data = ModuleData::build_module_data(
             root_module_id.clone(),
             root_compiled_module,
+            &package.deps_compiled_units,
+            &root_compiled_units,
             &mut function_definitions,
         );
 
-        let compilation_ctx = CompilationContext {
-            root_module_data: &root_module_data,
-            deps_data: &modules_data,
-            memory_id,
-            allocator: allocator_func,
-        };
+        let compilation_ctx =
+            CompilationContext::new(&root_module_data, &modules_data, memory_id, allocator_func);
 
         let mut public_functions = Vec::new();
         for function_information in root_module_data
             .functions
             .information
             .iter()
-            .filter(|fi| fi.function_id.module_id == root_module_id)
+            .filter(|fi| fi.function_id.module_id == root_module_id && !fi.is_generic)
         {
             translate_and_link_functions(
                 &function_information.function_id,
@@ -137,6 +152,14 @@ pub fn translate_package(
                 ));
             }
         }
+
+        // Inject constructor function.
+        inject_constructor(
+            &mut function_table,
+            &mut module,
+            &compilation_ctx,
+            &mut public_functions,
+        );
 
         hostio::build_entrypoint_router(&mut module, &public_functions, &compilation_ctx);
 
@@ -177,6 +200,7 @@ pub fn translate_package_cli(package: CompiledPackage, rerooted_path: &Path) {
 pub fn process_dependency_tree<'move_package>(
     dependencies_data: &mut HashMap<ModuleId, ModuleData>,
     deps_compiled_units: &'move_package [(PackageName, CompiledUnitWithSource)],
+    root_compiled_units: &'move_package [CompiledUnitWithSource],
     dependencies: &[move_core_types::language_storage::ModuleId],
     function_definitions: &mut GlobalFunctionTable<'move_package>,
 ) {
@@ -206,12 +230,14 @@ pub fn process_dependency_tree<'move_package>(
 
         let dependency_module = &dependency_module.unit.module;
 
+        let immediate_dependencies = &dependency_module.immediate_dependencies();
         // If the the dependency has dependency, we process them first
-        if !dependency_module.immediate_dependencies().is_empty() {
+        if !immediate_dependencies.is_empty() {
             process_dependency_tree(
                 dependencies_data,
                 deps_compiled_units,
-                &dependency_module.immediate_dependencies(),
+                root_compiled_units,
+                immediate_dependencies,
                 function_definitions,
             );
         }
@@ -219,6 +245,8 @@ pub fn process_dependency_tree<'move_package>(
         let dependency_module_data = ModuleData::build_module_data(
             module_id.clone(),
             dependency_module,
+            deps_compiled_units,
+            root_compiled_units,
             function_definitions,
         );
 
@@ -247,8 +275,10 @@ fn translate_and_link_functions(
         .functions
         .information
         .iter()
-        .find(|f| &f.function_id == function_id)
-    {
+        .find(|f| {
+            f.function_id.module_id == function_id.module_id
+                && f.function_id.identifier == function_id.identifier
+        }) {
         (fi, compilation_ctx.root_module_data)
     } else {
         let module_data = compilation_ctx
@@ -260,15 +290,23 @@ fn translate_and_link_functions(
             .functions
             .information
             .iter()
-            .find(|f| &f.function_id == function_id)
+            .find(|f| f.function_id.identifier == function_id.identifier)
             .unwrap();
 
         (fi, module_data)
     };
 
+    // If the function is generic, we instantiate the concrete types so we can translate it
+    let function_information = if function_information.is_generic {
+        &function_information.instantiate(function_id.type_instantiations.as_ref().unwrap())
+    } else {
+        function_information
+    };
+
     // Process function defined in this module
     // First we check if there is already an entry for this function
-    if let Some(table_entry) = function_table.get_by_function_id(function_id) {
+    if let Some(table_entry) = function_table.get_by_function_id(&function_information.function_id)
+    {
         // If it has asigned a wasm function id means that we already translated it, so we skip
         // it
         if table_entry.wasm_function_id.is_some() {
@@ -281,7 +319,8 @@ fn translate_and_link_functions(
     }
 
     let function_definition = function_definitions
-        .get(function_id)
+        // TODO do this in nother way
+        .get(&function_id.get_generic_fn_id())
         .unwrap_or_else(|| panic!("could not find function definition for {}", function_id));
 
     // If the function contains code we translate it
@@ -315,6 +354,19 @@ fn translate_and_link_functions(
     }
 }
 
+// TODO: Move somewhere else
+pub fn get_generic_function_name(base_name: &str, generics: &[&IntermediateType]) -> String {
+    if generics.is_empty() {
+        panic!("generic_function_name called with no generics");
+    }
+
+    let mut hasher = DefaultHasher::new();
+    generics.iter().for_each(|t| t.hash(&mut hasher));
+    let hash = format!("{:x}", hasher.finish());
+    format!("{base_name}_{hash}")
+}
+
+#[cfg(feature = "inject-host-debug-fns")]
 fn inject_debug_fns(module: &mut walrus::Module) {
     if cfg!(feature = "inject-host-debug-fns") {
         let func_ty = module.types.add(&[ValType::I32], &[]);

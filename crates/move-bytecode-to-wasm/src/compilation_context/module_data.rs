@@ -4,6 +4,7 @@ mod struct_data;
 
 use crate::{
     GlobalFunctionTable,
+    compilation_context::reserved_modules::STYLUS_FRAMEWORK_ADDRESS,
     translation::{
         functions::MappedFunction,
         intermediate_types::{
@@ -19,13 +20,21 @@ use function_data::FunctionData;
 use move_binary_format::{
     CompiledModule,
     file_format::{
-        Constant, DatatypeHandleIndex, EnumDefinitionIndex, FieldHandleIndex,
-        FieldInstantiationIndex, FunctionDefinitionIndex, SignatureIndex,
-        StructDefInstantiationIndex, StructDefinitionIndex, VariantHandleIndex,
+        Ability, AbilitySet, Constant, DatatypeHandleIndex, EnumDefinitionIndex, FieldHandleIndex,
+        FieldInstantiationIndex, FunctionDefinition, FunctionDefinitionIndex, Signature,
+        SignatureIndex, SignatureToken, StructDefInstantiationIndex, StructDefinitionIndex,
+        VariantHandleIndex, Visibility,
     },
     internals::ModuleIndex,
 };
-use std::{collections::HashMap, fmt::Display};
+use move_package::{
+    compilation::compiled_package::CompiledUnitWithSource,
+    source_package::parsed_manifest::PackageName,
+};
+use std::{
+    collections::HashMap,
+    fmt::{Debug, Display},
+};
 use struct_data::StructData;
 
 use super::{CompilationContextError, Result};
@@ -33,21 +42,21 @@ use super::{CompilationContextError, Result};
 #[derive(Debug)]
 pub enum UserDefinedType {
     /// Struct defined in this module
-    Struct(u16),
+    Struct { module_id: ModuleId, index: u16 },
 
     /// Enum defined in this module
     Enum(usize),
-
-    /// Data type defined outside this module
-    ExternalData {
-        module: ModuleId,
-        identifier: String,
-    },
 }
 
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
 #[repr(transparent)]
 pub struct Address([u8; 32]);
+
+impl Address {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Address(bytes)
+    }
+}
 
 impl Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,6 +69,12 @@ impl Display for Address {
         }
 
         Ok(())
+    }
+}
+
+impl Debug for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Address[{}]", self)
     }
 }
 
@@ -81,8 +96,21 @@ impl Display for ModuleId {
     }
 }
 
+// TODO: This just makes sense for testing
+impl Default for ModuleId {
+    fn default() -> Self {
+        Self {
+            address: Address::from([0; 32]),
+            module_name: "default".to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ModuleData {
+    /// Module's ID
+    pub id: ModuleId,
+
     /// Move's connstant pool
     pub constants: Vec<Constant>,
 
@@ -108,9 +136,16 @@ impl ModuleData {
     pub fn build_module_data<'move_package>(
         module_id: ModuleId,
         move_module: &'move_package CompiledModule,
+        move_module_dependencies: &'move_package [(PackageName, CompiledUnitWithSource)],
+        root_compiled_units: &'move_package [CompiledUnitWithSource],
         function_definitions: &mut GlobalFunctionTable<'move_package>,
     ) -> Self {
-        let datatype_handles_map = Self::process_datatype_handles(move_module);
+        let datatype_handles_map = Self::process_datatype_handles(
+            &module_id,
+            move_module,
+            move_module_dependencies,
+            root_compiled_units,
+        );
 
         // Module's structs
         let (module_structs, fields_to_struct_map) =
@@ -140,10 +175,11 @@ impl ModuleData {
         };
 
         let functions = Self::process_function_definitions(
-            module_id,
+            module_id.clone(),
             move_module,
             &datatype_handles_map,
             function_definitions,
+            move_module_dependencies,
         );
 
         let signatures = move_module
@@ -158,6 +194,7 @@ impl ModuleData {
             .unwrap();
 
         ModuleData {
+            id: module_id,
             constants: move_module.constant_pool.clone(), // TODO: Clone
             functions,
             structs,
@@ -168,7 +205,10 @@ impl ModuleData {
     }
 
     fn process_datatype_handles(
+        module_id: &ModuleId,
         module: &CompiledModule,
+        move_module_dependencies: &[(PackageName, CompiledUnitWithSource)],
+        root_compiled_units: &[CompiledUnitWithSource],
     ) -> HashMap<DatatypeHandleIndex, UserDefinedType> {
         let mut datatype_handles_map = HashMap::new();
 
@@ -185,7 +225,13 @@ impl ModuleData {
                     .iter()
                     .position(|s| s.struct_handle == idx)
                 {
-                    datatype_handles_map.insert(idx, UserDefinedType::Struct(position as u16));
+                    datatype_handles_map.insert(
+                        idx,
+                        UserDefinedType::Struct {
+                            module_id: module_id.clone(), // TODO: clone
+                            index: position as u16,
+                        },
+                    );
                 } else if let Some(position) =
                     module.enum_defs().iter().position(|e| e.enum_handle == idx)
                 {
@@ -195,21 +241,64 @@ impl ModuleData {
                 };
             } else {
                 let datatype_module = module.module_handle_at(datatype_handle.module);
+                let module_address = module.address_identifier_at(datatype_module.address);
+                let module_name = module.identifier_at(datatype_module.name);
+
                 let module_id = ModuleId {
-                    address: module
-                        .address_identifier_at(datatype_module.address)
-                        .into_bytes()
-                        .into(),
-                    module_name: module.identifier_at(datatype_module.name).to_string(),
+                    address: module_address.into_bytes().into(),
+                    module_name: module_name.to_string(),
                 };
 
-                datatype_handles_map.insert(
-                    idx,
-                    UserDefinedType::ExternalData {
-                        module: module_id,
-                        identifier: module.identifier_at(datatype_handle.name).to_string(),
-                    },
-                );
+                // Find the module where the external data is defined, we first look for it in the
+                // external packages and if we dont't find it, we look for it in the compile units
+                // that belong to our package
+                let external_module_source = if let Some(external_module) =
+                    &move_module_dependencies.iter().find(|(_, m)| {
+                        m.unit.name().as_str() == module_name.as_str()
+                            && m.unit.address == *module_address
+                    }) {
+                    &external_module.1.unit.module
+                } else if let Some(external_module) = &root_compiled_units.iter().find(|m| {
+                    m.unit.name().as_str() == module_name.as_str()
+                        && m.unit.address == *module_address
+                }) {
+                    &external_module.unit.module
+                } else {
+                    panic!("could not find dependency {module_id}")
+                };
+
+                let external_data_name = module.identifier_at(datatype_handle.name);
+
+                let external_dth_idx = external_module_source
+                    .datatype_handles()
+                    .iter()
+                    .position(|dth| {
+                        external_module_source.identifier_at(dth.name) == external_data_name
+                    })
+                    .unwrap();
+                let external_dth_idx = DatatypeHandleIndex::new(external_dth_idx as u16);
+
+                if let Some(position) = external_module_source
+                    .struct_defs()
+                    .iter()
+                    .position(|s| s.struct_handle == external_dth_idx)
+                {
+                    datatype_handles_map.insert(
+                        idx,
+                        UserDefinedType::Struct {
+                            module_id,
+                            index: position as u16,
+                        },
+                    );
+                } else if let Some(position) = module
+                    .enum_defs()
+                    .iter()
+                    .position(|e| e.enum_handle == external_dth_idx)
+                {
+                    datatype_handles_map.insert(idx, UserDefinedType::Enum(position));
+                } else {
+                    panic!("datatype handle index {index} not found");
+                };
             }
         }
 
@@ -263,15 +352,25 @@ impl ModuleData {
                 }
             }
 
+            let struct_datatype_handle = module.datatype_handle_at(struct_def.struct_handle);
             let identifier = module
-                .identifier_at(module.datatype_handle_at(struct_def.struct_handle).name)
+                .identifier_at(struct_datatype_handle.name)
                 .to_string();
+
+            let is_saved_in_storage = struct_datatype_handle
+                .abilities
+                .into_iter()
+                .any(|a| a == Ability::Key);
+
+            let is_one_time_witness = Self::is_one_time_witness(module, struct_def.struct_handle);
 
             module_structs.push(IStruct::new(
                 struct_index,
                 identifier,
                 all_fields,
                 fields_map,
+                is_saved_in_storage,
+                is_one_time_witness,
             ));
         }
 
@@ -437,12 +536,14 @@ impl ModuleData {
         move_module: &'move_package CompiledModule,
         datatype_handles_map: &HashMap<DatatypeHandleIndex, UserDefinedType>,
         function_definitions: &mut GlobalFunctionTable<'move_package>,
+        move_module_dependencies: &'move_package [(PackageName, CompiledUnitWithSource)],
     ) -> FunctionData {
         // Return types of functions in intermediate types. Used to fill the stack type
         let mut functions_returns = Vec::new();
         let mut functions_arguments = Vec::new();
         let mut function_calls = Vec::new();
         let mut function_information = Vec::new();
+        let mut init = None;
 
         for (index, function) in move_module.function_handles().iter().enumerate() {
             let move_function_arguments = &move_module.signature_at(function.parameters);
@@ -483,6 +584,7 @@ impl ModuleData {
                     address: function_module_address,
                     module_name: function_module_name.to_string(),
                 },
+                type_instantiations: None,
             };
 
             // If the functions is defined in this module, we can obtain its definition and process
@@ -507,6 +609,23 @@ impl ModuleData {
                     &vec![]
                 };
 
+                let is_init = Self::is_init(
+                    &function_id,
+                    move_function_arguments,
+                    move_function_return,
+                    function_def,
+                    datatype_handles_map,
+                    move_module,
+                    move_module_dependencies,
+                );
+
+                if is_init {
+                    if init.is_some() {
+                        panic!("There can be only a single init function per module.");
+                    }
+                    init = Some(function_id.clone());
+                }
+
                 function_information.push(MappedFunction::new(
                     function_id.clone(),
                     move_function_arguments,
@@ -522,11 +641,44 @@ impl ModuleData {
             function_calls.push(function_id);
         }
 
+        let mut generic_function_calls = Vec::new();
+        for function in move_module.function_instantiations().iter() {
+            let function_handle = move_module.function_handle_at(function.handle);
+            let function_name = move_module.identifier_at(function_handle.name).as_str();
+            let function_module = move_module.module_handle_at(function_handle.module);
+            let function_module_name = move_module.identifier_at(function_module.name).as_str();
+            let function_module_address: Address = move_module
+                .address_identifier_at(function_module.address)
+                .into_bytes()
+                .into();
+
+            let type_instantiations = move_module
+                .signature_at(function.type_parameters)
+                .0
+                .iter()
+                .map(|s| IntermediateType::try_from_signature_token(s, datatype_handles_map))
+                .collect::<std::result::Result<Vec<IntermediateType>, anyhow::Error>>()
+                .unwrap();
+
+            let function_id = FunctionId {
+                identifier: function_name.to_string(),
+                module_id: ModuleId {
+                    address: function_module_address,
+                    module_name: function_module_name.to_string(),
+                },
+                type_instantiations: Some(type_instantiations),
+            };
+
+            generic_function_calls.push(function_id);
+        }
+
         FunctionData {
             arguments: functions_arguments,
             returns: functions_returns,
             calls: function_calls,
+            generic_calls: generic_function_calls,
             information: function_information,
+            init,
         }
     }
 
@@ -534,5 +686,180 @@ impl ModuleData {
         self.signatures
             .get(index.into_index())
             .ok_or(CompilationContextError::SignatureNotFound(index))
+    }
+
+    // The init() function is a special function that is called once when the module is first deployed,
+    // so it is a good place to put the code that initializes module's objects and sets up the environment and configuration.
+    //
+    // For the init() function to be considered valid, it must adhere to the following requirements:
+    // 1. It must be named `init`.
+    // 2. It must be private.
+    // 3. It must have &TxContext or &mut TxContext as its last argument, with an optional One Time Witness (OTW) as its first argument.
+    // 4. It must not return any values.
+    //
+    // fun init(ctx: &TxContext) { /* ... */}
+    // fun init(otw: OTW, ctx: &mut TxContext) { /* ... */ }
+    //
+
+    /// Checks if the given function (by index) is a valid `init` function.
+    // TODO: Note that we currently trigger a panic if a function named 'init' fails to satisfy certain criteria to qualify as a constructor.
+    // This behavior is not enforced by the move compiler itself.
+    fn is_init(
+        function_id: &FunctionId,
+        move_function_arguments: &Signature,
+        move_function_return: &Signature,
+        function_def: &FunctionDefinition,
+        datatype_handles_map: &HashMap<DatatypeHandleIndex, UserDefinedType>,
+        module: &CompiledModule,
+        move_module_dependencies: &[(PackageName, CompiledUnitWithSource)],
+    ) -> bool {
+        // Constants
+        const INIT_FUNCTION_NAME: &str = "init";
+
+        // Error messages
+        const BAD_ARGS_ERROR_MESSAGE: &str = "invalid arguments";
+        const BAD_VISIBILITY_ERROR_MESSAGE: &str = "expected private visibility";
+        const BAD_RETURN_ERROR_MESSAGE: &str = "expected no return values";
+
+        // Must be named `init`
+        if function_id.identifier != INIT_FUNCTION_NAME {
+            return false;
+        }
+
+        // Must be private
+        assert_eq!(
+            function_def.visibility,
+            Visibility::Private,
+            "{}",
+            BAD_VISIBILITY_ERROR_MESSAGE
+        );
+
+        // Must have 1 or 2 arguments
+        let arg_count = move_function_arguments.len();
+        assert!((1..=2).contains(&arg_count), "{}", BAD_ARGS_ERROR_MESSAGE);
+
+        // Check TxContext in the last argument
+        let last_arg = move_function_arguments.0.last().map(|last| {
+            IntermediateType::try_from_signature_token(last, datatype_handles_map).unwrap()
+        });
+
+        // The compilation context is not available yet, so we can't use it to check if the
+        // `TxContext` is the one from the stylus framework. It is done manually
+        let is_tx_context_ref = match last_arg {
+            Some(IntermediateType::IRef(inner)) | Some(IntermediateType::IMutRef(inner)) => {
+                match inner.as_ref() {
+                    IntermediateType::IStruct {
+                        module_id, index, ..
+                    } if module_id.module_name == "tx_context"
+                        && module_id.address == STYLUS_FRAMEWORK_ADDRESS =>
+                    {
+                        // TODO: Look for this external module one time and pass it down to this
+                        // function
+                        let external_module_source = &move_module_dependencies
+                            .iter()
+                            .find(|(_, m)| {
+                                m.unit.name().as_str() == "tx_context"
+                                    && Address::from(m.unit.address.into_bytes())
+                                        == STYLUS_FRAMEWORK_ADDRESS
+                            })
+                            .expect("could not find stylus framework as dependency")
+                            .1
+                            .unit
+                            .module;
+
+                        let struct_ = external_module_source
+                            .struct_def_at(StructDefinitionIndex::new(*index));
+                        let handle =
+                            external_module_source.datatype_handle_at(struct_.struct_handle);
+                        let identifier = external_module_source.identifier_at(handle.name);
+                        identifier.as_str() == "TxContext"
+                    }
+
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+
+        assert!(is_tx_context_ref, "{}", BAD_ARGS_ERROR_MESSAGE);
+
+        // Check OTW if 2 arguments
+        if arg_count == 2 {
+            let SignatureToken::Datatype(idx) = &move_function_arguments.0[0] else {
+                panic!("{}", BAD_ARGS_ERROR_MESSAGE);
+            };
+
+            assert!(
+                Self::is_one_time_witness(module, *idx),
+                "{}",
+                BAD_ARGS_ERROR_MESSAGE
+            );
+        }
+
+        // Must not return any values
+        assert!(
+            move_function_return.is_empty(),
+            "{}",
+            BAD_RETURN_ERROR_MESSAGE
+        );
+
+        true
+    }
+
+    /// Checks if the given signature token is a one-time witness type.
+    //
+    // OTW (One-time witness) types are structs with the following requirements:
+    // i. Their name is the upper-case version of the module's name.
+    // ii. They have no fields (or a single boolean field).
+    // iii. They have no type parameters.
+    // iv. They have only the 'drop' ability.
+    fn is_one_time_witness(
+        module: &CompiledModule,
+        datatype_handle_index: DatatypeHandleIndex,
+    ) -> bool {
+        // 1. Datatype handle must be a struct
+        let datatype_handle = module.datatype_handle_at(datatype_handle_index);
+
+        // 2. Name must match uppercase module name
+        let module_handle = module.module_handle_at(datatype_handle.module);
+        let module_name = module.identifier_at(module_handle.name).as_str();
+        let struct_name = module.identifier_at(datatype_handle.name).as_str();
+        if struct_name != module_name.to_ascii_uppercase() {
+            return false;
+        }
+
+        // 3. Must have only the Drop ability
+        if datatype_handle.abilities != (AbilitySet::EMPTY | Ability::Drop) {
+            return false;
+        }
+
+        // 4. Must have no type parameters
+        if !datatype_handle.type_parameters.is_empty() {
+            return false;
+        }
+
+        // 5. Must have 0 or 1 field (and if 1, it must be Bool)
+        let struct_def = match module
+            .struct_defs
+            .iter()
+            .find(|def| def.struct_handle == datatype_handle_index)
+        {
+            Some(def) => def,
+            None => return false,
+        };
+
+        let field_count = struct_def.declared_field_count().unwrap_or(0);
+        if field_count > 1 {
+            return false;
+        }
+
+        if field_count == 1 {
+            let field = struct_def.field(0).unwrap();
+            if field.signature.0 != SignatureToken::Bool {
+                return false;
+            }
+        }
+
+        true
     }
 }

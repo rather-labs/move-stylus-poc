@@ -175,3 +175,26 @@ public fun vec_push_and_pop_back(x: vector<Foo>, y: Foo): vector<Foo> {
   z.pop_back();
   z
 }
+
+public fun vec_eq(x: vector<Foo>, y: vector<Foo>): bool {
+    x == y
+}
+
+public fun vec_neq(x: vector<Foo>, y: vector<Foo>): bool {
+    x != y
+}
+
+public fun vec_borrow(x: &vector<Foo>): &Foo {
+    &x[0]
+}
+
+public fun vec_mut_borrow(x: &mut vector<Foo>): &mut Foo {
+    &mut x[0]
+}
+
+// This generates a VecUnpack instruction
+public fun vec_unpack(x: vector<Foo>): vector<Foo> {
+    let mut z = get_literal();
+    x.do!(|e| z.push_back(e));
+    z
+}

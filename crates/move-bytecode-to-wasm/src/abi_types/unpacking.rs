@@ -2,7 +2,8 @@ use walrus::{InstrSeqBuilder, LocalId, Module, ValType};
 
 use crate::{
     CompilationContext,
-    compilation_context::ExternalModuleData,
+    data::DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET,
+    runtime::RuntimeFunction,
     translation::intermediate_types::{
         IntermediateType,
         address::IAddress,
@@ -13,9 +14,8 @@ use crate::{
         simple_integers::{IU8, IU16, IU32, IU64},
         vector::IVector,
     },
+    vm_handled_types::{VmHandledType, tx_context::TxContext},
 };
-
-use super::vm_handled_datatypes::TxContext;
 
 mod unpack_enum;
 mod unpack_heap_int;
@@ -168,38 +168,68 @@ impl Unpackable for IntermediateType {
                 calldata_reader_pointer,
                 compilation_ctx,
             ),
-            IntermediateType::IStruct(index) => {
+
+            IntermediateType::IStruct { module_id, index }
+                if TxContext::is_vm_type(module_id, *index, compilation_ctx) =>
+            {
+                TxContext::inject(function_builder, module, compilation_ctx);
+            }
+            IntermediateType::IStruct { module_id, index } => {
                 let struct_ = compilation_ctx
-                    .root_module_data
-                    .structs
-                    .get_by_index(*index)
+                    .get_struct_by_index(module_id, *index)
                     .unwrap();
 
-                // TODO: Check if the struct is TxContext. If it is, panic since the only valid
-                // TxContext is the one defined in the stylus framework.
+                if struct_.saved_in_storage {
+                    add_unpack_from_storage_instructions(
+                        function_builder,
+                        module,
+                        reader_pointer,
+                        calldata_reader_pointer,
+                        compilation_ctx,
+                        self,
+                        false,
+                    );
+                } else {
+                    // TODO: Check if the struct is TxContext. If it is, panic since the only valid
+                    // TxContext is the one defined in the stylus framework.
 
-                struct_.add_unpack_instructions(
-                    function_builder,
-                    module,
-                    reader_pointer,
-                    calldata_reader_pointer,
-                    compilation_ctx,
-                );
+                    struct_.add_unpack_instructions(
+                        function_builder,
+                        module,
+                        reader_pointer,
+                        calldata_reader_pointer,
+                        compilation_ctx,
+                    );
+                }
             }
-            IntermediateType::IGenericStructInstance(index, types) => {
+            IntermediateType::IGenericStructInstance {
+                module_id,
+                index,
+                types,
+            } => {
                 let struct_ = compilation_ctx
-                    .root_module_data
-                    .structs
-                    .get_by_index(*index)
+                    .get_struct_by_index(module_id, *index)
                     .unwrap();
                 let struct_instance = struct_.instantiate(types);
-                struct_instance.add_unpack_instructions(
-                    function_builder,
-                    module,
-                    reader_pointer,
-                    calldata_reader_pointer,
-                    compilation_ctx,
-                )
+                if struct_instance.saved_in_storage {
+                    add_unpack_from_storage_instructions(
+                        function_builder,
+                        module,
+                        reader_pointer,
+                        calldata_reader_pointer,
+                        compilation_ctx,
+                        self,
+                        false,
+                    );
+                } else {
+                    struct_instance.add_unpack_instructions(
+                        function_builder,
+                        module,
+                        reader_pointer,
+                        calldata_reader_pointer,
+                        compilation_ctx,
+                    )
+                }
             }
             IntermediateType::IEnum(enum_index) => {
                 let enum_ = compilation_ctx
@@ -220,52 +250,53 @@ impl Unpackable for IntermediateType {
                     compilation_ctx,
                 )
             }
-            IntermediateType::IExternalUserData {
-                module_id,
-                identifier,
-            } => {
-                let external_data = compilation_ctx
-                    .get_external_module_data(module_id, identifier)
-                    .unwrap();
-
-                match external_data {
-                    ExternalModuleData::Struct(istruct) => {
-                        if TxContext::struct_is_tx_context(module_id, identifier) {
-                            TxContext::inject_tx_context(
-                                function_builder,
-                                compilation_ctx.allocator,
-                            );
-                        } else {
-                            istruct.add_unpack_instructions(
-                                function_builder,
-                                module,
-                                reader_pointer,
-                                calldata_reader_pointer,
-                                compilation_ctx,
-                            )
-                        }
-                    }
-                    ExternalModuleData::Enum(ienum) => {
-                        if !ienum.is_simple {
-                            panic!(
-                                "cannot abi external module's enum {identifier}, it contains at least one variant with fields"
-                            );
-                        }
-                        IEnum::add_unpack_instructions(
-                            ienum,
-                            function_builder,
-                            module,
-                            reader_pointer,
-                            compilation_ctx,
-                        )
-                    }
-                }
-            }
             IntermediateType::ITypeParameter(_) => {
                 panic!("cannot unpack generic type parameter");
             }
         }
     }
+}
+
+/// This function searches in the storage for the structure that belongs to the object UID passed
+/// as argument.
+fn add_unpack_from_storage_instructions(
+    function_builder: &mut InstrSeqBuilder,
+    module: &mut Module,
+    reader_pointer: LocalId,
+    calldata_reader_pointer: LocalId,
+    compilation_ctx: &CompilationContext,
+    itype: &IntermediateType,
+    unpack_frozen: bool,
+) {
+    // First we add the instructions to unpack the UID. We use address to unpack it because ids are
+    // 32 bytes static, same as an address
+    IAddress::add_unpack_instructions(
+        function_builder,
+        module,
+        reader_pointer,
+        calldata_reader_pointer,
+        compilation_ctx,
+    );
+
+    // Search for the object in the objects mappings
+    let locate_storage_data_fn =
+        RuntimeFunction::LocateStorageData.get(module, Some(compilation_ctx));
+
+    if unpack_frozen {
+        function_builder.i32_const(1);
+    } else {
+        function_builder.i32_const(0);
+    }
+
+    function_builder.call(locate_storage_data_fn);
+
+    // Read the object
+    let read_struct_from_storage_fn =
+        RuntimeFunction::DecodeAndReadFromStorage.get_generic(module, compilation_ctx, &[itype]);
+
+    function_builder
+        .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+        .call(read_struct_from_storage_fn);
 }
 
 #[cfg(test)]

@@ -2,11 +2,11 @@ use walrus::{FunctionId, InstrSeqBuilder, LocalId, Module, ValType, ir::BinaryOp
 
 use crate::{
     CompilationContext,
-    abi_types::vm_handled_datatypes::inject_signer,
     translation::{
         functions::add_unpack_function_return_values_instructions,
         intermediate_types::{ISignature, IntermediateType},
     },
+    vm_handled_types::{VmHandledType, signer::Signer},
 };
 
 use super::{
@@ -75,8 +75,6 @@ impl<'a> PublicFunction<'a> {
         args_len: LocalId,
         write_return_data_function: FunctionId,
         storage_flush_cache_function: FunctionId,
-        tx_origin_function: FunctionId,
-        emit_log_function: FunctionId,
         compilation_ctx: &CompilationContext,
     ) {
         router_builder.block(None, |block| {
@@ -97,22 +95,10 @@ impl<'a> PublicFunction<'a> {
             // first parameter
             match self.signature.arguments.first() {
                 Some(IntermediateType::ISigner) => {
-                    inject_signer(
-                        block,
-                        module,
-                        compilation_ctx.allocator,
-                        tx_origin_function,
-                        emit_log_function,
-                    );
+                    Signer::inject(block, module, compilation_ctx);
                 }
                 Some(IntermediateType::IRef(inner)) if **inner == IntermediateType::ISigner => {
-                    inject_signer(
-                        block,
-                        module,
-                        compilation_ctx.allocator,
-                        tx_origin_function,
-                        emit_log_function,
-                    );
+                    Signer::inject(block, module, compilation_ctx);
                 }
                 _ => {
                     // If there's no signer, reduce args length by 4 bytes to exclude selector,
@@ -172,8 +158,16 @@ impl<'a> PublicFunction<'a> {
             memory_id,
         );
 
-        build_pack_instructions(block, &self.signature.returns, module, compilation_ctx);
+        if self.signature.returns.is_empty() {
+            block.i32_const(0).i32_const(0).i32_const(0);
+            return;
+        }
 
+        // If we pack a unique value we proceed as always
+        let (data_start, data_end) =
+            build_pack_instructions(block, &self.signature.returns, module, compilation_ctx);
+
+        block.local_get(data_start).local_get(data_end);
         // TODO: Define error handling strategy, for now it will always result in traps
         // So it will only reach this point in the case of success
         block.i32_const(0);
@@ -208,6 +202,7 @@ impl<'a> PublicFunction<'a> {
                         function_name.to_owned(),
                     ));
                 }
+                // TODO: add TxContext as last parameter
                 _ => continue,
             }
         }
@@ -357,8 +352,6 @@ mod tests {
         // Build mock router
         let (write_return_data_function, _) = host_functions::write_result(module);
         let (storage_flush_cache_function, _) = host_functions::storage_flush_cache(module);
-        let (tx_origin_function, _) = host_functions::tx_origin(module);
-        let (emit_log_function, _) = host_functions::emit_log(module);
 
         let selector = module.locals.add(ValType::I32);
         let args_pointer = module.locals.add(ValType::I32);
@@ -399,8 +392,6 @@ mod tests {
             args_len,
             write_return_data_function,
             storage_flush_cache_function,
-            tx_origin_function,
-            emit_log_function,
             &compilation_ctx,
         );
 
@@ -490,6 +481,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn test_build_public_function_with_signer() {
         let (mut raw_module, allocator, memory_id) = build_module(None);
         let compilation_ctx = test_compilation_context!(memory_id, allocator);

@@ -3,13 +3,9 @@
 //! Then, it attempts to check the current counter value, increment it via a tx,
 //! and check the value again. The deployed contract is fully written in Rust and compiled to WASM
 //! but with Stylus, it is accessible just as a normal Solidity smart contract is via an ABI.
-
-use alloy::primitives::utils::parse_ether;
-use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::{primitives::Address, providers::ProviderBuilder, sol, transports::http::reqwest::Url};
 use dotenv::dotenv;
-
 use eyre::eyre;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -27,6 +23,17 @@ sol!(
 
         #[derive(Debug)]
         struct Foo {
+            uint16 c;
+            Bar d;
+            address e;
+            bool f;
+            uint64 g;
+            uint256 h;
+            uint32[] i;
+        }
+
+        #[derive(Debug)]
+        struct Baz {
             uint16 c;
             Bar d;
             address e;
@@ -53,6 +60,11 @@ sol!(
         }
 
         function createFooU16(uint16 x, uint16 y) external view returns (Foo);
+        function createFoo2U16(uint16 x, uint16 y) external view returns (Foo,Foo);
+        function createBazU16(uint16 x, uint16 y) external view returns (Baz);
+        function createBaz2U16(uint16 x, uint16 y) external view returns (Baz,Baz);
+        function multiValues1() external view returns (uint32[], uint128[], bool, uint64);
+        function multiValues2() external view returns (uint8, bool, uint64);
         function echoVariant(TestEnum v) external view returns (TestEnum);
         function testValues(Test test) external view returns (uint8, uint8);
         function echo(uint128 x) external view returns (uint128);
@@ -75,16 +87,16 @@ async fn main() -> eyre::Result<()> {
     let contract_address = std::env::var("CONTRACT_ADDRESS")
         .map_err(|_| eyre!("No {} env var set", "CONTRACT_ADDRESS"))?;
 
-
     let signer = PrivateKeySigner::from_str(&priv_key)?;
 
-    let provider = Arc::new(ProviderBuilder::new()
-        .wallet(signer)
-        .with_chain_id(412346)
-        .connect_http(Url::from_str(&rpc_url).unwrap()));
+    let provider = Arc::new(
+        ProviderBuilder::new()
+            .wallet(signer)
+            .with_chain_id(412346)
+            .connect_http(Url::from_str(&rpc_url).unwrap()),
+    );
     let address = Address::from_str(&contract_address)?;
     let example = Example::new(address, provider.clone());
-
 
     let num = example.echo(123).call().await?;
     println!("echo(123) = {}", num);
@@ -127,36 +139,55 @@ async fn main() -> eyre::Result<()> {
     let create_foo = example.createFooU16(55, 66).call().await?;
     println!("createFooU16(55, 66) = {:#?}", create_foo);
 
-    let echo_variant = example.echoVariant(Example::TestEnum::FirstVariant).call().await?;
+    let create_baz = example.createBazU16(55, 66).call().await?;
+    println!("createBazU16(55, 66) = {:#?}", create_baz);
+
+    let create_foo = example.createFoo2U16(55, 66).call().await?;
+    println!(
+        "createFoo2U16(55, 66) = {:#?} {:#?}",
+        create_foo._0, create_foo._1
+    );
+
+    let create_baz = example.createBaz2U16(55, 66).call().await?;
+    println!(
+        "createBaz2U16(55, 66) = {:#?} {:#?}",
+        create_baz._0, create_baz._1
+    );
+
+    let multi_values = example.multiValues1().call().await?;
+    println!(
+        "multiValues1 = ({:?}, {:?}, {}, {})",
+        multi_values._0, multi_values._1, multi_values._2, multi_values._3
+    );
+
+    let multi_values = example.multiValues2().call().await?;
+    println!(
+        "multiValues2 = ({}, {}, {})",
+        multi_values._0, multi_values._1, multi_values._2
+    );
+
+    let num = example.echo(123).call().await;
+    println!("Example echo = {:?}", num);
+    let echo_variant = example
+        .echoVariant(Example::TestEnum::FirstVariant)
+        .call()
+        .await?;
     println!("echoVariant(FirstVariant) = {:?}", echo_variant);
 
-    let echo_variant = example.echoVariant(Example::TestEnum::SecondVariant).call().await?;
+    let echo_variant = example
+        .echoVariant(Example::TestEnum::SecondVariant)
+        .call()
+        .await?;
     println!("echoVariant(SecondVariant) = {:?}", echo_variant);
 
-    let test_values = example.testValues(Example::Test {
-        pos0: 55,
-        pos1: Example::AnotherTest { pos0: 66 },
-    }).call().await?;
+    let test_values = example
+        .testValues(Example::Test {
+            pos0: 55,
+            pos1: Example::AnotherTest { pos0: 66 },
+        })
+        .call()
+        .await?;
     println!("testValues = ({}, {})", test_values._0, test_values._1);
-
-    // This simple call will inject the "from" field as asigner
-    let ret = example.echoSignerWithInt(42).call().await?;
-    println!("echoSignerWithInt = ({}, {})", ret._0, ret._1);
-
-    // A real tx should write in the logs the signer's address
-    // 0x3f1eae7d46d88f08fc2f8ed27fcb2ab183eb2d0e
-    let tx = example.echoSignerWithInt(43).into_transaction_request()
-        .to(Address::from_str(&contract_address).unwrap())
-        .value(parse_ether("0.1")?);
-
-
-    let pending_tx = provider.send_transaction(tx).await?;
-    let receipt = pending_tx.get_receipt().await?;
-
-    println!(
-        "echoSignerWithInt - transaction log data: {:?}",
-        receipt.logs().first().map(|l| l.data())
-    );
 
     Ok(())
 }

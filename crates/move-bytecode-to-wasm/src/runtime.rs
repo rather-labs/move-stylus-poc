@@ -1,10 +1,17 @@
 use walrus::{FunctionId, Module};
 
-use crate::CompilationContext;
+use crate::{
+    CompilationContext,
+    translation::intermediate_types::{
+        IntermediateType,
+        heap_integers::{IU128, IU256},
+    },
+};
 
 mod copy;
 mod equality;
 mod integers;
+mod storage;
 mod swap;
 mod vector;
 
@@ -31,12 +38,15 @@ pub enum RuntimeFunction {
     // Swap bytes
     SwapI32Bytes,
     SwapI64Bytes,
+    SwapI128Bytes,
+    SwapI256Bytes,
     // Copy
     CopyU128,
     CopyU256,
     // Equality
     HeapTypeEquality,
     VecEqualityHeapType,
+    IsZero,
     // Vector
     VecSwap32,
     VecSwap64,
@@ -45,6 +55,17 @@ pub enum RuntimeFunction {
     VecBorrow,
     VecIncrementLen,
     VecDecrementLen,
+    // Storage
+    StorageNextSlot,
+    DeriveMappingSlot,
+    DeriveDynArraySlot,
+    WriteObjectSlot,
+    LocateStorageData,
+    LocateStructSlot,
+    GetIdBytesPtr,
+    EncodeAndSaveInStorage,
+    DecodeAndReadFromStorage,
+    DeleteFromStorage,
 }
 
 impl RuntimeFunction {
@@ -72,12 +93,15 @@ impl RuntimeFunction {
             // Swap bytes
             Self::SwapI32Bytes => "swap_i32_bytes",
             Self::SwapI64Bytes => "swap_i64_bytes",
+            Self::SwapI128Bytes => "swap_i128_bytes",
+            Self::SwapI256Bytes => "swap_i256_bytes",
             // Copy
             Self::CopyU128 => "copy_u128",
             Self::CopyU256 => "copy_u256",
             // Equality
             Self::HeapTypeEquality => "heap_type_equality",
             Self::VecEqualityHeapType => "vec_equality_heap_type",
+            Self::IsZero => "is_zero",
             // Vector
             Self::VecSwap32 => "vec_swap_32",
             Self::VecSwap64 => "vec_swap_64",
@@ -86,6 +110,17 @@ impl RuntimeFunction {
             Self::VecBorrow => "vec_borrow",
             Self::VecIncrementLen => "vec_increment_len",
             Self::VecDecrementLen => "vec_decrement_len",
+            // Storage
+            Self::StorageNextSlot => "storage_next_slot",
+            Self::DeriveMappingSlot => "derive_mapping_slot",
+            Self::DeriveDynArraySlot => "derive_dyn_array_slot",
+            Self::LocateStorageData => "locate_storage_data",
+            Self::WriteObjectSlot => "write_object_slot",
+            Self::LocateStructSlot => "locate_struct_slot",
+            Self::GetIdBytesPtr => "get_id_bytes_ptr",
+            Self::EncodeAndSaveInStorage => "encode_and_save_in_storage",
+            Self::DecodeAndReadFromStorage => "decode_and_read_from_storage",
+            Self::DeleteFromStorage => "delete_from_storage",
         }
     }
 
@@ -130,6 +165,16 @@ impl RuntimeFunction {
                     let swap_i32_f = Self::SwapI32Bytes.get(module, compilation_ctx);
                     swap::swap_i64_bytes_function(module, swap_i32_f)
                 }
+                (Self::SwapI128Bytes, Some(ctx)) => swap::swap_bytes_function::<2>(
+                    module,
+                    ctx,
+                    Self::SwapI128Bytes.name().to_owned(),
+                ),
+                (Self::SwapI256Bytes, Some(ctx)) => swap::swap_bytes_function::<4>(
+                    module,
+                    ctx,
+                    Self::SwapI256Bytes.name().to_owned(),
+                ),
                 // Bitwise
                 (Self::HeapIntShiftLeft, Some(ctx)) => {
                     integers::bitwise::heap_int_shift_left(module, ctx)
@@ -138,13 +183,26 @@ impl RuntimeFunction {
                     integers::bitwise::heap_int_shift_right(module, ctx)
                 }
                 // Copy
-                (Self::CopyU128, Some(ctx)) => copy::copy_u128_function(module, ctx),
-                (Self::CopyU256, Some(ctx)) => copy::copy_u256_function(module, ctx),
+                (Self::CopyU128, Some(ctx)) => {
+                    copy::copy_heap_int_function::<{ IU128::HEAP_SIZE }>(
+                        module,
+                        ctx,
+                        Self::CopyU128.name().to_owned(),
+                    )
+                }
+                (Self::CopyU256, Some(ctx)) => {
+                    copy::copy_heap_int_function::<{ IU256::HEAP_SIZE }>(
+                        module,
+                        ctx,
+                        Self::CopyU256.name().to_owned(),
+                    )
+                }
                 // Equality
                 (Self::HeapTypeEquality, Some(ctx)) => equality::a_equals_b(module, ctx),
                 (Self::VecEqualityHeapType, Some(ctx)) => {
                     equality::vec_equality_heap_type(module, ctx)
                 }
+                (Self::IsZero, Some(ctx)) => equality::is_zero(module, ctx),
                 // Vector
                 (Self::VecSwap32, Some(ctx)) => vector::vec_swap_32_function(module, ctx),
                 (Self::VecSwap64, Some(ctx)) => vector::vec_swap_64_function(module, ctx),
@@ -157,12 +215,76 @@ impl RuntimeFunction {
                 (Self::VecDecrementLen, Some(ctx)) => {
                     vector::decrement_vec_len_function(module, ctx)
                 }
+                // Storage
+                (Self::StorageNextSlot, Some(ctx)) => {
+                    storage::storage_next_slot_function(module, ctx)
+                }
+                (Self::DeriveMappingSlot, Some(ctx)) => storage::derive_mapping_slot(module, ctx),
+                (Self::DeriveDynArraySlot, Some(ctx)) => {
+                    storage::derive_dyn_array_slot(module, ctx)
+                }
+                (Self::WriteObjectSlot, Some(ctx)) => storage::write_object_slot(module, ctx),
+                (Self::LocateStorageData, Some(ctx)) => storage::locate_storage_data(module, ctx),
+                (Self::LocateStructSlot, Some(ctx)) => storage::locate_struct_slot(module, ctx),
+                (Self::GetIdBytesPtr, Some(ctx)) => storage::get_id_bytes_ptr(module, ctx),
                 // Error
                 _ => panic!(
-                    r#"there was an error linking "{}" function, missing compilation context?"#,
+                    r#"there was an error linking "{}" runtime function, missing compilation context?"#,
                     self.name()
                 ),
             }
+        }
+    }
+
+    /// Links the function into the module and returns its id. The function generated depends on
+    /// the types passed in the `generics` parameter.
+    ///
+    /// The idempotency of this function depends on the generator functions. This is designed this
+    /// way to avoid errors when calculating the function name based on the types.
+    pub fn get_generic(
+        &self,
+        module: &mut Module,
+        compilation_ctx: &CompilationContext,
+        generics: &[&IntermediateType],
+    ) -> FunctionId {
+        match self {
+            Self::EncodeAndSaveInStorage => {
+                assert_eq!(
+                    1,
+                    generics.len(),
+                    "there was an error linking {} expected 1 type parameter, found {}",
+                    self.name(),
+                    generics.len(),
+                );
+
+                storage::add_save_struct_into_storage_fn(module, compilation_ctx, generics[0])
+            }
+            Self::DecodeAndReadFromStorage => {
+                assert_eq!(
+                    1,
+                    generics.len(),
+                    "there was an error linking {} expected 1 type parameter, found {}",
+                    self.name(),
+                    generics.len(),
+                );
+
+                storage::add_read_struct_from_storage_fn(module, compilation_ctx, generics[0])
+            }
+            Self::DeleteFromStorage => {
+                assert_eq!(
+                    1,
+                    generics.len(),
+                    "there was an error linking {} expected 1 type parameter, found {}",
+                    self.name(),
+                    generics.len(),
+                );
+
+                storage::add_delete_struct_from_storage_fn(module, compilation_ctx, generics[0])
+            }
+            _ => panic!(
+                r#"there was an error linking "{}" runtime function, is this function generic?"#,
+                self.name()
+            ),
         }
     }
 }

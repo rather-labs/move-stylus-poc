@@ -23,46 +23,58 @@ impl IVector {
         capacity: LocalId,
         data_size: i32,
     ) {
-        // This is a failsafe to prevent UB if static checks failed
-        builder
-            .local_get(len)
-            .local_get(capacity)
-            .binop(BinaryOp::I32GtU)
-            .if_else(
-                None,
-                |then_| {
-                    then_.unreachable(); // Trap if len > capacity
-                },
-                |_| {},
-            );
-
-        // Allocate memory: capacity * element size + 8 bytes for header
-        builder
-            .local_get(capacity)
-            .i32_const(data_size)
-            .binop(BinaryOp::I32Mul)
-            .i32_const(8)
-            .binop(BinaryOp::I32Add)
-            .call(compilation_ctx.allocator)
-            .local_set(pointer);
-
-        // Write length at offset 0
-        builder.local_get(pointer).local_get(len).store(
-            compilation_ctx.memory_id,
-            StoreKind::I32 { atomic: false },
-            MemArg {
-                align: 0,
-                offset: 0,
+        // If the len is 0 we just allocate 16 bytes representing 0 length and 0 capacity
+        builder.local_get(len).i32_const(0).binop(BinaryOp::I32Eq);
+        builder.if_else(
+            None,
+            |then| {
+                then.i32_const(16)
+                    .call(compilation_ctx.allocator)
+                    .local_set(pointer);
             },
-        );
+            |else_| {
+                // This is a failsafe to prevent UB if static checks failed
+                else_
+                    .local_get(len)
+                    .local_get(capacity)
+                    .binop(BinaryOp::I32GtU)
+                    .if_else(
+                        None,
+                        |then_| {
+                            then_.unreachable(); // Trap if len > capacity
+                        },
+                        |_| {},
+                    );
 
-        // Write capacity at offset 4
-        builder.local_get(pointer).local_get(capacity).store(
-            compilation_ctx.memory_id,
-            StoreKind::I32 { atomic: false },
-            MemArg {
-                align: 0,
-                offset: 4,
+                // Allocate memory: capacity * element size + 8 bytes for header
+                else_
+                    .local_get(capacity)
+                    .i32_const(data_size)
+                    .binop(BinaryOp::I32Mul)
+                    .i32_const(8)
+                    .binop(BinaryOp::I32Add)
+                    .call(compilation_ctx.allocator)
+                    .local_set(pointer);
+
+                // Write length at offset 0
+                else_.local_get(pointer).local_get(len).store(
+                    compilation_ctx.memory_id,
+                    StoreKind::I32 { atomic: false },
+                    MemArg {
+                        align: 0,
+                        offset: 0,
+                    },
+                );
+
+                // Write capacity at offset 4
+                else_.local_get(pointer).local_get(capacity).store(
+                    compilation_ctx.memory_id,
+                    StoreKind::I32 { atomic: false },
+                    MemArg {
+                        align: 0,
+                        offset: 4,
+                    },
+                );
             },
         );
     }
@@ -334,7 +346,7 @@ impl IVector {
                         module_data,
                     );
                 }
-                IntermediateType::IStruct(index) => {
+                IntermediateType::IStruct { module_id, index } => {
                     loop_block.load(
                         compilation_ctx.memory_id,
                         LoadKind::I32 { atomic: false },
@@ -344,7 +356,10 @@ impl IVector {
                         },
                     );
 
-                    let struct_ = module_data.structs.get_by_index(*index).unwrap();
+                    let struct_ = compilation_ctx
+                        .get_struct_by_index(module_id, *index)
+                        .unwrap();
+
                     struct_.copy_local_instructions(
                         module,
                         loop_block,
@@ -353,7 +368,33 @@ impl IVector {
                     );
                 }
 
-                IntermediateType::IExternalUserData { .. } => todo!(),
+                IntermediateType::IGenericStructInstance {
+                    module_id,
+                    index,
+                    types,
+                } => {
+                    loop_block.load(
+                        compilation_ctx.memory_id,
+                        LoadKind::I32 { atomic: false },
+                        MemArg {
+                            align: 0,
+                            offset: 0,
+                        },
+                    );
+
+                    let struct_ = compilation_ctx
+                        .get_struct_by_index(module_id, *index)
+                        .unwrap();
+                    let struct_ = struct_.instantiate(types);
+
+                    struct_.copy_local_instructions(
+                        module,
+                        loop_block,
+                        compilation_ctx,
+                        module_data,
+                    );
+                }
+
                 t => panic!("unsupported vector type {t:?}"),
             }
 
@@ -442,25 +483,79 @@ impl IVector {
                             .binop(BinaryOp::I32Add)
                             .call(equality_f_id);
                     }
-                    t @ (IntermediateType::IU128
+                    IntermediateType::IU128
                     | IntermediateType::IU256
-                    | IntermediateType::IAddress
-                    | IntermediateType::IStruct(_)
-                    | IntermediateType::IGenericStructInstance(_, _)) => {
+                    | IntermediateType::IAddress => {
                         let vec_equality_heap_type_f_id =
                             RuntimeFunction::VecEqualityHeapType.get(module, Some(compilation_ctx));
 
                         then.local_get(v1_ptr)
                             .local_get(v2_ptr)
                             .local_get(len)
-                            .i32_const(if *t == IntermediateType::IU128 {
+                            .i32_const(if *inner == IntermediateType::IU128 {
                                 16
                             } else {
                                 32
                             })
                             .call(vec_equality_heap_type_f_id);
                     }
+                    IntermediateType::IStruct { module_id, index } => {
+                        let module_data = compilation_ctx
+                            .get_module_data_by_id(module_id)
+                            .unwrap();
+                        let struct_ = compilation_ctx
+                            .get_struct_by_index(module_id, *index)
+                            .unwrap();
 
+                        then.local_get(v1_ptr)
+                            .load(
+                                compilation_ctx.memory_id,
+                                LoadKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            )
+                            .local_get(v2_ptr)
+                            .load(
+                                compilation_ctx.memory_id,
+                                LoadKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            );
+
+                        struct_.equality(then, module, compilation_ctx, module_data);
+                    }
+                    IntermediateType::IGenericStructInstance { module_id, index, types } => {
+                        let module_data = compilation_ctx
+                            .get_module_data_by_id(module_id)
+                            .unwrap();
+                        let struct_ = compilation_ctx.get_struct_by_index(module_id, *index).unwrap();
+                        let struct_instance = struct_.instantiate(types);
+
+                        then.local_get(v1_ptr)
+                            .load(
+                                compilation_ctx.memory_id,
+                                LoadKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            )
+                            .local_get(v2_ptr)
+                            .load(
+                                compilation_ctx.memory_id,
+                                LoadKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            );
+
+                        struct_instance.equality(then, module, compilation_ctx, module_data);
+                    }
                     IntermediateType::IVector(inner_v) => {
                         let res = module.locals.add(ValType::I32);
                         let offset = module.locals.add(ValType::I32);
@@ -553,7 +648,6 @@ impl IVector {
                     IntermediateType::ITypeParameter(_) => {
                         panic!("cannot check the equality of a vector of type parameters, expected a concrete type");
                     }
-                IntermediateType::IExternalUserData { .. } => todo!(),
                 }
             },
             |else_| {
@@ -572,41 +666,152 @@ impl IVector {
         // Local declarations
         let ptr_local = module.locals.add(ValType::I32);
         let len_local = module.locals.add(ValType::I32);
-        let temp_local = module.locals.add(inner.into());
-        let data_size = inner.stack_data_size() as i32;
 
-        // Set length
-        builder.i32_const(num_elements).local_set(len_local);
+        if num_elements == 0 {
+            // Set length
+            builder.i32_const(0).local_set(len_local);
 
-        IVector::allocate_vector_with_header(
-            builder,
-            compilation_ctx,
-            ptr_local,
-            len_local,
-            len_local,
-            data_size,
-        );
-
-        for i in 0..num_elements {
-            builder.local_get(ptr_local);
-            builder.swap(ptr_local, temp_local);
-
-            // Store at computed address
-            builder.store(
-                compilation_ctx.memory_id,
-                match inner.into() {
-                    ValType::I64 => StoreKind::I64 { atomic: false },
-                    ValType::I32 => StoreKind::I32 { atomic: false },
-                    _ => panic!("Unsupported ValType"),
-                },
-                MemArg {
-                    align: 0,
-                    offset: (8 + (num_elements - 1 - i) * data_size) as u32,
-                },
+            IVector::allocate_vector_with_header(
+                builder,
+                compilation_ctx,
+                ptr_local,
+                len_local,
+                len_local,
+                0,
             );
+        } else {
+            let data_size = inner.stack_data_size() as i32;
+
+            // Set length
+            builder.i32_const(num_elements).local_set(len_local);
+
+            IVector::allocate_vector_with_header(
+                builder,
+                compilation_ctx,
+                ptr_local,
+                len_local,
+                len_local,
+                data_size,
+            );
+
+            let temp_local = module.locals.add(inner.into());
+            for i in 0..num_elements {
+                builder.local_get(ptr_local);
+                builder.swap(ptr_local, temp_local);
+
+                // Store at computed address
+                builder.store(
+                    compilation_ctx.memory_id,
+                    match inner.into() {
+                        ValType::I64 => StoreKind::I64 { atomic: false },
+                        ValType::I32 => StoreKind::I32 { atomic: false },
+                        _ => panic!("Unsupported ValType"),
+                    },
+                    MemArg {
+                        align: 0,
+                        offset: (8 + (num_elements - 1 - i) * data_size) as u32,
+                    },
+                );
+            }
         }
 
         builder.local_get(ptr_local);
+    }
+
+    pub fn vec_unpack_instructions(
+        inner: &IntermediateType,
+        module: &mut Module,
+        builder: &mut InstrSeqBuilder,
+        compilation_ctx: &CompilationContext,
+        length: u64,
+    ) {
+        let vec_ptr = module.locals.add(ValType::I32);
+
+        builder
+            .local_set(vec_ptr)
+            .skip_vec_header(vec_ptr)
+            .local_set(vec_ptr);
+
+        let i = module.locals.add(ValType::I32);
+        builder.i32_const(0).local_set(i);
+
+        builder.block(None, |block| {
+            let exit_loop_id = block.id();
+
+            block.loop_(None, |loop_| {
+                let loop_id = loop_.id();
+
+                loop_
+                    .local_get(i)
+                    .i32_const(length as i32)
+                    .binop(BinaryOp::I32GeU)
+                    .br_if(exit_loop_id);
+
+                match inner {
+                    IntermediateType::IBool
+                    | IntermediateType::IU8
+                    | IntermediateType::IU16
+                    | IntermediateType::IU32
+                    | IntermediateType::IU128
+                    | IntermediateType::IU256
+                    | IntermediateType::IAddress
+                    | IntermediateType::IVector(_)
+                    | IntermediateType::IStruct { .. }
+                    | IntermediateType::IGenericStructInstance { .. } => {
+                        loop_
+                            .local_get(vec_ptr)
+                            .local_get(i)
+                            .i32_const(4)
+                            .binop(BinaryOp::I32Mul)
+                            .binop(BinaryOp::I32Add)
+                            .load(
+                                compilation_ctx.memory_id,
+                                LoadKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            );
+                    }
+                    IntermediateType::IU64 => {
+                        loop_
+                            .local_get(vec_ptr)
+                            .local_get(i)
+                            .i32_const(8)
+                            .binop(BinaryOp::I32Mul)
+                            .binop(BinaryOp::I32Add)
+                            .load(
+                                compilation_ctx.memory_id,
+                                LoadKind::I64 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            );
+                    }
+                    IntermediateType::IEnum(_) => todo!(),
+                    IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
+                        panic!("vector of rereferences found")
+                    }
+                    IntermediateType::ISigner => {
+                        panic!("should not be possible to have a vector of signers")
+                    }
+                    IntermediateType::ITypeParameter(_) => {
+                        panic!(
+                            "cannot unpack a vector of type parameters, expected a concrete type"
+                        );
+                    }
+                }
+
+                loop_
+                    .local_get(i)
+                    .i32_const(1)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(i);
+
+                loop_.br(loop_id);
+            });
+        });
     }
 
     pub fn vec_borrow_instructions(
@@ -636,8 +841,8 @@ impl IVector {
             | IntermediateType::IU256
             | IntermediateType::ISigner
             | IntermediateType::IAddress
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _) => {
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. } => {
                 builder.call(downcast_f);
                 builder.i32_const(1);
             }
@@ -645,7 +850,6 @@ impl IVector {
                 panic!("cannot borrow generic type parameters, expected a concrete type");
             }
             IntermediateType::IEnum(_) => todo!(),
-            IntermediateType::IExternalUserData { .. } => todo!(),
         }
 
         builder.i32_const(inner.stack_data_size() as i32);
@@ -960,8 +1164,8 @@ mod tests {
             | IntermediateType::IAddress
             | IntermediateType::ISigner
             | IntermediateType::IVector(_)
-            | IntermediateType::IGenericStructInstance(_, _)
-            | IntermediateType::IStruct(_) => {
+            | IntermediateType::IGenericStructInstance { .. }
+            | IntermediateType::IStruct { .. } => {
                 let swap_f =
                     RuntimeFunction::VecPopBack32.get(&mut raw_module, Some(&compilation_ctx));
                 builder.call(swap_f);
@@ -978,7 +1182,6 @@ mod tests {
                 panic!("cannot pop back a vector of type parameters, expected a concrete type");
             }
             IntermediateType::IEnum(_) => todo!(),
-            IntermediateType::IExternalUserData { .. } => todo!(),
         }
 
         if inner_type == IntermediateType::IU64 {

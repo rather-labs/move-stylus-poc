@@ -94,8 +94,8 @@ pub fn pack_variant(
                     | IntermediateType::IAddress
                     | IntermediateType::ISigner
                     | IntermediateType::IVector(_)
-                    | IntermediateType::IStruct(_)
-                    | IntermediateType::IGenericStructInstance(_, _) => {
+                    | IntermediateType::IStruct { .. }
+                    | IntermediateType::IGenericStructInstance { .. } => {
                         builder.local_set(ptr_to_data);
 
                         // Directly write the pointer to the data
@@ -117,7 +117,6 @@ pub fn pack_variant(
                         });
                     }
                     IntermediateType::IEnum(_) => todo!(),
-                    IntermediateType::IExternalUserData { .. } => todo!(),
                 };
             }
             t => Err(TranslationError::TypeMismatch {
