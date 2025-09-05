@@ -1,19 +1,35 @@
 [package]
 name = "move-hello-world-example"
 version = "0.1.11"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "interaction"
 path = "scripts/interaction.rs"
 
 [[bin]]
+name = "interaction_2"
+path = "scripts/interaction_2.rs"
+
+[[bin]]
 name = "primitives_and_operations"
 path = "scripts/primitives_and_operations.rs"
+
+[[bin]]
+name = "counter"
+path = "scripts/counter.rs"
+
+[[bin]]
+name = "counter_with_init"
+path = "scripts/counter_with_init.rs"
+
+[[bin]]
+name = "dog_walker"
+path = "scripts/dog_walker.rs"
 
 [dependencies]
 dotenv = "0.15.0"
 eyre = "0.6.8"
 tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
 alloy = "1.0.23"
-alloy-signer-wallet = "0.0.0-reserved"
+

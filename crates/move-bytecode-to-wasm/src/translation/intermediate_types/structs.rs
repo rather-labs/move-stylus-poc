@@ -45,11 +45,7 @@
 //! field management across all types.
 use std::collections::HashMap;
 
-use crate::{
-    CompilationContext,
-    abi_types::packing::Packable,
-    compilation_context::{ExternalModuleData, ModuleData},
-};
+use crate::{CompilationContext, abi_types::packing::Packable, compilation_context::ModuleData};
 
 use super::IntermediateType;
 use move_binary_format::{
@@ -61,7 +57,7 @@ use walrus::{
     ir::{BinaryOp, LoadKind, MemArg, StoreKind},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IStruct {
     /// Struct identifier
     pub identifier: String,
@@ -87,6 +83,10 @@ pub struct IStruct {
     /// it (if the struct contains dynamic data such as vector, the size can change depending on how
     /// many elements the vector has), just the pointers to them.
     pub heap_size: u32,
+
+    pub saved_in_storage: bool,
+
+    pub is_one_time_witness: bool,
 }
 
 impl IStruct {
@@ -95,6 +95,8 @@ impl IStruct {
         identifier: String,
         fields: Vec<(Option<FieldHandleIndex>, IntermediateType)>,
         fields_types: HashMap<FieldHandleIndex, IntermediateType>,
+        saved_in_storage: bool,
+        is_one_time_witness: bool,
     ) -> Self {
         let mut heap_size = 0;
         let mut field_offsets = HashMap::new();
@@ -114,18 +116,18 @@ impl IStruct {
             field_offsets,
             fields_types,
             fields: ir_fields,
+            saved_in_storage,
+            is_one_time_witness,
         }
     }
 
     pub fn equality(
+        &self,
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
         compilation_ctx: &CompilationContext,
         module_data: &ModuleData,
-        index: u16,
     ) {
-        let struct_ = module_data.structs.get_by_index(index).unwrap();
-
         let s1_ptr = module.locals.add(ValType::I32);
         let s2_ptr = module.locals.add(ValType::I32);
         let result = module.locals.add(ValType::I32);
@@ -157,7 +159,7 @@ impl IStruct {
 
         builder.block(None, |block| {
             let block_id = block.id();
-            for (index, field) in struct_.fields.iter().enumerate() {
+            for (index, field) in self.fields.iter().enumerate() {
                 // Offset of the field's pointer
                 let offset = index as u32 * 4;
 
@@ -276,8 +278,8 @@ impl IStruct {
                         },
                     );
                 }
-                IntermediateType::IStruct(_)
-                | IntermediateType::IGenericStructInstance(_, _)
+                IntermediateType::IStruct { .. }
+                | IntermediateType::IGenericStructInstance { .. }
                 | IntermediateType::IAddress
                 | IntermediateType::ISigner
                 | IntermediateType::IU128
@@ -309,7 +311,6 @@ impl IStruct {
                     );
                 }
                 IntermediateType::IEnum(_) => todo!(),
-                IntermediateType::IExternalUserData { .. } => todo!(),
             }
 
             // Store the middle pointer in the place of the struct field
@@ -356,21 +357,22 @@ impl IStruct {
                 | IntermediateType::IU256
                 | IntermediateType::IAddress => continue,
                 IntermediateType::IVector(_) => return true,
-                IntermediateType::IStruct(index) => {
-                    let struct_ = compilation_ctx
-                        .root_module_data
-                        .structs
-                        .get_by_index(*index)
+                IntermediateType::IStruct { module_id, index } => {
+                    let child_struct = compilation_ctx
+                        .get_struct_by_index(module_id, *index)
                         .unwrap();
-                    if struct_.solidity_abi_encode_is_dynamic(compilation_ctx) {
+
+                    if child_struct.solidity_abi_encode_is_dynamic(compilation_ctx) {
                         return true;
                     }
                 }
-                IntermediateType::IGenericStructInstance(index, types) => {
+                IntermediateType::IGenericStructInstance {
+                    module_id,
+                    index,
+                    types,
+                } => {
                     let child_struct = compilation_ctx
-                        .root_module_data
-                        .structs
-                        .get_by_index(*index)
+                        .get_struct_by_index(module_id, *index)
                         .unwrap();
                     let child_struct_instance = child_struct.instantiate(types);
 
@@ -386,24 +388,6 @@ impl IStruct {
                     panic!("cannot know if a type parameter is dynamic, expected a concrete type");
                 }
                 IntermediateType::IEnum(_) => todo!(),
-                IntermediateType::IExternalUserData {
-                    module_id,
-                    identifier,
-                } => {
-                    let external_data = compilation_ctx
-                        .get_external_module_data(module_id, identifier)
-                        .unwrap();
-
-                    match external_data {
-                        ExternalModuleData::Struct(istruct)
-                            if istruct.solidity_abi_encode_is_dynamic(compilation_ctx) =>
-                        {
-                            return true;
-                        }
-                        ExternalModuleData::Enum(_ienum) => todo!(),
-                        _ => (),
-                    }
-                }
             }
         }
 
@@ -426,11 +410,13 @@ impl IStruct {
                 | IntermediateType::IVector(_) => {
                     size += (field as &dyn Packable).encoded_size(compilation_ctx);
                 }
-                IntermediateType::IGenericStructInstance(index, types) => {
+                IntermediateType::IGenericStructInstance {
+                    module_id,
+                    index,
+                    types,
+                } => {
                     let child_struct = compilation_ctx
-                        .root_module_data
-                        .structs
-                        .get_by_index(*index)
+                        .get_struct_by_index(module_id, *index)
                         .unwrap();
                     let child_struct_instance = child_struct.instantiate(types);
 
@@ -440,11 +426,9 @@ impl IStruct {
                         size += field.encoded_size(compilation_ctx);
                     }
                 }
-                IntermediateType::IStruct(index) => {
+                IntermediateType::IStruct { module_id, index } => {
                     let child_struct = compilation_ctx
-                        .root_module_data
-                        .structs
-                        .get_by_index(*index)
+                        .get_struct_by_index(module_id, *index)
                         .unwrap();
 
                     if child_struct.solidity_abi_encode_is_dynamic(compilation_ctx) {
@@ -461,29 +445,37 @@ impl IStruct {
                     panic!("cannot know a type parameter's size, expected a concrete type");
                 }
                 IntermediateType::IEnum(_) => todo!(),
-                IntermediateType::IExternalUserData {
-                    module_id,
-                    identifier,
-                } => {
-                    let external_data = compilation_ctx
-                        .get_external_module_data(module_id, identifier)
-                        .unwrap();
-
-                    match external_data {
-                        ExternalModuleData::Struct(external_struct) => {
-                            if external_struct.solidity_abi_encode_is_dynamic(compilation_ctx) {
-                                size += 32;
-                            } else {
-                                size += field.encoded_size(compilation_ctx);
-                            }
-                        }
-                        ExternalModuleData::Enum(_ienum) => todo!(),
-                    }
-                }
             }
         }
 
         size
+    }
+
+    /// Auxiliary functiion that recursively looks for not instantiated type parameters and
+    /// replaces them
+    fn replace_type_parameters(
+        f: &IntermediateType,
+        instance_types: &[IntermediateType],
+    ) -> IntermediateType {
+        match f {
+            IntermediateType::ITypeParameter(index) => instance_types[*index as usize].clone(),
+            IntermediateType::IGenericStructInstance {
+                module_id,
+                index,
+                types,
+            } => IntermediateType::IGenericStructInstance {
+                module_id: module_id.clone(),
+                index: *index,
+                types: types
+                    .iter()
+                    .map(|t| Self::replace_type_parameters(t, instance_types))
+                    .collect(),
+            },
+            IntermediateType::IVector(inner) => IntermediateType::IVector(Box::new(
+                Self::replace_type_parameters(inner, instance_types),
+            )),
+            _ => f.clone(),
+        }
     }
 
     /// Replaces all type parameters in the struct with the provided types.
@@ -491,13 +483,7 @@ impl IStruct {
         let fields = self
             .fields
             .iter()
-            .map(|f| {
-                if let IntermediateType::ITypeParameter(index) = f {
-                    types[*index as usize].clone()
-                } else {
-                    f.clone()
-                }
-            })
+            .map(|itype| Self::replace_type_parameters(itype, types))
             .collect();
 
         let fields_types = self
@@ -505,11 +491,8 @@ impl IStruct {
             .iter()
             .map(|(k, v)| {
                 let key = FieldHandleIndex::new(k.into_index() as u16);
-                if let IntermediateType::ITypeParameter(index) = v {
-                    (key, types[*index as usize].clone())
-                } else {
-                    (key, v.clone())
-                }
+                let value = Self::replace_type_parameters(v, types);
+                (key, value)
             })
             .collect();
 
@@ -527,7 +510,7 @@ impl IStruct {
             struct_definition_index: StructDefinitionIndex::new(
                 self.struct_definition_index.into_index() as u16,
             ),
-            heap_size: self.heap_size,
+            ..*self
         }
     }
 }

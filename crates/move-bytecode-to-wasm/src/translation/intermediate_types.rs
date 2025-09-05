@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
 use crate::{
     CompilationContext, UserDefinedType,
@@ -28,7 +28,7 @@ pub mod simple_integers;
 pub mod structs;
 pub mod vector;
 
-#[derive(Clone, PartialEq, Debug, Eq)]
+#[derive(Clone, PartialEq, Debug, Eq, Hash)]
 pub enum IntermediateType {
     IBool,
     IU8,
@@ -50,28 +50,24 @@ pub enum IntermediateType {
     /// Intermediate struct representation
     ///
     /// The u16 is the struct's index in the compilation context's vector of declared structs
-    IStruct(u16),
+    IStruct {
+        module_id: ModuleId,
+        index: u16,
+    },
 
     /// The usize is the index of the generic struct.
     /// The Vec<IntermediateType> is the list of types we are going to instantiate the generic
     /// struct with.
-    IGenericStructInstance(u16, Vec<IntermediateType>),
+    IGenericStructInstance {
+        module_id: ModuleId,
+        index: u16,
+        types: Vec<IntermediateType>,
+    },
 
     /// Intermediate enum representation
     ///
     /// The first u16 is the enum's index in the compilation context.
     IEnum(u16),
-
-    /// Represents a complex datatype (struct or enum) defined in another module.
-    ///
-    /// When recursively processing the dependencies, we don't have the complete information about
-    /// the type (whether is a struct or an enum, its fields, etc), so we save a refrence to it. At
-    /// the moment of processing it, we should have all the dependencies processed with its
-    /// corresponding data.
-    IExternalUserData {
-        module_id: ModuleId,
-        identifier: String,
-    },
 }
 
 impl IntermediateType {
@@ -90,10 +86,9 @@ impl IntermediateType {
             | IntermediateType::IVector(_)
             | IntermediateType::IRef(_)
             | IntermediateType::IMutRef(_)
-            | IntermediateType::IStruct(_)
+            | IntermediateType::IStruct { .. }
             | IntermediateType::IEnum(_)
-            | IntermediateType::IGenericStructInstance(_, _)
-            | IntermediateType::IExternalUserData { .. } => 4,
+            | IntermediateType::IGenericStructInstance { .. } => 4,
             IntermediateType::ITypeParameter(_) => {
                 panic!("type parameter does not have a known stack data size at compile time")
             }
@@ -129,15 +124,11 @@ impl IntermediateType {
             SignatureToken::Datatype(index) => {
                 if let Some(udt) = handles_map.get(index) {
                     Ok(match udt {
-                        UserDefinedType::Struct(i) => IntermediateType::IStruct(*i),
-                        UserDefinedType::Enum(i) => IntermediateType::IEnum(*i as u16),
-                        UserDefinedType::ExternalData {
-                            module: module_id,
-                            identifier,
-                        } => IntermediateType::IExternalUserData {
+                        UserDefinedType::Struct { module_id, index } => IntermediateType::IStruct {
                             module_id: module_id.clone(),
-                            identifier: identifier.clone(),
+                            index: *index,
                         },
+                        UserDefinedType::Enum(i) => IntermediateType::IEnum(*i as u16),
                     })
                 } else {
                     Err(anyhow::anyhow!(
@@ -154,17 +145,14 @@ impl IntermediateType {
                         .collect::<Result<Vec<IntermediateType>, anyhow::Error>>()?;
 
                     Ok(match udt {
-                        UserDefinedType::Struct(i) => {
-                            IntermediateType::IGenericStructInstance(*i, types)
+                        UserDefinedType::Struct { module_id, index } => {
+                            IntermediateType::IGenericStructInstance {
+                                module_id: module_id.clone(),
+                                index: *index,
+                                types,
+                            }
                         }
                         UserDefinedType::Enum(_) => todo!(),
-                        UserDefinedType::ExternalData {
-                            module: module_id,
-                            identifier,
-                        } => IntermediateType::IExternalUserData {
-                            module_id: module_id.clone(),
-                            identifier: identifier.clone(),
-                        },
                     })
                 } else {
                     Err(anyhow::anyhow!(
@@ -209,11 +197,8 @@ impl IntermediateType {
             IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
                 panic!("cannot load a constant for a reference type");
             }
-            IntermediateType::IStruct(_) | IntermediateType::IGenericStructInstance(_, _) => {
+            IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
                 panic!("structs can't be loaded as constants")
-            }
-            IntermediateType::IExternalUserData { .. } => {
-                panic!("external user data can't be loaded as constants")
             }
             IntermediateType::ITypeParameter(_) => {
                 panic!("can't load a type parameter as a constant, expected a concrete type");
@@ -276,10 +261,9 @@ impl IntermediateType {
             | IntermediateType::IAddress
             | IntermediateType::ISigner
             | IntermediateType::IVector(_)
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _)
-            | IntermediateType::IEnum(_)
-            | IntermediateType::IExternalUserData { .. } => {
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. }
+            | IntermediateType::IEnum(_) => {
                 builder.load(
                     compilation_ctx.memory_id,
                     LoadKind::I32 { atomic: false },
@@ -389,8 +373,10 @@ impl IntermediateType {
                     module_data,
                 );
             }
-            IntermediateType::IStruct(index) => {
-                let struct_ = module_data.structs.get_by_index(*index).unwrap();
+            IntermediateType::IStruct { module_id, index } => {
+                let struct_ = compilation_ctx
+                    .get_struct_by_index(module_id, *index)
+                    .unwrap();
                 builder.load(
                     compilation_ctx.memory_id,
                     LoadKind::I32 { atomic: false },
@@ -401,8 +387,14 @@ impl IntermediateType {
                 );
                 struct_.copy_local_instructions(module, builder, compilation_ctx, module_data);
             }
-            IntermediateType::IGenericStructInstance(index, types) => {
-                let struct_ = module_data.structs.get_by_index(*index).unwrap();
+            IntermediateType::IGenericStructInstance {
+                module_id,
+                index,
+                types,
+            } => {
+                let struct_ = compilation_ctx
+                    .get_struct_by_index(module_id, *index)
+                    .unwrap();
                 let struct_instance = struct_.instantiate(types);
                 builder.load(
                     compilation_ctx.memory_id,
@@ -419,7 +411,6 @@ impl IntermediateType {
                     module_data,
                 );
             }
-            IntermediateType::IExternalUserData { .. } => todo!(),
             IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
                 // Nothing to be done, pointer is already correct
             }
@@ -448,9 +439,8 @@ impl IntermediateType {
             | IntermediateType::IU128
             | IntermediateType::IU256
             | IntermediateType::IAddress
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _)
-            | IntermediateType::IExternalUserData { .. }
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. }
             | IntermediateType::ISigner
             | IntermediateType::IVector(_)
             | IntermediateType::IRef(_)
@@ -512,10 +502,9 @@ impl IntermediateType {
             | IntermediateType::ISigner
             | IntermediateType::IRef(_)
             | IntermediateType::IMutRef(_)
-            | IntermediateType::IExternalUserData { .. }
-            | IntermediateType::IStruct(_)
+            | IntermediateType::IStruct { .. }
             | IntermediateType::IEnum(_)
-            | IntermediateType::IGenericStructInstance(_, _) => {
+            | IntermediateType::IGenericStructInstance { .. } => {
                 let local = module.locals.add(ValType::I32);
                 builder.local_set(local);
                 local
@@ -543,9 +532,8 @@ impl IntermediateType {
             | IntermediateType::ISigner
             | IntermediateType::IAddress
             | IntermediateType::IVector(_)
-            | IntermediateType::IExternalUserData { .. }
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _) => {
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. } => {
                 builder.local_get(local);
             }
             IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
@@ -615,8 +603,10 @@ impl IntermediateType {
                     module_data,
                 );
             }
-            IntermediateType::IStruct(index) => {
-                let struct_ = module_data.structs.get_by_index(*index).unwrap();
+            IntermediateType::IStruct { module_id, index } => {
+                let struct_ = compilation_ctx
+                    .get_struct_by_index(module_id, *index)
+                    .unwrap();
                 IStruct::copy_local_instructions(
                     struct_,
                     module,
@@ -625,18 +615,22 @@ impl IntermediateType {
                     module_data,
                 );
             }
-            IntermediateType::IGenericStructInstance(index, types) => {
-                let struct_ = module_data.structs.get_by_index(*index).unwrap();
+            IntermediateType::IGenericStructInstance {
+                module_id,
+                index,
+                types,
+            } => {
+                let struct_ = compilation_ctx
+                    .get_struct_by_index(module_id, *index)
+                    .unwrap();
                 let struct_instance = struct_.instantiate(types);
-                IStruct::copy_local_instructions(
-                    &struct_instance,
+                struct_instance.copy_local_instructions(
                     module,
                     builder,
                     compilation_ctx,
                     module_data,
                 );
             }
-            IntermediateType::IExternalUserData { .. } => todo!(),
             IntermediateType::ISigner => {
                 // Signer type is read-only, we push the pointer only
             }
@@ -744,8 +738,8 @@ impl IntermediateType {
             // We just update the intermediate pointer, since the new values are already allocated
             // in memory
             IntermediateType::IVector(_)
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _) => {
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. } => {
                 // Since the memory needed for vectors might differ, we don't overwrite it.
                 // We update the inner pointer to point to the location where the new vector is already allocated.
                 let src_ptr = module.locals.add(ValType::I32);
@@ -776,7 +770,6 @@ impl IntermediateType {
                 panic!("cannot write to a type parameter, expected a concrete type");
             }
             IntermediateType::IEnum(_) => todo!(),
-            IntermediateType::IExternalUserData { .. } => todo!(),
         }
     }
 
@@ -858,9 +851,8 @@ impl IntermediateType {
             | IntermediateType::IVector(_)
             | IntermediateType::IRef(_)
             | IntermediateType::IMutRef(_)
-            | IntermediateType::IExternalUserData { .. }
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _)
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. }
             | IntermediateType::IEnum(_) => {
                 let ptr = module.locals.add(ValType::I32);
                 builder
@@ -908,11 +900,23 @@ impl IntermediateType {
                 builder.i32_const(1);
             }
             Self::IVector(inner) => IVector::equality(builder, module, compilation_ctx, inner),
-            Self::IStruct(index) => {
-                IStruct::equality(builder, module, compilation_ctx, module_data, *index)
+            Self::IStruct { index, module_id } => {
+                let struct_ = compilation_ctx
+                    .get_struct_by_index(module_id, *index)
+                    .unwrap();
+                struct_.equality(builder, module, compilation_ctx, module_data)
             }
-            Self::IGenericStructInstance(index, _) => {
-                IStruct::equality(builder, module, compilation_ctx, module_data, *index)
+            Self::IGenericStructInstance {
+                index,
+                module_id,
+                types,
+            } => {
+                let struct_ = compilation_ctx
+                    .get_struct_by_index(module_id, *index)
+                    .unwrap();
+                struct_
+                    .instantiate(types)
+                    .equality(builder, module, compilation_ctx, module_data)
             }
             Self::IEnum(_) => todo!(),
             Self::IRef(inner) | Self::IMutRef(inner) => {
@@ -982,8 +986,8 @@ impl IntermediateType {
                     | IntermediateType::IAddress
                     | IntermediateType::ISigner
                     | IntermediateType::IVector(_)
-                    | IntermediateType::IStruct(_)
-                    | IntermediateType::IGenericStructInstance(_, _) => {
+                    | IntermediateType::IStruct { .. }
+                    | IntermediateType::IGenericStructInstance { .. } => {
                         builder.local_get(ptr1).local_get(ptr2);
                     }
                     IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
@@ -993,15 +997,14 @@ impl IntermediateType {
                         panic!("Cannot compare a type parameter, expected a concrete type");
                     }
                     IntermediateType::IEnum(_) => todo!(),
-                    IntermediateType::IExternalUserData { .. } => todo!(),
                 }
 
                 inner.load_equality_instructions(module, builder, compilation_ctx, module_data)
             }
+
             IntermediateType::ITypeParameter(_) => {
                 panic!("cannot compare a type parameter, expected a concrete type");
             }
-            IntermediateType::IExternalUserData { .. } => todo!(),
         }
     }
 
@@ -1032,9 +1035,8 @@ impl IntermediateType {
             | IntermediateType::IVector(_)
             | IntermediateType::IRef(_)
             | IntermediateType::IMutRef(_)
-            | IntermediateType::IExternalUserData { .. }
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _) => false,
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. } => false,
             IntermediateType::ITypeParameter(_) => {
                 panic!(
                     "cannot check if a type parameter is a stack type, expected a concrete type"
@@ -1060,9 +1062,8 @@ impl From<&IntermediateType> for ValType {
             | IntermediateType::IVector(_)
             | IntermediateType::IRef(_)
             | IntermediateType::IMutRef(_)
-            | IntermediateType::IExternalUserData { .. }
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _)
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. }
             | IntermediateType::IEnum(_) => ValType::I32,
             IntermediateType::ITypeParameter(_) => {
                 panic!("cannot convert a type parameter to a wasm type, expected a concrete type");

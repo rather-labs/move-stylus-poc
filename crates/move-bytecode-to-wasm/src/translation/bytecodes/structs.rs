@@ -21,8 +21,7 @@ pub fn borrow_field(
     field_id: &FieldHandleIndex,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
-    types_stack: &mut TypesStack,
-) {
+) -> IntermediateType {
     let Some(field_type) = struct_.fields_types.get(field_id) else {
         panic!(
             "{field_id} not found in {}",
@@ -49,7 +48,7 @@ pub fn borrow_field(
         .i32_const(*field_offset as i32)
         .binop(BinaryOp::I32Add);
 
-    types_stack.push(IntermediateType::IRef(Box::new(field_type.clone())));
+    field_type.clone()
 }
 
 /// Mutably borrows a field of a struct.
@@ -60,8 +59,7 @@ pub fn mut_borrow_field(
     field_id: &FieldHandleIndex,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
-    types_stack: &mut TypesStack,
-) {
+) -> IntermediateType {
     let Some(field_type) = struct_.fields_types.get(field_id) else {
         panic!(
             "{field_id:?} not found in {}",
@@ -88,7 +86,7 @@ pub fn mut_borrow_field(
         .i32_const(*field_offset as i32)
         .binop(BinaryOp::I32Add);
 
-    types_stack.push(IntermediateType::IMutRef(Box::new(field_type.clone())));
+    field_type.clone()
 }
 
 /// Packs an struct.
@@ -110,6 +108,13 @@ pub fn pack(
     let val_32 = module.locals.add(ValType::I32);
     let val_64 = module.locals.add(ValType::I64);
     let mut offset = struct_.heap_size;
+
+    // If the struct is saved in storage (has key ability), the owner's id must be prepended to the
+    // struct memory representation. Since we are packing it, means it is a new structure, so it
+    // has no owner (all zeroes). We just allocate the space
+    if struct_.saved_in_storage {
+        builder.i32_const(32).call(compilation_ctx.allocator).drop();
+    }
 
     builder
         .i32_const(struct_.heap_size as i32)
@@ -160,8 +165,8 @@ pub fn pack(
                     | IntermediateType::IAddress
                     | IntermediateType::ISigner
                     | IntermediateType::IVector(_)
-                    | IntermediateType::IStruct(_)
-                    | IntermediateType::IGenericStructInstance(_, _) => {
+                    | IntermediateType::IStruct { .. }
+                    | IntermediateType::IGenericStructInstance { .. } => {
                         builder.local_set(ptr_to_data);
                     }
                     IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
@@ -176,7 +181,6 @@ pub fn pack(
                         });
                     }
                     IntermediateType::IEnum(_) => todo!(),
-                    IntermediateType::IExternalUserData { .. } => todo!(),
                 };
 
                 builder.local_get(pointer).local_get(ptr_to_data).store(
@@ -199,8 +203,7 @@ pub fn pack(
 
 /// Unpack an struct.
 ///
-/// This function is used with Pack and PackGeneric bytecodes to allocate memory for a struct and
-/// save its fields into the allocated memory.
+/// This function is used with Unpack and UnpackGeneric bytecodes
 pub fn unpack(
     struct_: &IStruct,
     module: &mut Module,
@@ -250,8 +253,8 @@ pub fn unpack(
             | IntermediateType::IAddress
             | IntermediateType::ISigner
             | IntermediateType::IVector(_)
-            | IntermediateType::IStruct(_)
-            | IntermediateType::IGenericStructInstance(_, _) => {}
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. } => {}
             IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
                 return Err(TranslationError::FoundReferenceInsideStruct {
                     struct_index: struct_.index(),
@@ -264,7 +267,6 @@ pub fn unpack(
                 });
             }
             IntermediateType::IEnum(_) => todo!(),
-            IntermediateType::IExternalUserData { .. } => todo!(),
         }
 
         types_stack.push(field.clone());

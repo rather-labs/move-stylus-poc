@@ -12,13 +12,23 @@ pub mod intermediate_types;
 pub mod table;
 
 use crate::{
-    CompilationContext, compilation_context::ModuleData, native_functions::NativeFunction,
-    runtime::RuntimeFunction, wasm_builder_extensions::WasmBuilderExtension,
+    CompilationContext,
+    compilation_context::ModuleData,
+    data::DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET,
+    generics::{
+        extract_type_instances_from_stack, instantiate_vec_type_parameters,
+        replace_type_parameters, type_contains_generics,
+    },
+    hostio::host_functions::storage_flush_cache,
+    native_functions::NativeFunction,
+    runtime::RuntimeFunction,
+    wasm_builder_extensions::WasmBuilderExtension,
 };
 use anyhow::Result;
 use flow::Flow;
 use functions::{
-    MappedFunction, add_unpack_function_return_values_instructions, prepare_function_return,
+    MappedFunction, add_unpack_function_return_values_instructions, prepare_function_arguments,
+    prepare_function_return,
 };
 use intermediate_types::{
     IntermediateType,
@@ -124,12 +134,6 @@ pub fn translate_function(
         function_information,
     );
 
-    // let entry = function_table
-    //     .get_by_function_id(&function_information.function_id)
-    //     .ok_or(anyhow::anyhow!("index {} not found in function table", function_information.function_id))?;
-
-    // let code_unit = &entry.get_move_code_unit().unwrap();
-
     let flow = Flow::new(move_bytecode, function_information);
 
     let mut branch_targets = BranchTargets::new();
@@ -206,7 +210,10 @@ fn translate_flow(
                         branches,
                         ctx.branch_targets,
                     )
-                    .unwrap();
+                    .unwrap_or_else(|e| {
+                        panic!("there was an error translating instruction {instruction:?}.\n{e}")
+                    });
+
                     functions_to_link.extend(fns_to_link.drain(..));
                 }
                 // Then translate instructions of the immediate block, inside the current block
@@ -407,26 +414,183 @@ fn translate_instruction(
             types_stack.push(IntermediateType::IU256);
         }
         // Function calls
+        Bytecode::CallGeneric(function_instantiation_handle_index) => {
+            let function_id = &module_data.functions.generic_calls
+                [function_instantiation_handle_index.into_index()];
+
+            // Obtain the generic function information
+            let function_information = {
+                let dependency_data = compilation_ctx
+                    .deps_data
+                    .get(&function_id.module_id)
+                    .unwrap_or(module_data);
+
+                dependency_data
+                    .functions
+                    .information
+                    .iter()
+                    .find(|f| {
+                        f.function_id.module_id == function_id.module_id
+                            && f.function_id.identifier == function_id.identifier
+                            && f.function_id.type_instantiations.is_none()
+                    })
+                    .unwrap()
+            };
+
+            let type_instantiations = function_id.type_instantiations.as_ref().unwrap();
+
+            // If the type_instantiations contains generic parameters, those generic parameters
+            // refer to instantiations whithin this context. Instantiatons are obtained using
+            // the caller's function type instances (located in
+            // `mapped_function.function_id.type_instantiations`)
+            let function_information = if type_instantiations.iter().any(type_contains_generics) {
+                // Here we extract the type instances from the caller's type instantiations.
+                // Consider the following example:
+                //
+                // ```move
+                // public fun two_generics<T, U>(): Option<U> {
+                //     option::none()
+                // }
+                //
+                // public fun test(): Option<u16> {
+                //     two_generics<u32, u16>()
+                // }
+                // ```
+                //
+                // where `option::none()` is defined as:
+                //
+                // ```move
+                // public fun none<V>(): Option<V> {
+                //     Option { vec: vector::empty() }
+                // }
+                // ```
+                //
+                // In this case:
+                //
+                // - The call to `two_generics` is instantiated with two types: `u32` mapped to
+                //   `ITypeParameter(0)` and `u16` mapped to `ITypeParameter(1)`.
+                //
+                // - `two_generics<T, U>` returns `U`, which corresponds to `ITypeParameter(1)`.
+                //
+                // - `option::none<V>()` has a single type parameter `V`, represented as
+                //   `ITypeParameter(0)`.
+                //
+                // The substitutions happen as follows:
+                //
+                // - Since `option::none()` provides the return value, its parameter
+                //   `V: ITypeParameter(0)` is instantiated with the caller's parameter
+                //   `U: ITypeParameter(1)`.
+                //
+                // - In `test`, we call `two_generics` with `T = u32` and `U = u16`. Therefore:
+                //   - `ITypeParameter(0)` is replaced with `u32`
+                //   - `ITypeParameter(1)` is replaced with `u16`
+                //
+                // If we follow the call chain:
+                //
+                // - `ITypeParameter(0)` (from `option::none`) is replaced with
+                //   `ITypeParameter(1)` (from `two_generics`).
+                //
+                // - `ITypeParameter(1)` is then replaced with `u16` (from the instantiation
+                //   in `test`).
+                //
+                // By transitivity, we infer that the type of `option::none()` in this context
+                // is `u16`.
+                if let Some(caller_type_instances) =
+                    &mapped_function.function_id.type_instantiations
+                {
+                    let mut instantiations = Vec::new();
+                    for (index, field) in type_instantiations.iter().enumerate() {
+                        if let Some(res) =
+                            extract_type_instances_from_stack(field, &type_instantiations[index])
+                        {
+                            instantiations.push(res);
+                        } else {
+                            instantiations.push(field.clone());
+                        }
+                    }
+
+                    let instantiations = instantiations
+                        .into_iter()
+                        .map(|f| {
+                            if let IntermediateType::ITypeParameter(i) = f {
+                                caller_type_instances[i as usize].clone()
+                            } else {
+                                f
+                            }
+                        })
+                        .collect::<Vec<IntermediateType>>();
+
+                    function_information.instantiate(&instantiations)
+                }
+                // This should never happen
+                else {
+                    panic!("could not instantiate generic types");
+                }
+            } else {
+                function_information.instantiate(type_instantiations)
+            };
+
+            // Shadow the function_id variable because now it contains concrete types
+            let function_id = &function_information.function_id;
+            let arguments = &function_information.signature.arguments;
+
+            prepare_function_arguments(module, builder, arguments, compilation_ctx, types_stack)?;
+
+            // If the function is in the table we call it directly
+            if let Some(f) = function_table.get_by_function_id(function_id) {
+                call_indirect(
+                    f,
+                    &function_information.signature.returns,
+                    function_table.get_table_id(),
+                    builder,
+                    module,
+                    compilation_ctx,
+                );
+            }
+            // Otherwise
+            // If the function is not native, we add it to the table and declare it for translating
+            // and linking
+            // If the function IS native, we link it and call it directly
+            else if function_information.is_native {
+                let type_instantiations = function_information
+                    .function_id
+                    .type_instantiations
+                    .as_ref()
+                    .unwrap();
+
+                let native_function_id = NativeFunction::get_generic(
+                    &function_id.identifier,
+                    module,
+                    compilation_ctx,
+                    type_instantiations,
+                );
+
+                builder.call(native_function_id);
+            } else {
+                let table_id = function_table.get_table_id();
+                let f_entry =
+                    function_table.add(module, function_id.clone(), &function_information);
+                functions_calls_to_link.push(function_id.clone());
+
+                call_indirect(
+                    f_entry,
+                    &function_information.signature.returns,
+                    table_id,
+                    builder,
+                    module,
+                    compilation_ctx,
+                );
+            };
+
+            // Insert in the stack types the types returned by the function (if any)
+            types_stack.append(&function_information.signature.returns);
+        }
+        // Function calls
         Bytecode::Call(function_handle_index) => {
-            // Consume from the types stack the arguments that will be used by the function call
+            let function_id = &module_data.functions.calls[function_handle_index.into_index()];
             let arguments = &module_data.functions.arguments[function_handle_index.into_index()];
 
-            for argument in arguments.iter().rev() {
-                types_stack.pop_expecting(argument)?;
-
-                if let IntermediateType::IMutRef(_) | IntermediateType::IRef(_) = argument {
-                    builder.load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
-                }
-            }
-
-            let function_id = &module_data.functions.calls[function_handle_index.into_index()];
+            prepare_function_arguments(module, builder, arguments, compilation_ctx, types_stack)?;
 
             // If the function is in the table we call it directly
             if let Some(f) = function_table.get_by_function_id(function_id) {
@@ -498,6 +662,7 @@ fn translate_instruction(
             } else {
                 local_type.box_local_instructions(module, builder, compilation_ctx, local);
             }
+
             types_stack.pop_expecting(local_type)?;
         }
         Bytecode::MoveLoc(local_id) => {
@@ -535,17 +700,28 @@ fn translate_instruction(
             let struct_ = module_data.structs.get_by_field_handle_idx(field_id)?;
 
             // Check if in the types stack we have the correct type
-            types_stack.pop_expecting(&IntermediateType::IRef(Box::new(
-                IntermediateType::IStruct(struct_.index()),
-            )))?;
+            let t = types_stack.pop()?;
 
-            bytecodes::structs::borrow_field(
-                struct_,
-                field_id,
-                builder,
-                compilation_ctx,
-                types_stack,
+            // In this context, an immutable borrow can coexist with a mutable one, as the Move
+            // compiler ensures through static checks that no invalid accesses occur.
+            types_stack::match_types!(
+                (
+                    (IntermediateType::IRef(ref_inner) | IntermediateType::IMutRef(ref_inner)),
+                    "reference or mutable reference",
+                    t
+                ),
+                (
+                    IntermediateType::IStruct { ref module_id, index },
+                    "struct",
+                    *ref_inner
+                )
             );
+            assert_eq!(module_id, &module_data.id);
+            assert_eq!(struct_.index(), index);
+
+            let field_type =
+                bytecodes::structs::borrow_field(struct_, field_id, builder, compilation_ctx);
+            types_stack.push(IntermediateType::IRef(Box::new(field_type)));
         }
         Bytecode::ImmBorrowFieldGeneric(field_id) => {
             let (struct_field_id, instantiation_types) = module_data
@@ -554,6 +730,20 @@ fn translate_instruction(
                 .get(field_id)
                 .unwrap();
 
+            let instantiation_types = if instantiation_types.iter().any(type_contains_generics) {
+                match &types_stack.last().unwrap() {
+                    IntermediateType::IRef(inner) | IntermediateType::IMutRef(inner) => {
+                        match &**inner {
+                            IntermediateType::IGenericStructInstance { types, .. } => types.clone(),
+                            _ => panic!(),
+                        }
+                    }
+                    _ => panic!(),
+                }
+            } else {
+                instantiation_types.clone()
+            };
+
             let struct_ = if let Ok(struct_) = module_data
                 .structs
                 .get_struct_instance_by_field_handle_idx(field_id)
@@ -564,40 +754,53 @@ fn translate_instruction(
                     .structs
                     .get_by_field_handle_idx(struct_field_id)?;
 
-                generic_stuct.instantiate(instantiation_types)
+                generic_stuct.instantiate(&instantiation_types)
             };
 
             // Check if in the types stack we have the correct type
-            types_stack.pop_expecting(&IntermediateType::IRef(Box::new(
-                IntermediateType::IGenericStructInstance(
-                    struct_.index(),
-                    instantiation_types.to_vec(),
-                ),
-            )))?;
+            let t = types_stack.pop()?;
 
-            bytecodes::structs::borrow_field(
+            // In this context, an immutable borrow can coexist with a mutable one, as the Move
+            // compiler ensures through static checks that no invalid accesses occur.
+            types_stack::match_types!(
+                (
+                    (IntermediateType::IRef(ref_inner) | IntermediateType::IMutRef(ref_inner)),
+                    "reference or mutable reference",
+                    t
+                ),
+                (
+                    IntermediateType::IGenericStructInstance { ref module_id, index, ref types },
+                    "generic struct",
+                    *ref_inner
+                )
+            );
+            assert_eq!(module_id, &module_data.id);
+            assert_eq!(struct_.index(), index);
+            assert_eq!(types, &instantiation_types);
+
+            let field_type = bytecodes::structs::borrow_field(
                 &struct_,
                 struct_field_id,
                 builder,
                 compilation_ctx,
-                types_stack,
             );
+            let field_type = replace_type_parameters(&field_type, &instantiation_types);
+            types_stack.push(IntermediateType::IRef(Box::new(field_type)));
         }
         Bytecode::MutBorrowField(field_id) => {
             let struct_ = module_data.structs.get_by_field_handle_idx(field_id)?;
 
             // Check if in the types stack we have the correct type
             types_stack.pop_expecting(&IntermediateType::IMutRef(Box::new(
-                IntermediateType::IStruct(struct_.index()),
+                IntermediateType::IStruct {
+                    module_id: module_data.id.clone(),
+                    index: struct_.index(),
+                },
             )))?;
 
-            bytecodes::structs::mut_borrow_field(
-                struct_,
-                field_id,
-                builder,
-                compilation_ctx,
-                types_stack,
-            );
+            let field_type =
+                bytecodes::structs::mut_borrow_field(struct_, field_id, builder, compilation_ctx);
+            types_stack.push(IntermediateType::IMutRef(Box::new(field_type)));
         }
         Bytecode::MutBorrowFieldGeneric(field_id) => {
             let (struct_field_id, instantiation_types) = module_data
@@ -606,6 +809,19 @@ fn translate_instruction(
                 .get(field_id)
                 .unwrap();
 
+            let instantiation_types = if instantiation_types.iter().any(type_contains_generics) {
+                if let Some(IntermediateType::IMutRef(inner)) = &types_stack.last() {
+                    match &**inner {
+                        IntermediateType::IGenericStructInstance { types, .. } => types.clone(),
+                        _ => panic!(),
+                    }
+                } else {
+                    panic!()
+                }
+            } else {
+                instantiation_types.clone()
+            };
+
             let struct_ = if let Ok(struct_) = module_data
                 .structs
                 .get_struct_instance_by_field_handle_idx(field_id)
@@ -615,24 +831,53 @@ fn translate_instruction(
                 let generic_stuct = module_data
                     .structs
                     .get_by_field_handle_idx(struct_field_id)?;
-                generic_stuct.instantiate(instantiation_types)
+
+                generic_stuct.instantiate(&instantiation_types)
             };
 
             // Check if in the types stack we have the correct type
             types_stack.pop_expecting(&IntermediateType::IMutRef(Box::new(
-                IntermediateType::IGenericStructInstance(
-                    struct_.index(),
-                    instantiation_types.to_vec(),
-                ),
+                IntermediateType::IGenericStructInstance {
+                    module_id: module_data.id.clone(),
+                    index: struct_.index(),
+                    types: instantiation_types.to_vec(),
+                },
             )))?;
 
-            bytecodes::structs::mut_borrow_field(
+            let field_type = bytecodes::structs::mut_borrow_field(
                 &struct_,
                 struct_field_id,
                 builder,
                 compilation_ctx,
-                types_stack,
             );
+
+            let field_type = replace_type_parameters(&field_type, &instantiation_types);
+
+            types_stack.push(IntermediateType::IMutRef(Box::new(field_type)));
+        }
+        Bytecode::VecUnpack(signature_index, length) => {
+            let inner =
+                bytecodes::vectors::get_inner_type_from_signature(signature_index, module_data)?;
+
+            let inner = if type_contains_generics(&inner) {
+                if let Some(caller_type_instances) =
+                    &mapped_function.function_id.type_instantiations
+                {
+                    instantiate_vec_type_parameters(&inner, caller_type_instances)
+                } else {
+                    panic!("could not compute concrete type")
+                }
+            } else {
+                inner
+            };
+
+            types_stack.pop_expecting(&IntermediateType::IVector(Box::new(inner.clone())))?;
+
+            IVector::vec_unpack_instructions(&inner, module, builder, compilation_ctx, *length);
+
+            for _ in 0..*length {
+                types_stack.push(inner.clone());
+            }
         }
         // Vector instructions
         Bytecode::VecImmBorrow(signature_index) => {
@@ -686,8 +931,42 @@ fn translate_instruction(
             types_stack.push(IntermediateType::IMutRef(Box::new(*vec_inner)));
         }
         Bytecode::VecPack(signature_index, num_elements) => {
+            // If the inner type is a type parameter, replace it with the last type in the types stack.
+
+            // Example:
+            // The function create_foo uses a generic type T that is not known at compilation time. As a result,
+            // the VecPack instruction generated for packing the b vector field includes a type parameter instead of a concrete type.
+            // When create_foo_u32 is called, it places the specific type onto the types stack. We must substitute the type parameter
+            // with the specific type found at the top of the types stack.
+            // ```
+            // public struct Foo<T: copy> has drop, copy {
+            //     a: T,
+            //     b: vector<T>,
+            // }
+            //
+            // public fun create_foo<T: copy>(t: T): Foo<T> {
+            //     Foo {a: t, b: vector[t, t, t]}
+            // }
+            //
+            // public fun create_foo_u32(t: u32): Foo<u32> {
+            //     create_foo(t)
+            // }
+            // ```
+
             let inner =
                 bytecodes::vectors::get_inner_type_from_signature(signature_index, module_data)?;
+
+            let inner = if type_contains_generics(&inner) {
+                if let Some(caller_type_instances) =
+                    &mapped_function.function_id.type_instantiations
+                {
+                    instantiate_vec_type_parameters(&inner, caller_type_instances)
+                } else {
+                    panic!("could not compute concrete type")
+                }
+            } else {
+                inner
+            };
 
             IVector::vec_pack_instructions(
                 &inner,
@@ -721,9 +1000,16 @@ fn translate_instruction(
             let expected_vec_inner =
                 bytecodes::vectors::get_inner_type_from_signature(signature_index, module_data)?;
 
-            if *vec_inner != expected_vec_inner {
+            let expected_vec_inner = if let IntermediateType::ITypeParameter(_) = expected_vec_inner
+            {
+                &*vec_inner
+            } else {
+                &expected_vec_inner
+            };
+
+            if *vec_inner != *expected_vec_inner {
                 return Err(TranslationError::TypeMismatch {
-                    expected: expected_vec_inner,
+                    expected: expected_vec_inner.clone(),
                     found: *vec_inner,
                 });
             }
@@ -737,9 +1023,8 @@ fn translate_instruction(
                 | IntermediateType::IU256
                 | IntermediateType::IAddress
                 | IntermediateType::ISigner
-                | IntermediateType::IExternalUserData { .. }
-                | IntermediateType::IStruct(_)
-                | IntermediateType::IGenericStructInstance(_, _)
+                | IntermediateType::IStruct { .. }
+                | IntermediateType::IGenericStructInstance { .. }
                 | IntermediateType::IVector(_) => {
                     let pop_back_f =
                         RuntimeFunction::VecPopBack32.get(module, Some(compilation_ctx));
@@ -778,16 +1063,23 @@ fn translate_instruction(
             let expected_elem_type =
                 bytecodes::vectors::get_inner_type_from_signature(signature_index, module_data)?;
 
-            if *vec_inner != expected_elem_type {
+            let expected_elem_type = if let IntermediateType::ITypeParameter(_) = expected_elem_type
+            {
+                &*vec_inner
+            } else {
+                &expected_elem_type
+            };
+
+            if *vec_inner != *expected_elem_type {
                 return Err(TranslationError::TypeMismatch {
-                    expected: expected_elem_type,
+                    expected: expected_elem_type.clone(),
                     found: *vec_inner,
                 });
             }
 
-            if elem_ty != expected_elem_type {
+            if &elem_ty != expected_elem_type {
                 return Err(TranslationError::TypeMismatch {
-                    expected: expected_elem_type,
+                    expected: expected_elem_type.clone(),
                     found: elem_ty,
                 });
             }
@@ -817,6 +1109,18 @@ fn translate_instruction(
             let expected_vec_inner =
                 bytecodes::vectors::get_inner_type_from_signature(signature_index, module_data)?;
 
+            let expected_vec_inner = if type_contains_generics(&expected_vec_inner) {
+                if let Some(caller_type_instances) =
+                    &mapped_function.function_id.type_instantiations
+                {
+                    instantiate_vec_type_parameters(&expected_vec_inner, caller_type_instances)
+                } else {
+                    panic!("could not compute concrete type")
+                }
+            } else {
+                expected_vec_inner
+            };
+
             if *vec_inner != expected_vec_inner {
                 return Err(TranslationError::TypeMismatch {
                     expected: expected_vec_inner,
@@ -839,9 +1143,17 @@ fn translate_instruction(
             let elem_ir_type =
                 bytecodes::vectors::get_inner_type_from_signature(signature_index, module_data)?;
 
-            types_stack.pop_expecting(&IntermediateType::IRef(Box::new(
-                IntermediateType::IVector(Box::new(elem_ir_type)),
-            )))?;
+            if let IntermediateType::ITypeParameter(_) = elem_ir_type {
+                let ref_ty = types_stack.pop()?;
+                types_stack::match_types!(
+                    (IntermediateType::IRef(inner), "vector reference", ref_ty),
+                    (IntermediateType::IVector(_vec_inner), "vector", *inner)
+                );
+            } else {
+                types_stack.pop_expecting(&IntermediateType::IRef(Box::new(
+                    IntermediateType::IVector(Box::new(elem_ir_type)),
+                )))?;
+            };
 
             builder
                 .load(
@@ -907,6 +1219,58 @@ fn translate_instruction(
         }
         // TODO: ensure this is the last instruction in the move code
         Bytecode::Ret => {
+            // If the function is entry and received as an argument an struct that must be saved in
+            // storage, we must persist it in case it had some change.
+            //
+            // We expect that the owner address is just right before the pointer
+            if mapped_function.is_entry {
+                for (arg_index, fn_arg) in mapped_function.signature.arguments.iter().enumerate() {
+                    let (itype, struct_) = match fn_arg {
+                        IntermediateType::IMutRef(inner) => (
+                            &**inner,
+                            compilation_ctx.get_struct_by_intermediate_type(inner),
+                        ),
+                        t => (fn_arg, compilation_ctx.get_struct_by_intermediate_type(t)),
+                    };
+
+                    if let Ok(struct_) = struct_ {
+                        if struct_.saved_in_storage {
+                            let locate_struct_fn = RuntimeFunction::LocateStructSlot
+                                .get(module, Some(compilation_ctx));
+
+                            let struct_ptr = module.locals.add(ValType::I32);
+                            builder
+                                .local_get(function_locals[arg_index])
+                                .load(
+                                    compilation_ctx.memory_id,
+                                    LoadKind::I32 { atomic: false },
+                                    MemArg {
+                                        align: 0,
+                                        offset: 0,
+                                    },
+                                )
+                                .local_tee(struct_ptr);
+
+                            // Compute the slot where the struct will be saved
+                            builder.call(locate_struct_fn);
+
+                            let save_in_slot_fn = RuntimeFunction::EncodeAndSaveInStorage
+                                .get_generic(module, compilation_ctx, &[itype]);
+
+                            // Load the struct memory representation to pass it to the save
+                            // function
+                            builder
+                                .local_get(struct_ptr)
+                                .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+                                .call(save_in_slot_fn);
+
+                            let (storage_flush_cache, _) = storage_flush_cache(module);
+                            builder.i32_const(1).call(storage_flush_cache);
+                        }
+                    }
+                }
+            }
+
             prepare_function_return(
                 module,
                 builder,
@@ -917,7 +1281,9 @@ fn translate_instruction(
             // We dont pop the return values from the stack, we just check if the types match
             assert!(
                 types_stack.0.ends_with(&mapped_function.signature.returns),
-                "types stack does not match function return types"
+                "types stack does not match function return types\ntypes stack {:?}\nfunction return {:?}",
+                types_stack.0.last(),
+                &mapped_function.signature.returns,
             );
         }
         Bytecode::CastU8 => {
@@ -1363,6 +1729,10 @@ fn translate_instruction(
 
             types_stack.push(t2);
         }
+        Bytecode::Abort => {
+            types_stack.pop_expecting(&IntermediateType::IU64)?;
+            builder.return_();
+        }
         Bytecode::Xor => {
             let [t1, t2] = types_stack.pop_n_from_stack()?;
             if t1 != t2 {
@@ -1435,29 +1805,97 @@ fn translate_instruction(
 
             bytecodes::structs::pack(struct_, module, builder, compilation_ctx, types_stack)?;
 
-            types_stack.push(IntermediateType::IStruct(struct_definition_index.0));
+            types_stack.push(IntermediateType::IStruct {
+                module_id: module_data.id.clone(),
+                index: struct_definition_index.0,
+            });
         }
         Bytecode::PackGeneric(struct_definition_index) => {
             let struct_ = module_data
                 .structs
                 .get_struct_instance_by_struct_definition_idx(struct_definition_index)?;
 
+            let type_instantiations = module_data
+                .structs
+                .get_generic_struct_types_instances(struct_definition_index)?
+                .to_vec();
+
+            // In some situations a struct instantiation in the Move module that contains a generic type
+            // parameter. For example:
+            // ```
+            // public struct Foo<T> {
+            //     field: T
+            // }
+            //
+            // public fun create_foo<T>(f: T): Foo<T> {
+            //     Foo { field: f }
+            // }
+            //
+            // public fun create_foo_u32(n: u32): Foo<u32> {
+            //     create_foo(n)
+            // }
+            // ```
+            //  In `create_foo` the compiler does not have any information about what T could be,
+            //  so, when called from `create_foo_u32` it will find a TypeParameter instead of a u32.
+            //  The TypeParameter will replaced by the u32 using the caller's type information.
+            let (struct_, types) = if type_instantiations.iter().any(type_contains_generics) {
+                if let Some(caller_type_instances) =
+                    &mapped_function.function_id.type_instantiations
+                {
+                    let mut instantiations = Vec::new();
+                    for (index, field) in type_instantiations.iter().enumerate() {
+                        if let Some(res) =
+                            extract_type_instances_from_stack(field, &type_instantiations[index])
+                        {
+                            instantiations.push(res);
+                        } else {
+                            instantiations.push(field.clone());
+                        }
+                    }
+
+                    let instantiations = instantiations
+                        .into_iter()
+                        .map(|f| {
+                            if let IntermediateType::ITypeParameter(i) = f {
+                                caller_type_instances[i as usize].clone()
+                            } else {
+                                f
+                            }
+                        })
+                        .collect::<Vec<IntermediateType>>();
+
+                    (struct_.instantiate(&instantiations), instantiations)
+                }
+                // This should never happen
+                else {
+                    panic!("could not instantiate generic types");
+                }
+            } else {
+                let types = module_data
+                    .structs
+                    .get_generic_struct_types_instances(struct_definition_index)?
+                    .to_vec();
+
+                (struct_, types)
+            };
+
             bytecodes::structs::pack(&struct_, module, builder, compilation_ctx, types_stack)?;
 
             let idx = module_data
                 .structs
                 .get_generic_struct_idx_by_struct_definition_idx(struct_definition_index);
-            let types = module_data
-                .structs
-                .get_generic_struct_types_instances(struct_definition_index)?;
 
-            types_stack.push(IntermediateType::IGenericStructInstance(
-                idx,
-                types.to_vec(),
-            ));
+            types_stack.push(IntermediateType::IGenericStructInstance {
+                module_id: module_data.id.clone(),
+                index: idx,
+                types,
+            });
         }
         Bytecode::Unpack(struct_definition_index) => {
-            types_stack.pop_expecting(&IntermediateType::IStruct(struct_definition_index.0))?;
+            types_stack.pop_expecting(&IntermediateType::IStruct {
+                module_id: module_data.id.clone(),
+                index: struct_definition_index.0,
+            })?;
 
             let struct_ = module_data
                 .structs
@@ -1473,14 +1911,49 @@ fn translate_instruction(
                 .structs
                 .get_generic_struct_types_instances(struct_definition_index)?;
 
-            types_stack.pop_expecting(&IntermediateType::IGenericStructInstance(
-                idx,
-                types.to_vec(),
-            ))?;
-
             let struct_ = module_data
                 .structs
                 .get_struct_instance_by_struct_definition_idx(struct_definition_index)?;
+
+            let (struct_, types) = if types.iter().any(type_contains_generics) {
+                if let Some(caller_type_instances) =
+                    &mapped_function.function_id.type_instantiations
+                {
+                    let mut instantiations = Vec::new();
+                    for (index, field) in types.iter().enumerate() {
+                        if let Some(res) = extract_type_instances_from_stack(field, &types[index]) {
+                            instantiations.push(res);
+                        } else {
+                            instantiations.push(field.clone());
+                        }
+                    }
+
+                    let instantiations = instantiations
+                        .into_iter()
+                        .map(|f| {
+                            if let IntermediateType::ITypeParameter(i) = f {
+                                caller_type_instances[i as usize].clone()
+                            } else {
+                                f
+                            }
+                        })
+                        .collect::<Vec<IntermediateType>>();
+
+                    (struct_.instantiate(&instantiations), instantiations)
+                }
+                // This should never happen
+                else {
+                    panic!("could not instantiate generic types");
+                }
+            } else {
+                (struct_, types.to_vec())
+            };
+
+            types_stack.pop_expecting(&IntermediateType::IGenericStructInstance {
+                module_id: module_data.id.clone(),
+                index: idx,
+                types,
+            })?;
 
             bytecodes::structs::unpack(&struct_, module, builder, compilation_ctx, types_stack)?;
         }
@@ -1505,6 +1978,9 @@ fn translate_instruction(
                     builder.br(target);
                 }
             }
+        }
+        Bytecode::Nop => {
+            // Just do nothing
         }
         //**
         // Enums

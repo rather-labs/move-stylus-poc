@@ -65,7 +65,7 @@ mod bool_type {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -132,7 +132,7 @@ mod address_type {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -161,15 +161,12 @@ mod signer_type {
     }
 
     #[rstest]
+    #[should_panic]
     #[case(echoCall::new(()), (address!("0x0000000000000000000000000000000007030507"),))]
-    #[case(
-        echoIdentityCall::new(()),
-        (address!("0x0000000000000000000000000000000007030507"),)
-    )]
-    #[case(
-        echoWithIntCall::new((42,)),
-        (42, address!("0x0000000000000000000000000000000007030507"))
-    )]
+    #[should_panic]
+    #[case(echoIdentityCall::new(()), (address!("0x0000000000000000000000000000000007030507"),))]
+    #[should_panic]
+    #[case(echoWithIntCall::new((42,)), (42, address!("0x0000000000000000000000000000000007030507")))]
     fn test_signer<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -180,7 +177,7 @@ mod signer_type {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -245,7 +242,7 @@ mod uint_8 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -273,7 +270,7 @@ mod uint_8 {
         run_test(
             runtime,
             divCall::new((dividend, divisor)).abi_encode(),
-            <(&i32,)>::abi_encode_params(&(&expected_result,)),
+            <(&i32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -297,7 +294,7 @@ mod uint_8 {
         run_test(
             runtime,
             modCall::new((dividend, divisor)).abi_encode(),
-            <(&i32,)>::abi_encode_params(&(&expected_result,)),
+            <(&i32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -324,7 +321,7 @@ mod uint_8 {
         run_test(
             runtime,
             mulCall::new((n1, n2)).abi_encode(),
-            <(&i32,)>::abi_encode_params(&(&expected_result,)),
+            <(&i32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -380,7 +377,7 @@ mod uint_16 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -408,7 +405,7 @@ mod uint_16 {
         run_test(
             runtime,
             divCall::new((dividend, divisor)).abi_encode(),
-            <(&u16,)>::abi_encode_params(&(&expected_result,)),
+            <(&u16,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -431,7 +428,7 @@ mod uint_16 {
         run_test(
             runtime,
             modCall::new((dividend, divisor)).abi_encode(),
-            <(&u16,)>::abi_encode_params(&(&expected_result,)),
+            <(&u16,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -458,7 +455,7 @@ mod uint_16 {
         run_test(
             runtime,
             mulCall::new((n1, n2)).abi_encode(),
-            <(&u16,)>::abi_encode_params(&(&expected_result,)),
+            <(&u16,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -515,7 +512,7 @@ mod uint_32 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -543,7 +540,7 @@ mod uint_32 {
         run_test(
             runtime,
             divCall::new((dividend, divisor)).abi_encode(),
-            <(&u32,)>::abi_encode_params(&(&expected_result,)),
+            <(&u32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -566,7 +563,7 @@ mod uint_32 {
         run_test(
             runtime,
             modCall::new((dividend, divisor)).abi_encode(),
-            <(&u32,)>::abi_encode_params(&(&expected_result,)),
+            <(&u32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -591,7 +588,7 @@ mod uint_32 {
         run_test(
             runtime,
             mulCall::new((n1, n2)).abi_encode(),
-            <(&u32,)>::abi_encode_params(&(&expected_result,)),
+            <(&u32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -647,7 +644,7 @@ mod uint_64 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -675,7 +672,7 @@ mod uint_64 {
         run_test(
             runtime,
             divCall::new((dividend, divisor)).abi_encode(),
-            <(&u64,)>::abi_encode_params(&(&expected_result,)),
+            <(&u64,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -698,7 +695,7 @@ mod uint_64 {
         run_test(
             runtime,
             modCall::new((dividend, divisor)).abi_encode(),
-            <(&u64,)>::abi_encode_params(&(&expected_result,)),
+            <(&u64,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -723,7 +720,7 @@ mod uint_64 {
         run_test(
             runtime,
             mulCall::new((n1, n2)).abi_encode(),
-            <(&u64,)>::abi_encode_params(&(&expected_result,)),
+            <(&u64,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -773,7 +770,7 @@ mod uint_128 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -816,7 +813,7 @@ mod uint_128 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -849,7 +846,7 @@ mod uint_128 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -886,7 +883,7 @@ mod uint_128 {
         run_test(
             runtime,
             mulCall::new((n1, n2)).abi_encode(),
-            <(&u128,)>::abi_encode_params(&(&expected_result,)),
+            <(&u128,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -910,7 +907,7 @@ mod uint_128 {
         run_test(
             runtime,
             divCall::new((dividend, divisor)).abi_encode(),
-            <(&u128,)>::abi_encode_params(&(&expected_result,)),
+            <(&u128,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -934,7 +931,7 @@ mod uint_128 {
         run_test(
             runtime,
             modCall::new((dividend, divisor)).abi_encode(),
-            <(&u128,)>::abi_encode_params(&(&expected_result,)),
+            <(&u128,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -984,7 +981,7 @@ mod uint_256 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1084,7 +1081,7 @@ mod uint_256 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1143,7 +1140,7 @@ mod uint_256 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1218,7 +1215,7 @@ mod uint_256 {
         run_test(
             runtime,
             mulCall::new((n1, n2)).abi_encode(),
-            <(&U256,)>::abi_encode_params(&(&expected_result,)),
+            <(&U256,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -1254,7 +1251,7 @@ mod uint_256 {
         run_test(
             runtime,
             divCall::new((dividend, divisor)).abi_encode(),
-            <(&U256,)>::abi_encode_params(&(&expected_result,)),
+            <(&U256,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -1290,7 +1287,7 @@ mod uint_256 {
         run_test(
             runtime,
             modCall::new((dividend, divisor)).abi_encode(),
-            <(&U256,)>::abi_encode_params(&(&expected_result,)),
+            <(&U256,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
@@ -1321,7 +1318,7 @@ fn test_multi_values_return() {
         address,
         uint32[],
         uint128[]
-    ))>::abi_encode_params(&(
+    ))>::abi_encode_sequence(&(
         U256::from(256256),
         6464,
         3232,
@@ -1343,7 +1340,7 @@ fn test_multi_values_return() {
         uint32,
         uint64,
         uint256
-    ))>::abi_encode_params(&(
+    ))>::abi_encode_sequence(&(
         vec![100, 200, 300],
         vec![10, 20, 30],
         address!("0x0000000000000000000000000000000000000001"),
@@ -1365,7 +1362,7 @@ fn test_multi_values_return() {
         address,
         uint32[],
         uint128[]
-    ))>::abi_encode_params(&(
+    ))>::abi_encode_sequence(&(
         U256::from(256256),
         6464,
         3232,
@@ -1406,6 +1403,7 @@ mod vec_32 {
         function vecSwap(uint32[] x, uint64 id1, uint64 id2) external returns (uint32[]);
         function vecPushBack(uint32[] x, uint32 y) external returns (uint32[]);
         function vecPushAndPopBack(uint32[] x, uint32 y) external returns (uint32[]);
+        function vecUnpack(uint32[] x) external returns (uint32[]);
     );
 
     #[rstest]
@@ -1427,6 +1425,7 @@ mod vec_32 {
     #[case(vecSwapCall::new((vec![1u32, 2u32, 3u32], 0u64, 2u64)), vec![3, 2, 1])]
     #[case(vecPushBackCall::new((vec![1u32, 2u32, 3u32], 4u32)), vec![1, 2, 3, 4])]
     #[case(vecPushAndPopBackCall::new((vec![1u32, 2u32, 3u32], 4u32)), vec![1, 2, 3])]
+    #[case(vecUnpackCall::new((vec![1u32, 5u32, 9u32],)), vec![3, 1, 4, 1, 5, 9])]
     fn test_vec_32<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -1437,7 +1436,7 @@ mod vec_32 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1471,6 +1470,7 @@ mod vec_64 {
           function vecSwap(uint64[] x, uint64 id1, uint64 id2) external returns (uint64[]);
           function vecPushBack(uint64[] x, uint64 y) external returns (uint64[]);
           function vecPushAndPopBack(uint64[] x, uint64 y) external returns (uint64[]);
+          function vecUnpack(uint64[] x) external returns (uint64[]);
     );
 
     #[rstest]
@@ -1492,6 +1492,7 @@ mod vec_64 {
     #[case(vecSwapCall::new((vec![1u64, 2u64, 3u64], 0u64, 2u64)), vec![3u64, 2u64, 1u64])]
     #[case(vecPushBackCall::new((vec![1u64, 2u64, 3u64], 4u64)), vec![1u64, 2u64, 3u64, 4u64, 4u64])]
     #[case(vecPushAndPopBackCall::new((vec![1u64, 2u64, 3u64], 4u64)), vec![1u64, 2u64, 3u64])]
+    #[case(vecUnpackCall::new((vec![1u64, 5u64, 9u64],)), vec![3, 1, 4, 1, 5, 9])]
     fn test_vec_64<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -1502,7 +1503,7 @@ mod vec_64 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1536,6 +1537,7 @@ mod vec_128 {
         function vecSwap(uint128[] x, uint64 id1, uint64 id2) external returns (uint128[]);
         function vecPushBack(uint128[] x, uint128 y) external returns (uint128[]);
         function vecPushAndPopBack(uint128[] x, uint128 y) external returns (uint128[]);
+        function vecUnpack(uint128[] x) external returns (uint128[]);
     );
 
     #[rstest]
@@ -1557,6 +1559,7 @@ mod vec_128 {
     #[case(vecSwapCall::new((vec![1u128, 2u128, 3u128], 0u64, 2u64)), vec![3u128, 2u128, 1u128])]
     #[case(vecPushBackCall::new((vec![1u128, 2u128, 3u128], 4u128)), vec![1u128, 2u128, 3u128, 4u128, 4u128])]
     #[case(vecPushAndPopBackCall::new((vec![1u128, 2u128, 3u128], 4u128)), vec![1u128, 2u128, 3u128])]
+    #[case(vecUnpackCall::new((vec![1u128, 5u128, 9u128],)), vec![3, 1, 4, 1, 5, 9])]
     fn test_vec_128<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -1567,7 +1570,7 @@ mod vec_128 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1600,6 +1603,7 @@ mod vec_vec_32 {
         function vecPushBackToElement(uint32[][] x, uint32 y) external returns (uint32[][]);
         function vecPushAndPopBack(uint32[][] x, uint32[] y) external returns (uint32[][]);
         function misc0(uint32[][] x, uint32 y) external returns (uint32[][]);
+        function vecUnpack(uint32[][] x) external returns (uint32[][]);
     );
 
     #[rstest]
@@ -1619,6 +1623,7 @@ mod vec_vec_32 {
     #[case(vecPushBackCall::new((vec![vec![1u32, 2u32], vec![3u32, 4u32]], vec![5u32, 6u32])), vec![vec![1u32, 2u32], vec![3u32, 4u32], vec![5u32, 6u32], vec![5u32, 6u32]])]
     #[case(vecPushAndPopBackCall::new((vec![vec![1u32, 2u32], vec![3u32, 4u32]], vec![5u32, 6u32])), vec![vec![1u32, 2u32], vec![3u32, 4u32]])]
     #[case(misc0Call::new((vec![vec![1u32, 2u32], vec![3u32, 4u32]], 99u32)), vec![vec![1u32, 2u32, 99u32], vec![4u32, 99u32]])]
+    #[case(vecUnpackCall::new((vec![vec![1u32], vec![5u32], vec![9u32]],)), vec![vec![3], vec![1], vec![4], vec![1], vec![5], vec![9]])]
     fn test_vec_vec_32<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -1629,7 +1634,7 @@ mod vec_vec_32 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1662,6 +1667,7 @@ mod vec_vec_128 {
         function vecPushBackToElement(uint128[][] x, uint128 y) external returns (uint128[][]);
         function vecPushAndPopBack(uint128[][] x, uint128[] y) external returns (uint128[][]);
         function misc0(uint128[][] x, uint128 y) external returns (uint128[][]);
+        function vecUnpack(uint128[][] x) external returns (uint128[][]);
     );
 
     #[rstest]
@@ -1681,6 +1687,7 @@ mod vec_vec_128 {
     #[case(vecPushBackCall::new((vec![vec![1u128, 2u128], vec![3u128, 4u128]], vec![5u128, 6u128])), vec![vec![1u128, 2u128], vec![3u128, 4u128], vec![5u128, 6u128], vec![5u128, 6u128]])]
     #[case(vecPushAndPopBackCall::new((vec![vec![1u128, 2u128], vec![3u128, 4u128]], vec![5u128, 6u128])), vec![vec![1u128, 2u128], vec![3u128, 4u128]])]
     #[case(misc0Call::new((vec![vec![1u128, 2u128], vec![3u128, 4u128]], 99u128)), vec![vec![1u128, 2u128, 99u128], vec![4u128, 99u128]])]
+    #[case(vecUnpackCall::new((vec![vec![1u128], vec![5u128], vec![9u128]],)), vec![vec![3], vec![1], vec![4], vec![1], vec![5], vec![9]])]
     fn test_vec_vec_128<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -1691,7 +1698,7 @@ mod vec_vec_128 {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
@@ -1749,6 +1756,11 @@ mod vec_struct {
         function vecSwap(Foo[] x, uint64 id1, uint64 id2) external returns (Foo[]);
         function vecPushBack(Foo[] x, Foo y) external returns (Foo[]);
         function vecPushAndPopBack(Foo[] x, Foo y) external returns (Foo[]);
+        function vecEq(Foo[] x, Foo[] y) external returns (bool);
+        function vecNeq(Foo[] x, Foo[] y) external returns (bool);
+        function vecBorrow(Foo[] x) external returns (Foo);
+        function vecMutBorrow(Foo[] x) external returns (Foo);
+        function vecUnpack(Foo[] x) external returns (Foo[]);
     );
 
     fn get_foo_vector() -> Vec<Foo> {
@@ -2146,6 +2158,61 @@ mod vec_struct {
         [get_foo_vector(), vec![get_new_fooo(), get_new_fooo()]].concat()
     )]
     #[case(vecPushAndPopBackCall::new((get_foo_vector(), get_new_fooo())), get_foo_vector())]
+    #[case(vecEqCall::new((get_foo_vector(), get_foo_vector())), (true,))]
+    #[case(
+        vecEqCall::new((
+            get_foo_vector(),
+            vec![
+                Foo {
+                    q: address!("0x00000000000000000000000000000004deadbeef"),
+                    r: vec![4, 3, 0, 3, 4, 5, 6],
+                    s: vec![4, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 44,
+                    v: 44242,
+                    w: 4424242,
+                    x: 442424242,
+                    y: 44242424242,
+                    z: U256::from(4424242424242_u128),
+                    bar: Bar { a: 442, b: 44242 },
+                    baz: Baz {
+                        a: 44242,
+                        b: vec![U256::from(4)],
+                    },
+                }
+            ]
+        )),
+        (false,)
+    )]
+    #[case(vecNeqCall::new((get_foo_vector(), get_foo_vector())), (false,))]
+    #[case(
+        vecNeqCall::new((
+            get_foo_vector(),
+            vec![
+                Foo {
+                    q: address!("0x00000000000000000000000000000004deadbeef"),
+                    r: vec![4, 3, 0, 3, 4, 5, 6],
+                    s: vec![4, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 44,
+                    v: 44242,
+                    w: 4424242,
+                    x: 442424242,
+                    y: 44242424242,
+                    z: U256::from(4424242424242_u128),
+                    bar: Bar { a: 442, b: 44242 },
+                    baz: Baz {
+                        a: 44242,
+                        b: vec![U256::from(4)],
+                    },
+                }
+            ]
+        )),
+        (true,)
+    )]
+    #[case(vecBorrowCall::new((get_foo_vector(),)), get_foo_vector()[0].clone())]
+    #[case(vecMutBorrowCall::new((get_foo_vector(),)), get_foo_vector()[0].clone())]
+    #[case(vecUnpackCall::new((get_foo_vector(),)), [get_foo_vector(), get_foo_vector()].concat())]
     fn test_vec_struct<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -2156,7 +2223,1192 @@ mod vec_struct {
         run_test(
             runtime,
             call_data.abi_encode(),
-            expected_result.abi_encode_params(),
+            expected_result.abi_encode(),
+        )
+        .unwrap();
+    }
+}
+
+mod vec_external_struct {
+    use crate::common::translate_test_complete_package;
+
+    use super::*;
+
+    #[fixture]
+    #[once]
+    fn runtime() -> RuntimeSandbox {
+        let mut translated_packages = translate_test_complete_package("tests/primitives/external");
+
+        let translated_package = translated_packages.get_mut("vec_external_struct").unwrap();
+        RuntimeSandbox::new(translated_package)
+    }
+
+    sol!(
+        #[allow(missing_docs)]
+
+        struct Foo {
+            address q;
+            uint32[] r;
+            uint128[] s;
+            bool t;
+            uint8 u;
+            uint16 v;
+            uint32 w;
+            uint64 x;
+            uint128 y;
+            uint256 z;
+            Bar bar;
+            Baz baz;
+        }
+
+        struct Bar {
+            uint16 a;
+            uint128 b;
+        }
+
+        struct Baz {
+            uint16 a;
+            uint256[] b;
+        }
+
+        function getLiteral() external returns (Foo[]);
+        function getCopiedLocal() external returns (Foo[]);
+        function echo(Foo[] x) external returns (Foo[]);
+        function vecFromStruct(Foo x, Foo y) external returns (Foo[]);
+        function vecFromVec(Foo[] x, Foo[] y) external returns (Foo[][]);
+        function vecFromVecAndStruct(Foo[] x, Foo y) external returns (Foo [][]);
+        function vecLen(Foo[] x) external returns (uint64);
+        function vecPopBack(Foo[] x) external returns (Foo[]);
+        function vecSwap(Foo[] x, uint64 id1, uint64 id2) external returns (Foo[]);
+        function vecPushBack(Foo[] x, Foo y) external returns (Foo[]);
+        function vecPushAndPopBack(Foo[] x, Foo y) external returns (Foo[]);
+        function vecEq(Foo[] x, Foo[] y) external returns (bool);
+        function vecNeq(Foo[] x, Foo[] y) external returns (bool);
+        function vecBorrow(Foo[] x) external returns (Foo);
+        function vecMutBorrow(Foo[] x) external returns (Foo);
+    );
+
+    fn get_foo_vector() -> Vec<Foo> {
+        vec![
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar { a: 242, b: 24242 },
+                baz: Baz {
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000003deadbeef"),
+                r: vec![3, 3, 0, 3, 4, 5, 6],
+                s: vec![3, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 43,
+                v: 34242,
+                w: 3424242,
+                x: 342424242,
+                y: 34242424242,
+                z: U256::from(3424242424242_u128),
+                bar: Bar { a: 342, b: 34242 },
+                baz: Baz {
+                    a: 34242,
+                    b: vec![U256::from(3)],
+                },
+            },
+        ]
+    }
+
+    fn get_new_fooo() -> Foo {
+        Foo {
+            q: address!("0x00000000000000000000000000000004deadbeef"),
+            r: vec![4, 3, 0, 3, 4, 5, 6],
+            s: vec![4, 5, 4, 3, 0, 3, 0],
+            t: true,
+            u: 44,
+            v: 44242,
+            w: 4424242,
+            x: 442424242,
+            y: 44242424242,
+            z: U256::from(4424242424242_u128),
+            bar: Bar { a: 442, b: 44242 },
+            baz: Baz {
+                a: 44242,
+                b: vec![U256::from(4)],
+            },
+        }
+    }
+
+    #[rstest]
+    #[case(getLiteralCall::new(()), get_foo_vector())]
+    #[case(getCopiedLocalCall::new(()), get_foo_vector())]
+    #[case(echoCall::new((get_foo_vector(),)), get_foo_vector())]
+    #[case(
+        vecFromStructCall::new((
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar { a: 242, b: 24242 },
+                baz: Baz {
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            }
+        )),
+        vec![
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar { a: 242, b: 24242 },
+                baz: Baz {
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            }
+        ]
+    )]
+    #[case(vecFromVecCall::new((get_foo_vector(), get_foo_vector())), vec![get_foo_vector(), get_foo_vector()])]
+    #[case(
+        vecFromVecAndStructCall::new((
+            get_foo_vector(),
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            }
+        )),
+        vec![
+            get_foo_vector(),
+            vec![
+                Foo {
+                    q: address!("0x00000000000000000000000000000001deadbeef"),
+                    r: vec![1, 3, 0, 3, 4, 5, 6],
+                    s: vec![1, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 41,
+                    v: 14242,
+                    w: 1424242,
+                    x: 142424242,
+                    y: 14242424242,
+                    z: U256::from(1424242424242_u128),
+                    bar: Bar { a: 142, b: 14242 },
+                    baz: Baz {
+                        a: 14242,
+                        b: vec![U256::from(1)],
+                    },
+                },
+                Foo {
+                    q: address!("0x00000000000000000000000000000001deadbeef"),
+                    r: vec![1, 3, 0, 3, 4, 5, 6],
+                    s: vec![1, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 41,
+                    v: 14242,
+                    w: 1424242,
+                    x: 142424242,
+                    y: 14242424242,
+                    z: U256::from(1424242424242_u128),
+                    bar: Bar { a: 142, b: 14242 },
+                    baz: Baz {
+                        a: 14242,
+                        b: vec![U256::from(1)],
+                    },
+                }
+            ]
+        ]
+    )]
+    #[case(vecLenCall::new((get_foo_vector(),)), (3u64,))]
+    #[case(
+        vecPopBackCall::new((get_foo_vector(),)),
+        vec![
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            }
+        ]
+    )]
+    #[should_panic(expected = "wasm trap: wasm `unreachable` instruction executed")]
+    #[case(vecPopBackCall::new((vec![],)), ((),))]
+    #[should_panic(expected = r#"wasm trap: wasm `unreachable` instruction executed"#)]
+    #[case(vecSwapCall::new((get_foo_vector(), 0u64, 3u64)), ((),))]
+    #[case(
+        vecSwapCall::new((get_foo_vector(), 0u64, 1u64)),
+        vec![
+            Foo {
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar { a: 242, b: 24242 },
+                baz: Baz {
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000003deadbeef"),
+                r: vec![3, 3, 0, 3, 4, 5, 6],
+                s: vec![3, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 43,
+                v: 34242,
+                w: 3424242,
+                x: 342424242,
+                y: 34242424242,
+                z: U256::from(3424242424242_u128),
+                bar: Bar { a: 342, b: 34242 },
+                baz: Baz {
+                    a: 34242,
+                    b: vec![U256::from(3)],
+                },
+            }
+        ]
+    )]
+    #[case(
+        vecSwapCall::new((get_foo_vector(), 0u64, 2u64)),
+        vec![
+            Foo {
+                q: address!("0x00000000000000000000000000000003deadbeef"),
+                r: vec![3, 3, 0, 3, 4, 5, 6],
+                s: vec![3, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 43,
+                v: 34242,
+                w: 3424242,
+                x: 342424242,
+                y: 34242424242,
+                z: U256::from(3424242424242_u128),
+                bar: Bar { a: 342, b: 34242 },
+                baz: Baz {
+                    a: 34242,
+                    b: vec![U256::from(3)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar { a: 242, b: 24242 },
+                baz: Baz {
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar { a: 142, b: 14242 },
+                baz: Baz {
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+        ])]
+    #[case(
+        vecPushBackCall::new((
+            get_foo_vector(),
+            Foo {
+                q: address!("0x00000000000000000000000000000004deadbeef"),
+                r: vec![4, 3, 0, 3, 4, 5, 6],
+                s: vec![4, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 44,
+                v: 44242,
+                w: 4424242,
+                x: 442424242,
+                y: 44242424242,
+                z: U256::from(4424242424242_u128),
+                bar: Bar { a: 442, b: 44242 },
+                baz: Baz {
+                    a: 44242,
+                    b: vec![U256::from(4)],
+                },
+            }
+        )),
+        [get_foo_vector(), vec![get_new_fooo(), get_new_fooo()]].concat()
+    )]
+    #[case(vecPushAndPopBackCall::new((get_foo_vector(), get_new_fooo())), get_foo_vector())]
+    #[case(vecEqCall::new((get_foo_vector(), get_foo_vector())), (true,))]
+    #[case(
+        vecEqCall::new((
+            get_foo_vector(),
+            vec![
+                Foo {
+                    q: address!("0x00000000000000000000000000000004deadbeef"),
+                    r: vec![4, 3, 0, 3, 4, 5, 6],
+                    s: vec![4, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 44,
+                    v: 44242,
+                    w: 4424242,
+                    x: 442424242,
+                    y: 44242424242,
+                    z: U256::from(4424242424242_u128),
+                    bar: Bar { a: 442, b: 44242 },
+                    baz: Baz {
+                        a: 44242,
+                        b: vec![U256::from(4)],
+                    },
+                }
+            ]
+        )),
+        (false,)
+    )]
+    #[case(vecNeqCall::new((get_foo_vector(), get_foo_vector())), (false,))]
+    #[case(
+        vecNeqCall::new((
+            get_foo_vector(),
+            vec![
+                Foo {
+                    q: address!("0x00000000000000000000000000000004deadbeef"),
+                    r: vec![4, 3, 0, 3, 4, 5, 6],
+                    s: vec![4, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 44,
+                    v: 44242,
+                    w: 4424242,
+                    x: 442424242,
+                    y: 44242424242,
+                    z: U256::from(4424242424242_u128),
+                    bar: Bar { a: 442, b: 44242 },
+                    baz: Baz {
+                        a: 44242,
+                        b: vec![U256::from(4)],
+                    },
+                }
+            ]
+        )),
+        (true,)
+    )]
+    #[case(vecBorrowCall::new((get_foo_vector(),)), get_foo_vector()[0].clone())]
+    #[case(vecMutBorrowCall::new((get_foo_vector(),)), get_foo_vector()[0].clone())]
+    fn test_vec_external_struct<T: SolCall, V: SolValue>(
+        #[by_ref] runtime: &RuntimeSandbox,
+        #[case] call_data: T,
+        #[case] expected_result: V,
+    ) where
+        for<'a> <V::SolType as SolType>::Token<'a>: TokenSeq<'a>,
+    {
+        run_test(
+            runtime,
+            call_data.abi_encode(),
+            expected_result.abi_encode(),
+        )
+        .unwrap();
+    }
+}
+
+mod vec_external_generic_struct {
+    use crate::common::translate_test_complete_package;
+
+    use super::*;
+
+    #[fixture]
+    #[once]
+    fn runtime() -> RuntimeSandbox {
+        let mut translated_packages = translate_test_complete_package("tests/primitives/external");
+
+        let translated_package = translated_packages
+            .get_mut("vec_external_generic_struct")
+            .unwrap();
+        RuntimeSandbox::new(translated_package)
+    }
+
+    sol!(
+        #[allow(missing_docs)]
+
+        struct Foo {
+            uint32 g;
+            address q;
+            uint32[] r;
+            uint128[] s;
+            bool t;
+            uint8 u;
+            uint16 v;
+            uint32 w;
+            uint64 x;
+            uint128 y;
+            uint256 z;
+            Bar bar;
+            Baz baz;
+        }
+
+        struct Bar {
+            uint32 g;
+            uint16 a;
+            uint128 b;
+        }
+
+        struct Baz {
+            uint32 g;
+            uint16 a;
+            uint256[] b;
+        }
+
+        function getLiteral() external returns (Foo[]);
+        function getCopiedLocal() external returns (Foo[]);
+        function echo(Foo[] x) external returns (Foo[]);
+        function vecFromStruct(Foo x, Foo y) external returns (Foo[]);
+        function vecFromVec(Foo[] x, Foo[] y) external returns (Foo[][]);
+        function vecFromVecAndStruct(Foo[] x, Foo y) external returns (Foo [][]);
+        function vecLen(Foo[] x) external returns (uint64);
+        function vecPopBack(Foo[] x) external returns (Foo[]);
+        function vecSwap(Foo[] x, uint64 id1, uint64 id2) external returns (Foo[]);
+        function vecPushBack(Foo[] x, Foo y) external returns (Foo[]);
+        function vecPushAndPopBack(Foo[] x, Foo y) external returns (Foo[]);
+        function vecEq(Foo[] x, Foo[] y) external returns (bool);
+        function vecNeq(Foo[] x, Foo[] y) external returns (bool);
+        function vecBorrow(Foo[] x) external returns (Foo);
+        function vecMutBorrow(Foo[] x) external returns (Foo);
+    );
+
+    fn get_foo_vector() -> Vec<Foo> {
+        vec![
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242,
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                g: 2,
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar {
+                    g: 2,
+                    a: 242,
+                    b: 24242,
+                },
+                baz: Baz {
+                    g: 2,
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                g: 3,
+                q: address!("0x00000000000000000000000000000003deadbeef"),
+                r: vec![3, 3, 0, 3, 4, 5, 6],
+                s: vec![3, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 43,
+                v: 34242,
+                w: 3424242,
+                x: 342424242,
+                y: 34242424242,
+                z: U256::from(3424242424242_u128),
+                bar: Bar {
+                    g: 3,
+                    a: 342,
+                    b: 34242,
+                },
+                baz: Baz {
+                    g: 3,
+                    a: 34242,
+                    b: vec![U256::from(3)],
+                },
+            },
+        ]
+    }
+
+    fn get_new_fooo() -> Foo {
+        Foo {
+            g: 4,
+            q: address!("0x00000000000000000000000000000004deadbeef"),
+            r: vec![4, 3, 0, 3, 4, 5, 6],
+            s: vec![4, 5, 4, 3, 0, 3, 0],
+            t: true,
+            u: 44,
+            v: 44242,
+            w: 4424242,
+            x: 442424242,
+            y: 44242424242,
+            z: U256::from(4424242424242_u128),
+            bar: Bar {
+                g: 4,
+                a: 442,
+                b: 44242,
+            },
+            baz: Baz {
+                g: 4,
+                a: 44242,
+                b: vec![U256::from(4)],
+            },
+        }
+    }
+
+    #[rstest]
+    #[case(getLiteralCall::new(()), get_foo_vector())]
+    #[case(getCopiedLocalCall::new(()), get_foo_vector())]
+    #[case(echoCall::new((get_foo_vector(),)), get_foo_vector())]
+    #[case(
+        vecFromStructCall::new((
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                g: 2,
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar {
+                    g: 2,
+                    a: 242,
+                    b: 24242
+                },
+                baz: Baz {
+                    g: 2,
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            }
+        )),
+        vec![
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                g: 2,
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar {
+                    g: 2,
+                    a: 242,
+                    b: 24242
+                },
+                baz: Baz {
+                    g: 2,
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            }
+        ]
+    )]
+    #[case(vecFromVecCall::new((get_foo_vector(), get_foo_vector())), vec![get_foo_vector(), get_foo_vector()])]
+    #[case(
+        vecFromVecAndStructCall::new((
+            get_foo_vector(),
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            }
+        )),
+        vec![
+            get_foo_vector(),
+            vec![
+                Foo {
+                    g: 1,
+                    q: address!("0x00000000000000000000000000000001deadbeef"),
+                    r: vec![1, 3, 0, 3, 4, 5, 6],
+                    s: vec![1, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 41,
+                    v: 14242,
+                    w: 1424242,
+                    x: 142424242,
+                    y: 14242424242,
+                    z: U256::from(1424242424242_u128),
+                    bar: Bar {
+                        g: 1,
+                        a: 142,
+                        b: 14242
+                    },
+                    baz: Baz {
+                        g: 1,
+                        a: 14242,
+                        b: vec![U256::from(1)],
+                    },
+                },
+                Foo {
+                    g: 1,
+                    q: address!("0x00000000000000000000000000000001deadbeef"),
+                    r: vec![1, 3, 0, 3, 4, 5, 6],
+                    s: vec![1, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 41,
+                    v: 14242,
+                    w: 1424242,
+                    x: 142424242,
+                    y: 14242424242,
+                    z: U256::from(1424242424242_u128),
+                    bar: Bar {
+                        g: 1,
+                        a: 142,
+                        b: 14242
+                    },
+                    baz: Baz {
+                        g: 1,
+                        a: 14242,
+                        b: vec![U256::from(1)],
+                    },
+                }
+            ]
+        ]
+    )]
+    #[case(vecLenCall::new((get_foo_vector(),)), (3u64,))]
+    #[case(
+        vecPopBackCall::new((get_foo_vector(),)),
+        vec![
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            }
+        ]
+    )]
+    #[should_panic(expected = "wasm trap: wasm `unreachable` instruction executed")]
+    #[case(vecPopBackCall::new((vec![],)), ((),))]
+    #[should_panic(expected = r#"wasm trap: wasm `unreachable` instruction executed"#)]
+    #[case(vecSwapCall::new((get_foo_vector(), 0u64, 3u64)), ((),))]
+    #[case(
+        vecSwapCall::new((get_foo_vector(), 0u64, 1u64)),
+        vec![
+            Foo {
+                g: 2,
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar {
+                    g: 2,
+                    a: 242,
+                    b: 24242
+                },
+                baz: Baz {
+                    g: 2,
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+            Foo {
+                g: 3,
+                q: address!("0x00000000000000000000000000000003deadbeef"),
+                r: vec![3, 3, 0, 3, 4, 5, 6],
+                s: vec![3, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 43,
+                v: 34242,
+                w: 3424242,
+                x: 342424242,
+                y: 34242424242,
+                z: U256::from(3424242424242_u128),
+                bar: Bar {
+                    g: 3,
+                    a: 342,
+                    b: 34242
+                },
+                baz: Baz {
+                    g: 3,
+                    a: 34242,
+                    b: vec![U256::from(3)],
+                },
+            }
+        ]
+    )]
+    #[case(
+        vecSwapCall::new((get_foo_vector(), 0u64, 2u64)),
+        vec![
+            Foo {
+                g: 3,
+                q: address!("0x00000000000000000000000000000003deadbeef"),
+                r: vec![3, 3, 0, 3, 4, 5, 6],
+                s: vec![3, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 43,
+                v: 34242,
+                w: 3424242,
+                x: 342424242,
+                y: 34242424242,
+                z: U256::from(3424242424242_u128),
+                bar: Bar {
+                    g: 3,
+                    a: 342,
+                    b: 34242
+                },
+                baz: Baz {
+                    g: 3,
+                    a: 34242,
+                    b: vec![U256::from(3)],
+                },
+            },
+            Foo {
+                g: 2,
+                q: address!("0x00000000000000000000000000000002deadbeef"),
+                r: vec![2, 3, 0, 3, 4, 5, 6],
+                s: vec![2, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 42,
+                v: 24242,
+                w: 2424242,
+                x: 242424242,
+                y: 24242424242,
+                z: U256::from(2424242424242_u128),
+                bar: Bar {
+                    g: 2,
+                    a: 242,
+                    b: 24242
+                },
+                baz: Baz {
+                    g: 2,
+                    a: 24242,
+                    b: vec![U256::from(2)],
+                },
+            },
+            Foo {
+                g: 1,
+                q: address!("0x00000000000000000000000000000001deadbeef"),
+                r: vec![1, 3, 0, 3, 4, 5, 6],
+                s: vec![1, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 41,
+                v: 14242,
+                w: 1424242,
+                x: 142424242,
+                y: 14242424242,
+                z: U256::from(1424242424242_u128),
+                bar: Bar {
+                    g: 1,
+                    a: 142,
+                    b: 14242
+                },
+                baz: Baz {
+                    g: 1,
+                    a: 14242,
+                    b: vec![U256::from(1)],
+                },
+            },
+        ])]
+    #[case(
+        vecPushBackCall::new((
+            get_foo_vector(),
+            Foo {
+                g: 4,
+                q: address!("0x00000000000000000000000000000004deadbeef"),
+                r: vec![4, 3, 0, 3, 4, 5, 6],
+                s: vec![4, 5, 4, 3, 0, 3, 0],
+                t: true,
+                u: 44,
+                v: 44242,
+                w: 4424242,
+                x: 442424242,
+                y: 44242424242,
+                z: U256::from(4424242424242_u128),
+                bar: Bar {
+                    g: 4,
+                    a: 442,
+                    b: 44242
+                },
+                baz: Baz {
+                    g: 4,
+                    a: 44242,
+                    b: vec![U256::from(4)],
+                },
+            }
+        )),
+        [get_foo_vector(), vec![get_new_fooo(), get_new_fooo()]].concat()
+    )]
+    #[case(vecPushAndPopBackCall::new((get_foo_vector(), get_new_fooo())), get_foo_vector())]
+    #[case(vecEqCall::new((get_foo_vector(), get_foo_vector())), (true,))]
+    #[case(
+        vecEqCall::new((
+            get_foo_vector(),
+            vec![
+                Foo {
+                    g: 4,
+                    q: address!("0x00000000000000000000000000000004deadbeef"),
+                    r: vec![4, 3, 0, 3, 4, 5, 6],
+                    s: vec![4, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 44,
+                    v: 44242,
+                    w: 4424242,
+                    x: 442424242,
+                    y: 44242424242,
+                    z: U256::from(4424242424242_u128),
+                    bar: Bar {
+                        g: 4,
+                        a: 442,
+                        b: 44242
+                    },
+                    baz: Baz {
+                        g: 4,
+                        a: 44242,
+                        b: vec![U256::from(4)],
+                    },
+                }
+            ]
+        )),
+        (false,)
+    )]
+    #[case(vecNeqCall::new((get_foo_vector(), get_foo_vector())), (false,))]
+    #[case(
+        vecNeqCall::new((
+            get_foo_vector(),
+            vec![
+                Foo {
+                    g: 4,
+                    q: address!("0x00000000000000000000000000000004deadbeef"),
+                    r: vec![4, 3, 0, 3, 4, 5, 6],
+                    s: vec![4, 5, 4, 3, 0, 3, 0],
+                    t: true,
+                    u: 44,
+                    v: 44242,
+                    w: 4424242,
+                    x: 442424242,
+                    y: 44242424242,
+                    z: U256::from(4424242424242_u128),
+                    bar: Bar {
+                        g: 4,
+                        a: 442,
+                        b: 44242
+                    },
+                    baz: Baz {
+                        g: 4,
+                        a: 44242,
+                        b: vec![U256::from(4)],
+                    },
+                }
+            ]
+        )),
+        (true,)
+    )]
+    #[case(vecBorrowCall::new((get_foo_vector(),)), get_foo_vector()[0].clone())]
+    #[case(vecMutBorrowCall::new((get_foo_vector(),)), get_foo_vector()[0].clone())]
+    fn test_vec_external_struct<T: SolCall, V: SolValue>(
+        #[by_ref] runtime: &RuntimeSandbox,
+        #[case] call_data: T,
+        #[case] expected_result: V,
+    ) where
+        for<'a> <V::SolType as SolType>::Token<'a>: TokenSeq<'a>,
+    {
+        run_test(
+            runtime,
+            call_data.abi_encode(),
+            expected_result.abi_encode(),
         )
         .unwrap();
     }
