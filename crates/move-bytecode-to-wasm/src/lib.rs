@@ -1,77 +1,91 @@
-use abi_types::public_function::PublicFunction;
-pub(crate) use compilation_context::{CompilationContext, UserDefinedType};
-use compilation_context::{ModuleData, ModuleId};
-use constructor::inject_constructor;
-use move_binary_format::file_format::FunctionDefinition;
-use move_package::{
-    compilation::compiled_package::{CompiledPackage, CompiledUnitWithSource},
-    source_package::parsed_manifest::PackageName,
-};
-use std::{
-    collections::HashMap,
-    hash::{DefaultHasher, Hash, Hasher},
-    path::Path,
-};
-use translation::{
-    intermediate_types::IntermediateType,
-    table::{FunctionId, FunctionTable},
-    translate_function,
-};
-
-use walrus::{Module, RefType};
-use wasm_validation::validate_stylus_wasm;
-
 pub(crate) mod abi_types;
-mod compilation_context;
+pub mod compilation_context;
 mod constructor;
-mod data;
+pub mod data;
+pub mod error;
 mod generics;
+mod hasher;
 mod hostio;
 mod memory;
 mod native_functions;
 mod runtime;
-mod runtime_error_codes;
 mod storage;
 mod translation;
 mod utils;
 mod vm_handled_types;
 mod wasm_builder_extensions;
-mod wasm_helpers;
 mod wasm_validation;
 
-#[cfg(feature = "inject-host-debug-fns")]
-use walrus::ValType;
-
-#[cfg(test)]
+#[cfg(any(test, feature = "inject-host-debug-fns"))]
 mod test_tools;
+
+use abi_types::public_function::PublicFunction;
+pub(crate) use compilation_context::{CompilationContext, UserDefinedType};
+use compilation_context::{ModuleData, ModuleId};
+use constructor::inject_constructor;
+use error::{
+    CodeError, CompilationError, DependencyError, DependencyProcessingError, ICEError, ICEErrorKind,
+};
+use move_binary_format::file_format::FunctionDefinition;
+use move_package::{
+    compilation::compiled_package::{CompiledPackage, CompiledUnitWithSource},
+    source_package::parsed_manifest::PackageName,
+};
+use move_parse_special_attributes::process_special_attributes;
+use std::{collections::HashMap, path::PathBuf};
+use translation::{
+    TranslationError,
+    intermediate_types::IntermediateType,
+    table::{FunctionId, FunctionTable},
+    translate_and_link_functions,
+};
+
+use walrus::{GlobalId, Module, RefType};
+use wasm_validation::validate_stylus_wasm;
+
+pub use translation::functions::MappedFunction;
 
 pub type GlobalFunctionTable<'move_package> =
     HashMap<FunctionId, &'move_package FunctionDefinition>;
 
-pub fn translate_single_module(package: CompiledPackage, module_name: &str) -> Module {
-    let mut modules = translate_package(package, Some(module_name.to_string()));
+pub fn translate_single_module(
+    package: CompiledPackage,
+    module_name: &str,
+) -> Result<Module, CompilationError> {
+    let mut modules = translate_package(package, Some(module_name.to_string()), false)?;
 
-    modules.remove(module_name).expect("Module not compiled")
+    Ok(modules
+        .remove(module_name)
+        .ok_or_else(|| ICEError::new(ICEErrorKind::ModuleNotCompiled(module_name.to_string())))?)
 }
 
 pub fn translate_package(
     package: CompiledPackage,
     module_name: Option<String>,
-) -> HashMap<String, Module> {
-    let root_compiled_units: Vec<CompiledUnitWithSource> = if let Some(module_name) = module_name {
+    verbose: bool,
+) -> Result<HashMap<String, Module>, CompilationError> {
+    // HashMap of package name to address
+    // This includes all the dependencies of the root package
+    let address_alias_instantiation: HashMap<String, [u8; 32]> = package
+        .compiled_package_info
+        .address_alias_instantiation
+        .iter()
+        .map(|(key, value)| (key.as_str().to_string(), value.into_bytes()))
+        .collect();
+
+    let root_compiled_units: Vec<&CompiledUnitWithSource> = if let Some(module_name) = module_name {
         package
             .root_compiled_units
-            .into_iter()
+            .iter()
             .filter(move |unit| unit.unit.name.to_string() == module_name)
             .collect()
     } else {
-        package.root_compiled_units.into_iter().collect()
+        package.root_compiled_units.iter().collect()
     };
 
-    assert!(
-        !root_compiled_units.is_empty(),
-        "Module not found in package"
-    );
+    if root_compiled_units.is_empty() {
+        return Err(CompilationError::NoFilesFound);
+    }
 
     let mut modules = HashMap::new();
 
@@ -82,34 +96,77 @@ pub fn translate_package(
     // statically link them
     let mut function_definitions: GlobalFunctionTable = HashMap::new();
 
+    let mut errors = Vec::new();
+
     // TODO: a lot of clones, we must create a symbol pool
     for root_compiled_module in &root_compiled_units {
+        // This is used to keep track of dynamic fields were retrieved from storage as mutable.
+        // This vector is used at the end of the entrypoint function to commit the possible changes
+        // made to those variables. The variables will be declared in the source code even if the
+        // code does not follow a path that executes a borrow_mut function for dynamic fields. The
+        // value of those variables will be:
+        // - a pointer to the dynamic field
+        // - -1 if the code never executed borrow_mut for that variable
+        let mut dynamic_fields_global_variables: Vec<(GlobalId, IntermediateType)> = Vec::new();
+
         let module_name = root_compiled_module.unit.name.to_string();
-        println!("compiling module {module_name}...");
-        let root_compiled_module = &root_compiled_module.unit.module;
+        println!("\x1B[1m\x1B[32mCOMPILING\x1B[0m {module_name}");
+        let root_compiled_module_unit = &root_compiled_module.unit.module;
+
+        // Extract package address from CompiledPackage
+        let package_address = root_compiled_module_unit.address().into_bytes();
 
         let root_module_id = ModuleId {
-            address: root_compiled_module.address().into_bytes().into(),
+            address: package_address.into(),
             module_name: module_name.clone(),
         };
 
         let (mut module, allocator_func, memory_id) = hostio::new_module_with_host();
 
         #[cfg(feature = "inject-host-debug-fns")]
-        inject_debug_fns(&mut module);
+        crate::test_tools::inject_debug_fns(&mut module);
 
         // Function table
         let function_table_id = module.tables.add_local(false, 0, None, RefType::Funcref);
         let mut function_table = FunctionTable::new(function_table_id);
 
         // Process the dependency tree
-        process_dependency_tree(
+        if let Err(dependencies_errors) = process_dependency_tree(
             &mut modules_data,
             &package.deps_compiled_units,
             &root_compiled_units,
-            &root_compiled_module.immediate_dependencies(),
+            &root_compiled_module_unit.immediate_dependencies(),
             &mut function_definitions,
-        );
+            &address_alias_instantiation,
+            verbose,
+        ) {
+            match dependencies_errors {
+                DependencyProcessingError::ICE(ice_error) => {
+                    return Err(CompilationError::ICE(ice_error));
+                }
+                DependencyProcessingError::CodeError(code_errors) => {
+                    errors.extend(code_errors);
+                    continue;
+                }
+            }
+        }
+
+        // Build a HashMap of structs by module id from all dependencies.
+        // This allows proper validation of entry function return values, ensuring they do not return imported structs with the key ability.
+        let deps_structs = build_dependency_structs_map(&modules_data);
+
+        let special_attributes = match process_special_attributes(
+            &root_compiled_module.source_path,
+            package_address,
+            &deps_structs,
+            &address_alias_instantiation,
+        ) {
+            Ok(sa) => sa,
+            Err((_mf, e)) => {
+                errors.extend(e.into_iter().map(CodeError::SpecialAttributesError));
+                continue;
+            }
+        };
 
         let root_module_data = ModuleData::build_module_data(
             root_module_id.clone(),
@@ -117,39 +174,38 @@ pub fn translate_package(
             &package.deps_compiled_units,
             &root_compiled_units,
             &mut function_definitions,
-        );
+            special_attributes,
+        )?;
 
         let compilation_ctx =
             CompilationContext::new(&root_module_data, &modules_data, memory_id, allocator_func);
 
         let mut public_functions = Vec::new();
-        for function_information in root_module_data
-            .functions
-            .information
-            .iter()
-            .filter(|fi| fi.function_id.module_id == root_module_id && !fi.is_generic)
-        {
+        for function_information in root_module_data.functions.information.iter().filter(|fi| {
+            fi.function_id.module_id == root_module_id && !fi.is_generic && !fi.is_native
+        }) {
             translate_and_link_functions(
                 &function_information.function_id,
                 &mut function_table,
                 &function_definitions,
                 &mut module,
                 &compilation_ctx,
-            );
-
-            let wasm_function_id = function_table
-                .get_by_function_id(&function_information.function_id)
-                .unwrap()
-                .wasm_function_id
-                .unwrap();
+                &mut dynamic_fields_global_variables,
+            )?;
 
             if function_information.is_entry {
+                let wasm_function_id = function_table
+                    .get_by_function_id(&function_information.function_id)
+                    .ok_or(TranslationError::EntryFunctionNotFound)?
+                    .wasm_function_id
+                    .ok_or(TranslationError::EntryFunctionWasmIdNotFound)?;
+
                 public_functions.push(PublicFunction::new(
                     wasm_function_id,
                     &function_information.function_id.identifier,
                     &function_information.signature,
                     &compilation_ctx,
-                ));
+                )?);
             }
         }
 
@@ -159,38 +215,139 @@ pub fn translate_package(
             &mut module,
             &compilation_ctx,
             &mut public_functions,
-        );
+        )?;
 
-        hostio::build_entrypoint_router(&mut module, &public_functions, &compilation_ctx);
+        hostio::build_entrypoint_router(
+            &mut module,
+            &public_functions,
+            &compilation_ctx,
+            &dynamic_fields_global_variables,
+        )?;
 
-        function_table.ensure_all_functions_added().unwrap();
-        validate_stylus_wasm(&mut module).unwrap();
+        function_table.ensure_all_functions_added()?;
+        validate_stylus_wasm(&mut module)?;
 
         modules.insert(module_name, module);
         modules_data.insert(root_module_id.clone(), root_module_data);
     }
 
-    modules
+    if errors.is_empty() {
+        Ok(modules)
+    } else {
+        Err(CompilationError::CodeError {
+            mapped_files: package.file_map,
+            errors,
+        })
+    }
 }
 
-pub fn translate_package_cli(package: CompiledPackage, rerooted_path: &Path) {
-    let build_directory = rerooted_path.join("build/wasm");
-    // Create the build directory if it doesn't exist
-    std::fs::create_dir_all(&build_directory).unwrap();
+#[derive(Debug)]
+pub struct PackageModuleData {
+    pub modules_paths: HashMap<PathBuf, ModuleId>,
+    pub modules_data: HashMap<ModuleId, ModuleData>,
+}
 
-    let mut modules = translate_package(package, None);
-    for (module_name, module) in modules.iter_mut() {
-        module
-            .emit_wasm_file(build_directory.join(format!("{}.wasm", module_name)))
-            .unwrap();
+pub fn package_module_data(
+    package: &CompiledPackage,
+    module_name: Option<String>,
+    verbose: bool,
+) -> Result<PackageModuleData, CompilationError> {
+    // HashMap of package name to address
+    let address_alias_instantiation: HashMap<String, [u8; 32]> = package
+        .compiled_package_info
+        .address_alias_instantiation
+        .iter()
+        .map(|(key, value)| (key.as_str().to_string(), value.into_bytes()))
+        .collect();
 
-        // Convert to WAT format
-        let wat = wasmprinter::print_bytes(module.emit_wasm()).expect("Failed to generate WAT");
-        std::fs::write(
-            build_directory.join(format!("{}.wat", module_name)),
-            wat.as_bytes(),
-        )
-        .expect("Failed to write WAT file");
+    let mut modules_data = HashMap::new();
+    let mut modules_paths = HashMap::new();
+    let mut errors = Vec::new();
+
+    // This is not used in this function but is used in the others
+    let mut function_definitions: GlobalFunctionTable = HashMap::new();
+
+    let root_compiled_units: Vec<&CompiledUnitWithSource> = if let Some(module_name) = module_name {
+        package
+            .root_compiled_units
+            .iter()
+            .filter(move |unit| unit.unit.name.to_string() == module_name)
+            .collect()
+    } else {
+        package.root_compiled_units.iter().collect()
+    };
+
+    for root_compiled_module in &root_compiled_units {
+        let module_name = root_compiled_module.unit.name.to_string();
+        let root_compiled_module_unit = &root_compiled_module.unit.module;
+
+        let package_address = root_compiled_module_unit.address().into_bytes();
+        let root_module_id = ModuleId {
+            address: package_address.into(),
+            module_name: module_name.clone(),
+        };
+
+        // Process the dependency tree
+        if let Err(dependencies_errors) = process_dependency_tree(
+            &mut modules_data,
+            &package.deps_compiled_units,
+            &root_compiled_units,
+            &root_compiled_module_unit.immediate_dependencies(),
+            &mut function_definitions,
+            &address_alias_instantiation,
+            verbose,
+        ) {
+            match dependencies_errors {
+                DependencyProcessingError::ICE(ice_error) => {
+                    return Err(CompilationError::ICE(ice_error));
+                }
+                DependencyProcessingError::CodeError(code_errors) => {
+                    errors.extend(code_errors);
+                    continue;
+                }
+            }
+        }
+
+        // Create a mapping from each dependency's module id to the list of structs obtained via the special attributes crate.
+        // This allows proper validation of entry function return values, ensuring they do not return imported structs with the key ability.
+        let deps_structs = build_dependency_structs_map(&modules_data);
+
+        let special_attributes = match process_special_attributes(
+            &root_compiled_module.source_path,
+            package_address,
+            &deps_structs,
+            &address_alias_instantiation,
+        ) {
+            Ok(sa) => sa,
+            Err((_mf, e)) => {
+                errors.extend(e.into_iter().map(CodeError::SpecialAttributesError));
+                continue;
+            }
+        };
+
+        let root_module_data = ModuleData::build_module_data(
+            root_module_id.clone(),
+            root_compiled_module,
+            &package.deps_compiled_units,
+            &root_compiled_units,
+            &mut function_definitions,
+            special_attributes,
+        )?;
+
+        modules_data.insert(root_module_id.clone(), root_module_data);
+        modules_paths.insert(root_compiled_module.source_path.clone(), root_module_id);
+    }
+
+    if errors.is_empty() {
+        Ok(PackageModuleData {
+            modules_data,
+            modules_paths,
+        })
+    } else {
+        Err(CompilationError::CodeError {
+            mapped_files: package.file_map.clone(),
+            errors,
+        })
     }
 }
 
@@ -200,22 +357,30 @@ pub fn translate_package_cli(package: CompiledPackage, rerooted_path: &Path) {
 pub fn process_dependency_tree<'move_package>(
     dependencies_data: &mut HashMap<ModuleId, ModuleData>,
     deps_compiled_units: &'move_package [(PackageName, CompiledUnitWithSource)],
-    root_compiled_units: &'move_package [CompiledUnitWithSource],
+    root_compiled_units: &'move_package [&CompiledUnitWithSource],
     dependencies: &[move_core_types::language_storage::ModuleId],
     function_definitions: &mut GlobalFunctionTable<'move_package>,
-) {
+    address_alias_instantiation: &HashMap<String, [u8; 32]>,
+    verbose: bool,
+) -> Result<(), DependencyProcessingError> {
+    let mut errors = Vec::new();
     for dependency in dependencies {
+        let dependency_address = dependency.address().into_bytes();
         let module_id = ModuleId {
             module_name: dependency.name().to_string(),
-            address: dependency.address().into_bytes().into(),
+            address: dependency_address.into(),
         };
-        print!("\tprocessing dependency {module_id}...",);
+
         // If the HashMap contains the key, we already processed that dependency
-        if dependencies_data.contains_key(&module_id) {
-            println!(" [cached]");
-            continue;
+        if !dependencies_data.contains_key(&module_id) {
+            if verbose {
+                println!("  \x1B[1m\x1B[34mPROCESSING DEPENDENCY\x1B[0m {module_id}");
+            }
         } else {
-            println!();
+            if verbose {
+                println!("  \x1B[1m\x1B[34mPROCESSING DEPENDENCY\x1B[0m {module_id} [cached]");
+            }
+            continue;
         }
 
         // Find the dependency inside Move's compiled package
@@ -226,21 +391,52 @@ pub fn process_dependency_tree<'move_package>(
                     && module.unit.address.into_bytes() == **dependency.address()
             })
             .map(|(_, module)| module)
-            .unwrap_or_else(|| panic!("could not find dependency {}", dependency.name()));
+            .ok_or_else(|| DependencyError::DependencyNotFound(dependency.name().to_string()))?;
 
-        let dependency_module = &dependency_module.unit.module;
-
-        let immediate_dependencies = &dependency_module.immediate_dependencies();
+        let immediate_dependencies = &dependency_module.unit.module.immediate_dependencies();
         // If the the dependency has dependency, we process them first
-        if !immediate_dependencies.is_empty() {
+        let dependencies_process_result = if !immediate_dependencies.is_empty() {
             process_dependency_tree(
                 dependencies_data,
                 deps_compiled_units,
                 root_compiled_units,
                 immediate_dependencies,
                 function_definitions,
-            );
+                address_alias_instantiation,
+                verbose,
+            )
+        } else {
+            Ok(())
+        };
+
+        if let Err(dependencies_errors) = dependencies_process_result {
+            match dependencies_errors {
+                DependencyProcessingError::ICE(ice_error) => {
+                    return Err(DependencyProcessingError::ICE(ice_error));
+                }
+                DependencyProcessingError::CodeError(code_errors) => {
+                    errors.extend(code_errors);
+                    continue;
+                }
+            }
         }
+
+        // Create a mapping from each dependency's module id to the list of structs obtained via the special attributes crate.
+        // This allows proper validation of entry function return values, ensuring they do not return imported structs with the key ability.
+        let deps_structs = build_dependency_structs_map(dependencies_data);
+
+        let special_attributes = match process_special_attributes(
+            &dependency_module.source_path,
+            dependency_address,
+            &deps_structs,
+            address_alias_instantiation,
+        ) {
+            Ok(sa) => sa,
+            Err((_mf, e)) => {
+                errors.extend(e.into_iter().map(CodeError::SpecialAttributesError));
+                continue;
+            }
+        };
 
         let dependency_module_data = ModuleData::build_module_data(
             module_id.clone(),
@@ -248,157 +444,45 @@ pub fn process_dependency_tree<'move_package>(
             deps_compiled_units,
             root_compiled_units,
             function_definitions,
-        );
+            special_attributes,
+        )
+        .map_err(|e| {
+            DependencyProcessingError::ICE(ICEError::new(ICEErrorKind::CompilationContext(e)))
+        })?;
 
-        let processed_dependency = dependencies_data.insert(module_id, dependency_module_data);
+        let processed_dependency =
+            dependencies_data.insert(module_id.clone(), dependency_module_data);
 
-        assert!(
-            processed_dependency.is_none(),
-            "processed the same dep twice in different contexts"
-        );
-    }
-}
-
-/// Trnaslates a function to WASM and links it to the WASM module
-///
-/// It also recursively translates and links all the functions called by this function
-fn translate_and_link_functions(
-    function_id: &FunctionId,
-    function_table: &mut FunctionTable,
-    function_definitions: &GlobalFunctionTable,
-    module: &mut walrus::Module,
-    compilation_ctx: &CompilationContext,
-) {
-    // Obtain the function information and module's data
-    let (function_information, module_data) = if let Some(fi) = compilation_ctx
-        .root_module_data
-        .functions
-        .information
-        .iter()
-        .find(|f| {
-            f.function_id.module_id == function_id.module_id
-                && f.function_id.identifier == function_id.identifier
-        }) {
-        (fi, compilation_ctx.root_module_data)
-    } else {
-        let module_data = compilation_ctx
-            .deps_data
-            .get(&function_id.module_id)
-            .unwrap();
-
-        let fi = module_data
-            .functions
-            .information
-            .iter()
-            .find(|f| f.function_id.identifier == function_id.identifier)
-            .unwrap();
-
-        (fi, module_data)
-    };
-
-    // If the function is generic, we instantiate the concrete types so we can translate it
-    let function_information = if function_information.is_generic {
-        &function_information.instantiate(function_id.type_instantiations.as_ref().unwrap())
-    } else {
-        function_information
-    };
-
-    // Process function defined in this module
-    // First we check if there is already an entry for this function
-    if let Some(table_entry) = function_table.get_by_function_id(&function_information.function_id)
-    {
-        // If it has asigned a wasm function id means that we already translated it, so we skip
-        // it
-        if table_entry.wasm_function_id.is_some() {
-            return;
+        if processed_dependency.is_some() {
+            Err(DependencyError::DependencyProcessedMoreThanOnce(module_id))?;
         }
     }
-    // If it is not present, we add an entry for it
-    else {
-        function_table.add(module, function_id.clone(), function_information);
-    }
 
-    let function_definition = function_definitions
-        // TODO do this in nother way
-        .get(&function_id.get_generic_fn_id())
-        .unwrap_or_else(|| panic!("could not find function definition for {}", function_id));
-
-    // If the function contains code we translate it
-    // If it does not it means is a native function, we do nothing, it is linked and called
-    // directly in the translation function
-    if let Some(move_bytecode) = function_definition.code.as_ref() {
-        let (wasm_function_id, functions_to_link) = translate_function(
-            module,
-            compilation_ctx,
-            module_data,
-            function_table,
-            function_information,
-            move_bytecode,
-        )
-        .unwrap_or_else(|_| panic!("there was an error translating {}", function_id));
-
-        function_table
-            .add_to_wasm_table(module, function_id, wasm_function_id)
-            .expect("there was an error adding the module's functions to the function table");
-
-        // Recursively translate and link functions called by this function
-        functions_to_link.iter().for_each(|function_id| {
-            translate_and_link_functions(
-                function_id,
-                function_table,
-                function_definitions,
-                module,
-                compilation_ctx,
-            )
-        });
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(DependencyProcessingError::CodeError(errors))
     }
 }
 
-// TODO: Move somewhere else
-pub fn get_generic_function_name(base_name: &str, generics: &[&IntermediateType]) -> String {
-    if generics.is_empty() {
-        panic!("generic_function_name called with no generics");
+/// Builds a HashMap mapping module IDs to their structs from all dependencies.
+///
+/// This function extracts struct information from `ModuleData` and converts it into
+/// a format compatible with `move_parse_special_attributes::ModuleId`. This mapping
+/// is essential for validating entry function return values, ensuring they do not
+/// return imported structs with the `key` ability.
+fn build_dependency_structs_map(
+    modules_data: &HashMap<ModuleId, ModuleData>,
+) -> HashMap<move_parse_special_attributes::ModuleId, Vec<move_parse_special_attributes::Struct_>> {
+    let mut deps_structs = HashMap::new();
+    for md in modules_data.values() {
+        deps_structs.insert(
+            move_parse_special_attributes::ModuleId {
+                address: <[u8; 32]>::try_from(md.id.address.as_slice()).unwrap(),
+                module_name: md.id.module_name.clone(),
+            },
+            md.special_attributes.structs.clone(),
+        );
     }
-
-    let mut hasher = DefaultHasher::new();
-    generics.iter().for_each(|t| t.hash(&mut hasher));
-    let hash = format!("{:x}", hasher.finish());
-    format!("{base_name}_{hash}")
-}
-
-#[cfg(feature = "inject-host-debug-fns")]
-fn inject_debug_fns(module: &mut walrus::Module) {
-    if cfg!(feature = "inject-host-debug-fns") {
-        let func_ty = module.types.add(&[ValType::I32], &[]);
-        module.add_import_func("", "print_i32", func_ty);
-
-        let func_ty = module.types.add(&[ValType::I32], &[]);
-        module.add_import_func("", "print_memory_from", func_ty);
-
-        let func_ty = module.types.add(&[ValType::I64], &[]);
-        module.add_import_func("", "print_i64", func_ty);
-
-        let func_ty = module.types.add(&[ValType::I32], &[]);
-        module.add_import_func("", "print_u128", func_ty);
-
-        let func_ty = module.types.add(&[], &[]);
-        module.add_import_func("", "print_separator", func_ty);
-
-        let func_ty = module.types.add(&[ValType::I32], &[]);
-        module.add_import_func("", "print_address", func_ty);
-    }
-}
-
-#[cfg(feature = "inject-host-debug-fns")]
-#[macro_export]
-macro_rules! declare_host_debug_functions {
-    ($module: ident) => {
-        (
-            $module.imports.get_func("", "print_i32").unwrap(),
-            $module.imports.get_func("", "print_i64").unwrap(),
-            $module.imports.get_func("", "print_memory_from").unwrap(),
-            $module.imports.get_func("", "print_separator").unwrap(),
-            $module.imports.get_func("", "print_u128").unwrap(),
-        )
-    };
+    deps_structs
 }

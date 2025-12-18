@@ -1,4 +1,5 @@
 use alloy_sol_types::{SolType, sol_data};
+use error::AbiPackError;
 use pack_native_int::{pack_i32_type_instructions, pack_i64_type_instructions};
 use walrus::{
     InstrSeqBuilder, LocalId, Module, ValType,
@@ -10,17 +11,21 @@ use crate::{
     translation::intermediate_types::{
         IntermediateType,
         address::IAddress,
-        enums::IEnum,
         heap_integers::{IU128, IU256},
         reference::{IMutRef, IRef},
         vector::IVector,
     },
+    vm_handled_types::{VmHandledType, string::String_},
 };
 
+use super::error::{AbiEncodingError, AbiError};
+
+pub mod error;
 mod pack_enum;
 mod pack_heap_int;
 mod pack_native_int;
 mod pack_reference;
+mod pack_string;
 mod pack_struct;
 mod pack_vector;
 
@@ -41,7 +46,7 @@ pub trait Packable {
         writer_pointer: LocalId,
         calldata_reference_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    );
+    ) -> Result<(), AbiError>;
 
     /// Adds the instructions to pack the value into memory according to Solidity's ABI encoding.
     ///
@@ -69,7 +74,7 @@ pub trait Packable {
         writer_pointer: LocalId,
         calldata_reference_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    );
+    ) -> Result<(), AbiError>;
 
     /// Adds the instructions to load the value into a local variable.
     /// This is used to reverse the order of the stack before packing
@@ -80,10 +85,10 @@ pub trait Packable {
         &self,
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
-    ) -> LocalId;
+    ) -> Result<LocalId, AbiError>;
 
     /// Returns the ABI encoded size of the type
-    fn encoded_size(&self, compilation_ctx: &CompilationContext) -> usize;
+    fn encoded_size(&self, compilation_ctx: &CompilationContext) -> Result<usize, AbiError>;
 
     /// Returns true if the type to be encoded is dynamic
     ///
@@ -96,7 +101,7 @@ pub trait Packable {
     ///
     /// For more information:
     /// https://docs.soliditylang.org/en/develop/abi-spec.html#formal-specification-of-the-encoding
-    fn is_dynamic(&self, compilation_ctx: &CompilationContext) -> bool;
+    fn is_dynamic(&self, compilation_ctx: &CompilationContext) -> Result<bool, AbiError>;
 }
 
 /// Builds the instructions to pack WASM return values into memory according to Solidity's ABI encoding.
@@ -112,29 +117,29 @@ pub fn build_pack_instructions<T: Packable>(
     function_return_signature: &[T],
     module: &mut Module,
     compilation_ctx: &CompilationContext,
-) -> (LocalId, LocalId) {
+) -> Result<(LocalId, LocalId), AbiError> {
     // We need to load all return types into locals in order to reverse the read order
     // Otherwise they would be popped in reverse order
     let mut locals = Vec::new();
     let mut args_size = 0;
     for signature_token in function_return_signature.iter().rev() {
-        let local = signature_token.add_load_local_instructions(builder, module);
+        let local = signature_token.add_load_local_instructions(builder, module)?;
         locals.push(local);
 
         // If the function returns multiple values, those values will be encoded as a tuple. By
         // definition, a tuple T is dynamic (T1,...,Tk) if Ti is dynamic for some 1 <= i <= k.
         // The encode size for a dynamically encoded field inside a dynamically encoded tuple is
         // just 32 bytes (the value is the offset to where the values are packed)
-        args_size += if signature_token.is_dynamic(compilation_ctx) {
+        args_size += if signature_token.is_dynamic(compilation_ctx)? {
             32
         } else {
-            signature_token.encoded_size(compilation_ctx)
+            signature_token.encoded_size(compilation_ctx)?
         };
     }
     locals.reverse();
 
     let pointer = module.locals.add(ValType::I32);
-    let pointer_end = module.locals.add(ValType::I32);
+    let len = module.locals.add(ValType::I32);
     let writer_pointer = module.locals.add(ValType::I32);
     let calldata_reference_pointer = module.locals.add(ValType::I32);
 
@@ -157,7 +162,7 @@ pub fn build_pack_instructions<T: Packable>(
         // definition, a tuple T is dynamic (T1,...,Tk) if Ti is dynamic for some 1 <= i <= k.
         // Given that the return tuple is encoded dynamically, for the values that are dynamic
         // inside the tuple, we must force a dynamic encoding.
-        if signature_token.is_dynamic(compilation_ctx) {
+        if signature_token.is_dynamic(compilation_ctx)? {
             signature_token.add_pack_instructions_dynamic(
                 builder,
                 module,
@@ -165,7 +170,7 @@ pub fn build_pack_instructions<T: Packable>(
                 writer_pointer,
                 calldata_reference_pointer,
                 compilation_ctx,
-            );
+            )?;
 
             // A dynamic value will only save the offset to where the values are located, so, we
             // just use 32 bytes
@@ -182,11 +187,11 @@ pub fn build_pack_instructions<T: Packable>(
                 writer_pointer,
                 calldata_reference_pointer,
                 compilation_ctx,
-            );
+            )?;
 
             builder
                 .local_get(writer_pointer)
-                .i32_const(signature_token.encoded_size(compilation_ctx) as i32)
+                .i32_const(signature_token.encoded_size(compilation_ctx)? as i32)
                 .binop(BinaryOp::I32Add)
                 .local_set(writer_pointer);
         }
@@ -198,11 +203,9 @@ pub fn build_pack_instructions<T: Packable>(
         .call(compilation_ctx.allocator)
         .local_get(pointer)
         .binop(BinaryOp::I32Sub)
-        .local_set(pointer_end);
+        .local_set(len);
 
-    (pointer, pointer_end)
-
-    // The pointer_end remaining in the stack is the length of the encoded data
+    Ok((pointer, len))
 }
 
 impl Packable for IntermediateType {
@@ -210,7 +213,7 @@ impl Packable for IntermediateType {
         &self,
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
-    ) -> LocalId {
+    ) -> Result<LocalId, AbiError> {
         match self {
             IntermediateType::IBool
             | IntermediateType::IU8
@@ -225,19 +228,18 @@ impl Packable for IntermediateType {
             | IntermediateType::IMutRef(_)
             | IntermediateType::IStruct { .. }
             | IntermediateType::IGenericStructInstance { .. }
-            | IntermediateType::IEnum(_) => {
+            | IntermediateType::IEnum { .. }
+            | IntermediateType::IGenericEnumInstance { .. } => {
                 let local = module.locals.add(ValType::I32);
                 builder.local_set(local);
-                local
+                Ok(local)
             }
             IntermediateType::IU64 => {
                 let local = module.locals.add(ValType::I64);
                 builder.local_set(local);
-                local
+                Ok(local)
             }
-            IntermediateType::ITypeParameter(_) => {
-                panic!("cannot pack generic type parameter");
-            }
+            IntermediateType::ITypeParameter(_) => Err(AbiPackError::PackingGenericTypeParameter)?,
         }
     }
 
@@ -249,7 +251,7 @@ impl Packable for IntermediateType {
         writer_pointer: LocalId,
         calldata_reference_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         match self {
             IntermediateType::IBool
             | IntermediateType::IU8
@@ -261,7 +263,7 @@ impl Packable for IntermediateType {
                     compilation_ctx.memory_id,
                     local,
                     writer_pointer,
-                );
+                )?;
             }
             IntermediateType::IU64 => {
                 pack_i64_type_instructions(
@@ -270,7 +272,7 @@ impl Packable for IntermediateType {
                     compilation_ctx.memory_id,
                     local,
                     writer_pointer,
-                );
+                )?;
             }
             IntermediateType::IU128 => IU128::add_pack_instructions(
                 builder,
@@ -278,17 +280,15 @@ impl Packable for IntermediateType {
                 local,
                 writer_pointer,
                 compilation_ctx.memory_id,
-            ),
+            )?,
             IntermediateType::IU256 => IU256::add_pack_instructions(
                 builder,
                 module,
                 local,
                 writer_pointer,
                 compilation_ctx.memory_id,
-            ),
-            IntermediateType::ISigner => {
-                panic!("signer type cannot be packed as it has no ABI representation")
-            }
+            )?,
+            IntermediateType::ISigner => return Err(AbiPackError::FoundSignerType)?,
             IntermediateType::IAddress => IAddress::add_pack_instructions(
                 builder,
                 module,
@@ -304,7 +304,7 @@ impl Packable for IntermediateType {
                 writer_pointer,
                 calldata_reference_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IRef(inner) => IRef::add_pack_instructions(
                 inner,
                 builder,
@@ -313,7 +313,7 @@ impl Packable for IntermediateType {
                 writer_pointer,
                 calldata_reference_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IMutRef(inner) => IMutRef::add_pack_instructions(
                 inner,
                 builder,
@@ -322,11 +322,10 @@ impl Packable for IntermediateType {
                 writer_pointer,
                 calldata_reference_pointer,
                 compilation_ctx,
-            ),
-            IntermediateType::IStruct { module_id, index } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
+            )?,
+
+            IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
+                let struct_ = compilation_ctx.get_struct_by_intermediate_type(self)?;
 
                 struct_.add_pack_instructions(
                     builder,
@@ -336,50 +335,27 @@ impl Packable for IntermediateType {
                     calldata_reference_pointer,
                     compilation_ctx,
                     None,
-                )
+                )?
             }
-            IntermediateType::IGenericStructInstance {
-                module_id,
-                index,
-                types,
-            } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-                let struct_instance = struct_.instantiate(types);
-                struct_instance.add_pack_instructions(
-                    builder,
-                    module,
-                    local,
-                    writer_pointer,
-                    calldata_reference_pointer,
-                    compilation_ctx,
-                    None,
-                )
-            }
-            IntermediateType::IEnum(enum_index) => {
-                let enum_ = compilation_ctx
-                    .root_module_data
-                    .enums
-                    .get_enum_by_index(*enum_index)
-                    .unwrap();
+            IntermediateType::IEnum { .. } | IntermediateType::IGenericEnumInstance { .. } => {
+                let enum_ = compilation_ctx.get_enum_by_intermediate_type(self)?;
                 if !enum_.is_simple {
-                    panic!(
-                        "cannot abi pack enum with index {enum_index}, it contains at least one variant with fields"
-                    );
+                    return Err(AbiPackError::EnumIsNotSimple(enum_.identifier.clone()))?;
                 }
-                IEnum::add_pack_instructions(
+                enum_.add_pack_instructions(
                     builder,
                     module,
                     local,
                     writer_pointer,
                     compilation_ctx,
-                )
+                )?
             }
             IntermediateType::ITypeParameter(_) => {
-                panic!("cannot pack generic type parameter");
+                return Err(AbiPackError::PackingGenericTypeParameter)?;
             }
         }
+
+        Ok(())
     }
 
     fn add_pack_instructions_dynamic(
@@ -390,7 +366,7 @@ impl Packable for IntermediateType {
         writer_pointer: LocalId,
         calldata_reference_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         match self {
             IntermediateType::IRef(inner) | IntermediateType::IMutRef(inner) => {
                 // Load the intermediate pointer
@@ -414,12 +390,22 @@ impl Packable for IntermediateType {
                     writer_pointer,
                     calldata_reference_pointer,
                     compilation_ctx,
-                );
+                )?;
             }
-            IntermediateType::IStruct { module_id, index } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
+            IntermediateType::IStruct {
+                module_id, index, ..
+            } if String_::is_vm_type(module_id, *index, compilation_ctx)? => {
+                String_::add_pack_instructions(
+                    builder,
+                    module,
+                    local,
+                    writer_pointer,
+                    calldata_reference_pointer,
+                    compilation_ctx,
+                )?;
+            }
+            IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
+                let struct_ = compilation_ctx.get_struct_by_intermediate_type(self)?;
 
                 struct_.add_pack_instructions(
                     builder,
@@ -429,28 +415,8 @@ impl Packable for IntermediateType {
                     calldata_reference_pointer,
                     compilation_ctx,
                     Some(calldata_reference_pointer),
-                );
+                )?;
             }
-            IntermediateType::IGenericStructInstance {
-                module_id,
-                index,
-                types,
-            } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-                let struct_instance = struct_.instantiate(types);
-                struct_instance.add_pack_instructions(
-                    builder,
-                    module,
-                    local,
-                    writer_pointer,
-                    calldata_reference_pointer,
-                    compilation_ctx,
-                    Some(calldata_reference_pointer),
-                );
-            }
-
             _ => self.add_pack_instructions(
                 builder,
                 module,
@@ -458,53 +424,61 @@ impl Packable for IntermediateType {
                 writer_pointer,
                 calldata_reference_pointer,
                 compilation_ctx,
-            ),
+            )?,
         }
+        Ok(())
     }
 
-    fn encoded_size(&self, compilation_ctx: &CompilationContext) -> usize {
-        match self {
-            IntermediateType::IBool => sol_data::Bool::ENCODED_SIZE.unwrap(),
+    fn encoded_size(&self, compilation_ctx: &CompilationContext) -> Result<usize, AbiError> {
+        let size = match self {
+            IntermediateType::IBool => {
+                sol_data::Bool::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
             // According to the official documentation, enum types are encoded as uint8
-            IntermediateType::IU8 | IntermediateType::IEnum(_) => {
-                sol_data::Uint::<8>::ENCODED_SIZE.unwrap()
+            IntermediateType::IU8
+            | IntermediateType::IEnum { .. }
+            | IntermediateType::IGenericEnumInstance { .. } => {
+                sol_data::Uint::<8>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
             }
-            IntermediateType::IU16 => sol_data::Uint::<16>::ENCODED_SIZE.unwrap(),
-            IntermediateType::IU32 => sol_data::Uint::<32>::ENCODED_SIZE.unwrap(),
-            IntermediateType::IU64 => sol_data::Uint::<64>::ENCODED_SIZE.unwrap(),
-            IntermediateType::IU128 => sol_data::Uint::<128>::ENCODED_SIZE.unwrap(),
-            IntermediateType::IU256 => sol_data::Uint::<256>::ENCODED_SIZE.unwrap(),
-            IntermediateType::IAddress => sol_data::Address::ENCODED_SIZE.unwrap(),
-            IntermediateType::ISigner => sol_data::Address::ENCODED_SIZE.unwrap(),
+            IntermediateType::IU16 => {
+                sol_data::Uint::<16>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
+            IntermediateType::IU32 => {
+                sol_data::Uint::<32>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
+            IntermediateType::IU64 => {
+                sol_data::Uint::<64>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
+            IntermediateType::IU128 => {
+                sol_data::Uint::<128>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
+            IntermediateType::IU256 => {
+                sol_data::Uint::<256>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
+            IntermediateType::IAddress => {
+                sol_data::Address::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
+            IntermediateType::ISigner => {
+                sol_data::Address::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?
+            }
             IntermediateType::IVector(_) => 32,
-            IntermediateType::IRef(inner) => inner.encoded_size(compilation_ctx),
-            IntermediateType::IMutRef(inner) => inner.encoded_size(compilation_ctx),
-            IntermediateType::IGenericStructInstance {
-                module_id,
-                index,
-                types,
-            } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-                let struct_instance = struct_.instantiate(types);
-                struct_instance.solidity_abi_encode_size(compilation_ctx)
-            }
-            IntermediateType::IStruct { module_id, index } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
+            IntermediateType::IRef(inner) => inner.encoded_size(compilation_ctx)?,
+            IntermediateType::IMutRef(inner) => inner.encoded_size(compilation_ctx)?,
+            IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
+                let struct_ = compilation_ctx.get_struct_by_intermediate_type(self)?;
 
-                struct_.solidity_abi_encode_size(compilation_ctx)
+                struct_.solidity_abi_encode_size(compilation_ctx)?
             }
             IntermediateType::ITypeParameter(_) => {
-                panic!("can't know the size of a generic type parameter at compile time");
+                return Err(AbiEncodingError::GenericTypeParameterSize)?;
             }
-        }
+        };
+
+        Ok(size)
     }
 
-    fn is_dynamic(&self, compilation_ctx: &CompilationContext) -> bool {
-        match self {
+    fn is_dynamic(&self, compilation_ctx: &CompilationContext) -> Result<bool, AbiError> {
+        let is_dyn = match self {
             IntermediateType::IBool
             | IntermediateType::IU8
             | IntermediateType::IU16
@@ -514,33 +488,23 @@ impl Packable for IntermediateType {
             | IntermediateType::IU256
             | IntermediateType::IAddress
             | IntermediateType::ISigner
-            | IntermediateType::IEnum(_) => false,
+            | IntermediateType::IEnum { .. }
+            | IntermediateType::IGenericEnumInstance { .. } => false,
             IntermediateType::IVector(_) => true,
-            IntermediateType::IStruct { module_id, index } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-                struct_.solidity_abi_encode_is_dynamic(compilation_ctx)
-            }
-            IntermediateType::IGenericStructInstance {
-                module_id,
-                index,
-                types,
-            } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-                let struct_instance = struct_.instantiate(types);
-                struct_instance.solidity_abi_encode_is_dynamic(compilation_ctx)
+            IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
+                let struct_ = compilation_ctx.get_struct_by_intermediate_type(self)?;
+                struct_.solidity_abi_encode_is_dynamic(compilation_ctx)?
             }
             IntermediateType::ITypeParameter(_) => {
-                panic!("cannot check if generic type parameter is dynamic at compile time");
+                return Err(AbiEncodingError::GenericTypeParameterIsDynamic)?;
             }
             // References are dynamic if the inner type is dynamic!
             IntermediateType::IRef(inner) | IntermediateType::IMutRef(inner) => {
-                inner.is_dynamic(compilation_ctx)
+                inner.is_dynamic(compilation_ctx)?
             }
-        }
+        };
+
+        Ok(is_dyn)
     }
 }
 
@@ -565,7 +529,7 @@ mod tests {
         data: Vec<u8>,
     ) -> impl Fn(Caller<()>, u32, u32) {
         move |mut caller: Caller<()>, pointer: u32, length: u32| {
-            println!("validator: {}, {}", pointer, length);
+            println!("validator: {pointer}, {length}");
 
             assert_eq!(pointer, pointer_addr);
             assert_eq!(length, data_len as u32);
@@ -614,7 +578,8 @@ mod tests {
             ],
             &mut raw_module,
             &compilation_ctx,
-        );
+        )
+        .unwrap();
 
         func_body.local_get(data_start).local_get(data_end);
 
@@ -627,7 +592,7 @@ mod tests {
         display_module(&mut raw_module);
 
         let data = <sol!((bool, uint16, uint64))>::abi_encode(&(true, 1234, 123456789012345));
-        println!("data: {:?}", data);
+        println!("data: {data:?}");
         let data_len = data.len() as i32;
 
         // Define validator function
@@ -677,7 +642,8 @@ mod tests {
             ],
             &mut raw_module,
             &compilation_ctx,
-        );
+        )
+        .unwrap();
 
         func_body.local_get(data_start).local_get(data_end);
 
@@ -690,7 +656,7 @@ mod tests {
         display_module(&mut raw_module);
 
         let data = <sol!((bool, uint16, uint64))>::abi_encode(&(true, 1234, 123456789012345));
-        println!("data: {:?}", data);
+        println!("data: {data:?}");
         let data_len = data.len() as i32;
 
         // Define validator function
@@ -769,7 +735,8 @@ mod tests {
             ],
             &mut raw_module,
             &compilation_ctx,
-        );
+        )
+        .unwrap();
 
         func_body.local_get(data_start).local_get(data_end);
 
@@ -786,7 +753,7 @@ mod tests {
             vec![vec![1, 2, 3], vec![4, 5, 6]],
             U256::from(123456789012345u128),
         ));
-        println!("expected_data: {:?}", expected_data);
+        println!("expected_data: {expected_data:?}");
 
         // Define validator function
         let mut linker = Linker::new(&Engine::default());

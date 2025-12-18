@@ -15,7 +15,7 @@ public struct CONSTRUCTOR_WITH_OTW has drop {}
 
 // An init function can only take an OTW as first argument and a TxContext as last argument,
 // To be considered a constructor.
-fun init(otw: CONSTRUCTOR_WITH_OTW, ctx: &mut TxContext) {
+entry fun init(otw: CONSTRUCTOR_WITH_OTW, ctx: &mut TxContext) {
 
   assert!(types::is_one_time_witness(&otw), 0);
 
@@ -27,10 +27,10 @@ fun init(otw: CONSTRUCTOR_WITH_OTW, ctx: &mut TxContext) {
   transfer::share_object(foo);
 }
 
-public fun read_value(foo: &Foo): u64 {
+entry fun read_value(foo: &Foo): u64 {
     foo.value
 }
 
-public fun set_value(foo: &mut Foo, value: u64) {
+entry fun set_value(foo: &mut Foo, value: u64) {
     foo.value = value;
 }

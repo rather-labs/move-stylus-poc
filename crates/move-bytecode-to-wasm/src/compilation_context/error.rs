@@ -1,15 +1,36 @@
+use std::rc::Rc;
+
 use move_binary_format::file_format::{
     FieldHandleIndex, FieldInstantiationIndex, SignatureIndex, StructDefInstantiationIndex,
     StructDefinitionIndex,
 };
 
-use super::ModuleId;
+use crate::{
+    error::{CompilationError, ICEError, ICEErrorKind},
+    translation::{
+        functions::MappedFunctionError, intermediate_types::error::IntermediateTypeError,
+    },
+};
+
+use super::{ModuleId, module_data::error::ModuleDataError};
 
 #[derive(Debug, thiserror::Error)]
 #[allow(clippy::enum_variant_names)]
 pub enum CompilationContextError {
+    #[error("creating a mapped function")]
+    MappedFunction(#[source] Rc<MappedFunctionError>),
+
+    #[error("there was an error when processing an intermediate type")]
+    IntermediateType(#[source] Rc<IntermediateTypeError>),
+
+    #[error("processing module data")]
+    ModuleData(#[from] ModuleDataError),
+
     #[error("struct with index {0} not found in compilation context")]
     StructNotFound(u16),
+
+    #[error("struct with identifier {0} not found in compilation context")]
+    StructByIdentifierNotFound(String),
 
     #[error("struct with field id {0:?} not found in compilation context")]
     StructWithFieldIdxNotFound(FieldHandleIndex),
@@ -32,9 +53,92 @@ pub enum CompilationContextError {
     #[error("enum with enum id {0} not found in compilation context")]
     EnumWithVariantIdxNotFound(u16),
 
-    #[error("module {0:?} not found")]
+    #[error("module {0} not found")]
     ModuleNotFound(ModuleId),
 
     #[error("expected struct")]
     ExpectedStruct,
+
+    #[error("expected enum")]
+    ExpectedEnum,
+
+    #[error("could not find external datatype handler index")]
+    ExternalDatatypeHandlerIndexNotFound,
+
+    #[error("receive function with returns")]
+    ReceiveFunctionHasReturns,
+
+    #[error("receive function with too many arguments")]
+    ReceiveFunctionTooManyArguments,
+
+    #[error("receive function with non-TxContext argument")]
+    ReceiveFunctionNonTxContextArgument,
+
+    #[error("receive function with non-payable state mutability")]
+    ReceiveFunctionIsNotPayable,
+
+    #[error("receive function with bad visibility")]
+    ReceiveFunctionBadVisibility,
+
+    #[error("there can be only a single receive function per module")]
+    DuplicateReceiveFunction,
+
+    #[error("there can be only a single fallback function per module")]
+    DuplicateFallbackFunction,
+
+    #[error("fallback function with bad visibility")]
+    FallbackFunctionBadVisibility,
+
+    #[error("fallback function with too many arguments (must have 0, 1, or 2 arguments)")]
+    FallbackFunctionTooManyArguments,
+
+    #[error(
+        "fallback function with invalid argument type at position {0} (expected reference to Calldata or TxContext)"
+    )]
+    FallbackFunctionInvalidArgumentType(usize),
+
+    #[error("fallback function with invalid return type (expected reference to Calldata)")]
+    FallbackFunctionInvalidReturnType,
+
+    #[error(r#"datatype handle index "{0}" not found"#)]
+    DatatypeHanldeIndexNotFound(usize),
+
+    #[error("there can be only a single init function per module")]
+    DuplicateInitFunction,
+
+    #[error("found init funciton with no arguments")]
+    InitFunctionNoAguments,
+
+    #[error("too many arguments for init function")]
+    InitFunctionTooManyArgs,
+
+    #[error("init functions does not have TxContext as parameter")]
+    InitFunctionNoTxContext,
+
+    #[error("init function second argument must be a OTW")]
+    InitFunctionNoOTW,
+
+    #[error("expected no return values for init function")]
+    InitFunctionBadRetrunValues,
+
+    #[error("expected private visibility for init function")]
+    InitFunctionBadPrivacy,
+}
+
+impl From<CompilationContextError> for CompilationError {
+    fn from(value: CompilationContextError) -> Self {
+        CompilationError::ICE(ICEError::new(ICEErrorKind::CompilationContext(value)))
+    }
+}
+
+impl From<MappedFunctionError> for CompilationContextError {
+    fn from(value: MappedFunctionError) -> Self {
+        CompilationContextError::MappedFunction(value.into())
+    }
+}
+
+impl From<IntermediateTypeError> for CompilationContextError {
+    fn from(value: IntermediateTypeError) -> Self {
+        CompilationContextError::IntermediateType(value.into())
+    }
 }

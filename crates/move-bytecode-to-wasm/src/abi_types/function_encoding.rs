@@ -1,114 +1,26 @@
-use alloy_primitives::keccak256;
-use alloy_sol_types::{SolType, sol_data};
-
 use crate::{
-    CompilationContext,
-    translation::intermediate_types::{IntermediateType, structs::IStruct},
-    utils::snake_to_camel,
-    vm_handled_types::{VmHandledType, tx_context::TxContext},
+    CompilationContext, translation::intermediate_types::IntermediateType, utils::snake_to_camel,
 };
 
-pub type AbiFunctionSelector = [u8; 4];
-
-fn selector<T: AsRef<[u8]>>(bytes: T) -> AbiFunctionSelector {
-    keccak256(bytes)[..4].try_into().unwrap()
-}
-
-pub trait SolName {
-    /// Returns the corresponding type name in solidity in case it exist
-    fn sol_name(&self, compilation_ctx: &CompilationContext) -> Option<String>;
-}
+use super::{
+    abi_encoding::{self, AbiFunctionSelector},
+    error::AbiError,
+};
 
 /// Calculate the function selector according to Solidity's [ABI encoding](https://docs.soliditylang.org/en/latest/abi-spec.html#function-selector)
 ///
 /// Function names are converted to camel case before encoding.
-pub fn move_signature_to_abi_selector<T: SolName>(
+pub fn move_signature_to_abi_selector(
     function_name: &str,
-    signature: &[T],
+    signature: &[IntermediateType],
     compilation_ctx: &CompilationContext,
-) -> AbiFunctionSelector {
-    let parameter_strings = signature
-        .iter()
-        .filter_map(|s| s.sol_name(compilation_ctx))
-        .collect::<Vec<String>>()
-        .join(",");
-
-    let function_name = snake_to_camel(function_name);
-
-    selector(format!("{}({})", function_name, parameter_strings))
-}
-
-impl SolName for IntermediateType {
-    fn sol_name(&self, compilation_ctx: &CompilationContext) -> Option<String> {
-        match self {
-            IntermediateType::IBool => Some(sol_data::Bool::SOL_NAME.to_string()),
-            IntermediateType::IU8 => Some(sol_data::Uint::<8>::SOL_NAME.to_string()),
-            IntermediateType::IU16 => Some(sol_data::Uint::<16>::SOL_NAME.to_string()),
-            IntermediateType::IU32 => Some(sol_data::Uint::<32>::SOL_NAME.to_string()),
-            IntermediateType::IU64 => Some(sol_data::Uint::<64>::SOL_NAME.to_string()),
-            IntermediateType::IU128 => Some(sol_data::Uint::<128>::SOL_NAME.to_string()),
-            IntermediateType::IU256 => Some(sol_data::Uint::<256>::SOL_NAME.to_string()),
-            IntermediateType::IAddress => Some(sol_data::Address::SOL_NAME.to_string()),
-            // According to the official documentation, enum types are encoded as uint8
-            // TODO: check if the enum is simple
-            IntermediateType::IEnum(_) => Some(sol_data::Uint::<8>::SOL_NAME.to_string()),
-            IntermediateType::IRef(inner) | IntermediateType::IMutRef(inner) => {
-                inner.sol_name(compilation_ctx)
-            }
-            IntermediateType::IVector(inner) => inner
-                .sol_name(compilation_ctx)
-                .map(|sol_n| format!("{sol_n}[]")),
-            IntermediateType::IStruct { module_id, index }
-                if TxContext::is_vm_type(module_id, *index, compilation_ctx) =>
-            {
-                None
-            }
-            IntermediateType::IStruct { module_id, index } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-
-                if struct_.saved_in_storage {
-                    Some(sol_data::FixedBytes::<32>::SOL_NAME.to_string())
-                } else {
-                    Self::struct_fields_sol_name(struct_, compilation_ctx)
-                }
-            }
-            IntermediateType::IGenericStructInstance {
-                module_id,
-                index,
-                types,
-            } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-                let struct_instance = struct_.instantiate(types);
-
-                if struct_instance.saved_in_storage {
-                    Some(sol_data::FixedBytes::<32>::SOL_NAME.to_string())
-                } else {
-                    Self::struct_fields_sol_name(&struct_instance, compilation_ctx)
-                }
-            }
-            IntermediateType::ISigner | IntermediateType::ITypeParameter(_) => None,
-        }
-    }
-}
-
-impl IntermediateType {
-    #[inline]
-    fn struct_fields_sol_name(
-        struct_: &IStruct,
-        compilation_ctx: &CompilationContext,
-    ) -> Option<String> {
-        struct_
-            .fields
-            .iter()
-            .map(|field| field.sol_name(compilation_ctx))
-            .collect::<Option<Vec<String>>>()
-            .map(|fields| fields.join(","))
-            .map(|fields| format!("({fields})"))
-    }
+) -> Result<AbiFunctionSelector, AbiError> {
+    abi_encoding::move_signature_to_abi_selector(
+        function_name,
+        signature,
+        compilation_ctx,
+        snake_to_camel,
+    )
 }
 
 #[cfg(test)]
@@ -121,9 +33,13 @@ mod tests {
         compilation_context::{ModuleData, ModuleId},
         test_compilation_context,
         test_tools::build_module,
-        translation::intermediate_types::structs::IStruct,
+        translation::intermediate_types::{
+            VmHandledStruct,
+            structs::{IStruct, IStructType},
+        },
     };
 
+    use super::abi_encoding::selector;
     use super::*;
 
     #[test]
@@ -133,14 +49,14 @@ mod tests {
 
         let signature: &[IntermediateType] = &[IntermediateType::IU8, IntermediateType::IU16];
         assert_eq!(
-            move_signature_to_abi_selector("test", signature, &compilation_ctx),
-            selector("test(uint8,uint16)")
+            move_signature_to_abi_selector("test", signature, &compilation_ctx).unwrap(),
+            selector("test(uint8,uint16)").unwrap()
         );
 
         let signature: &[IntermediateType] = &[IntermediateType::IAddress, IntermediateType::IU256];
         assert_eq!(
-            move_signature_to_abi_selector("transfer", signature, &compilation_ctx),
-            selector("transfer(address,uint256)")
+            move_signature_to_abi_selector("transfer", signature, &compilation_ctx).unwrap(),
+            selector("transfer(address,uint256)").unwrap()
         );
 
         let signature: &[IntermediateType] = &[
@@ -150,8 +66,8 @@ mod tests {
             IntermediateType::IVector(Box::new(IntermediateType::IBool)),
         ];
         assert_eq!(
-            move_signature_to_abi_selector("set_owner", signature, &compilation_ctx),
-            selector("setOwner(address,uint64,bool[])")
+            move_signature_to_abi_selector("set_owner", signature, &compilation_ctx).unwrap(),
+            selector("setOwner(address,uint64,bool[])").unwrap()
         );
 
         let signature: &[IntermediateType] = &[
@@ -159,8 +75,8 @@ mod tests {
             IntermediateType::IVector(Box::new(IntermediateType::IBool)),
         ];
         assert_eq!(
-            move_signature_to_abi_selector("test_array", signature, &compilation_ctx),
-            selector("testArray(uint128[],bool[])")
+            move_signature_to_abi_selector("test_array", signature, &compilation_ctx).unwrap(),
+            selector("testArray(uint128[],bool[])").unwrap()
         );
 
         let signature: &[IntermediateType] = &[
@@ -170,8 +86,8 @@ mod tests {
             IntermediateType::IVector(Box::new(IntermediateType::IBool)),
         ];
         assert_eq!(
-            move_signature_to_abi_selector("test_array", signature, &compilation_ctx),
-            selector("testArray(uint128[][],bool[])")
+            move_signature_to_abi_selector("test_array", signature, &compilation_ctx).unwrap(),
+            selector("testArray(uint128[][],bool[])").unwrap()
         );
 
         let struct_1 = IStruct::new(
@@ -199,12 +115,13 @@ mod tests {
                     IntermediateType::IStruct {
                         module_id: ModuleId::default(),
                         index: 1,
+                        vm_handled_struct: VmHandledStruct::None,
                     },
                 ),
             ],
             HashMap::new(),
             false,
-            false,
+            IStructType::Common,
         );
 
         let struct_2 = IStruct::new(
@@ -216,7 +133,7 @@ mod tests {
             ],
             HashMap::new(),
             false,
-            false,
+            IStructType::Common,
         );
 
         let mut module_data = ModuleData::default();
@@ -228,19 +145,21 @@ mod tests {
             IntermediateType::IStruct {
                 module_id: ModuleId::default(),
                 index: 0,
+                vm_handled_struct: VmHandledStruct::None,
             },
             IntermediateType::IVector(Box::new(IntermediateType::IStruct {
                 module_id: ModuleId::default(),
                 index: 1,
+                vm_handled_struct: VmHandledStruct::None,
             })),
         ];
 
         compilation_ctx.root_module_data = &module_data;
         assert_eq!(
-            move_signature_to_abi_selector("test_struct", signature, &compilation_ctx),
+            move_signature_to_abi_selector("test_struct", signature, &compilation_ctx).unwrap(),
             selector(
                 "testStruct((address,uint32[],uint128[],bool,uint8,uint16,uint32,uint64,uint128,uint256,(uint32,uint128)),(uint32,uint128)[])"
-            )
+            ).unwrap()
         );
     }
 }

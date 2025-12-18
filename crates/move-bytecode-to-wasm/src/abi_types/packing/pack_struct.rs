@@ -89,7 +89,7 @@ use walrus::{
 
 use crate::{
     CompilationContext,
-    abi_types::packing::pack_native_int::pack_i32_type_instructions,
+    abi_types::{error::AbiError, packing::pack_native_int::pack_i32_type_instructions},
     translation::intermediate_types::{IntermediateType, structs::IStruct},
 };
 
@@ -106,7 +106,7 @@ impl IStruct {
         calldata_reference_pointer: LocalId,
         compilation_ctx: &CompilationContext,
         base_calldata_reference_pointer: Option<LocalId>,
-    ) {
+    ) -> Result<(), AbiError> {
         let val_32 = module.locals.add(ValType::I32);
         let val_64 = module.locals.add(ValType::I64);
         let struct_ptr = local;
@@ -124,7 +124,7 @@ impl IStruct {
             // Allocate memory for the packed value. Set the data_ptr the beginning, since
             // we are going to pack the values from there
             block
-                .i32_const(self.solidity_abi_encode_size(compilation_ctx) as i32)
+                .i32_const(self.solidity_abi_encode_size(compilation_ctx)? as i32)
                 .call(compilation_ctx.allocator)
                 .local_tee(data_ptr)
                 .local_tee(inner_data_reference);
@@ -145,7 +145,7 @@ impl IStruct {
                 compilation_ctx.memory_id,
                 reference_value,
                 writer_pointer,
-            );
+            )?;
         } else {
             block.local_get(writer_pointer).local_set(data_ptr);
         }
@@ -171,7 +171,7 @@ impl IStruct {
                 | IntermediateType::IU16
                 | IntermediateType::IU32
                 | IntermediateType::IU64 => {
-                    let (val, load_kind) = if field.stack_data_size() == 8 {
+                    let (val, load_kind) = if field.stack_data_size()? == 8 {
                         (val_64, LoadKind::I64 { atomic: false })
                     } else {
                         (val_32, LoadKind::I32 { atomic: false })
@@ -208,13 +208,12 @@ impl IStruct {
             // current offset of writer pointer, we are going to write the offset where we can find
             // the struct
             let advancement = match field {
-                IntermediateType::IStruct { module_id, index } => {
-                    let child_struct = compilation_ctx
-                        .get_struct_by_index(module_id, *index)
-                        .unwrap();
+                IntermediateType::IStruct { .. }
+                | IntermediateType::IGenericStructInstance { .. } => {
+                    let child_struct = compilation_ctx.get_struct_by_intermediate_type(field)?;
 
                     pack_child_struct(
-                        child_struct,
+                        &child_struct,
                         module,
                         compilation_ctx,
                         block,
@@ -222,28 +221,7 @@ impl IStruct {
                         data_ptr,
                         inner_data_reference,
                         field,
-                    )
-                }
-                IntermediateType::IGenericStructInstance {
-                    module_id,
-                    index,
-                    types,
-                } => {
-                    let child_struct = compilation_ctx
-                        .get_struct_by_index(module_id, *index)
-                        .unwrap();
-                    let child_struct_instance = child_struct.instantiate(types);
-
-                    pack_child_struct(
-                        &child_struct_instance,
-                        module,
-                        compilation_ctx,
-                        block,
-                        field_local,
-                        data_ptr,
-                        inner_data_reference,
-                        field,
-                    )
+                    )?
                 }
                 _ => {
                     field.add_pack_instructions(
@@ -253,7 +231,7 @@ impl IStruct {
                         data_ptr,
                         inner_data_reference,
                         compilation_ctx,
-                    );
+                    )?;
                     32
                 }
             };
@@ -274,6 +252,8 @@ impl IStruct {
                 .binop(BinaryOp::I32Add)
                 .local_set(data_ptr);
         }
+
+        Ok(())
     }
 }
 
@@ -287,28 +267,26 @@ fn pack_child_struct(
     data_ptr: LocalId,
     inner_data_reference: LocalId,
     field: &IntermediateType,
-) -> usize {
-    if child_struct.solidity_abi_encode_is_dynamic(compilation_ctx) {
-        child_struct.add_pack_instructions(
+) -> Result<usize, AbiError> {
+    if child_struct.solidity_abi_encode_is_dynamic(compilation_ctx)? {
+        field.add_pack_instructions_dynamic(
             block,
             module,
             field_local,
             data_ptr,
             inner_data_reference,
             compilation_ctx,
-            Some(inner_data_reference),
-        );
-        32
+        )?;
+        Ok(32)
     } else {
-        child_struct.add_pack_instructions(
+        field.add_pack_instructions(
             block,
             module,
             field_local,
             data_ptr,
             inner_data_reference,
             compilation_ctx,
-            None,
-        );
-        field.encoded_size(compilation_ctx)
+        )?;
+        Ok(field.encoded_size(compilation_ctx)?)
     }
 }

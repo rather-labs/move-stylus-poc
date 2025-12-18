@@ -1,6 +1,11 @@
-use crate::translation::{
-    functions::MappedFunction, intermediate_types::IntermediateType, table::FunctionId,
+use crate::{
+    compilation_context::CompilationContextError,
+    translation::{
+        functions::MappedFunction, intermediate_types::IntermediateType, table::FunctionId,
+    },
 };
+
+use super::error::ModuleDataError;
 
 #[derive(Debug, Default)]
 pub struct FunctionData {
@@ -22,4 +27,25 @@ pub struct FunctionData {
 
     /// The init function of the module.
     pub init: Option<FunctionId>,
+
+    /// The receive function of the module.
+    pub receive: Option<FunctionId>,
+
+    /// The fallback function of the module.
+    pub fallback: Option<FunctionId>,
+}
+
+impl FunctionData {
+    pub fn get_information_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<&MappedFunction, CompilationContextError> {
+        Ok(self
+            .information
+            .iter()
+            .find(|f| f.function_id.identifier == identifier)
+            .ok_or(ModuleDataError::FunctionByIdentifierNotFound(
+                identifier.to_string(),
+            ))?)
+    }
 }

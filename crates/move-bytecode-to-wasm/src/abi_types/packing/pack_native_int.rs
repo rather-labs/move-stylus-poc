@@ -3,7 +3,7 @@ use walrus::{
     ir::{MemArg, StoreKind},
 };
 
-use crate::runtime::RuntimeFunction;
+use crate::{abi_types::error::AbiError, runtime::RuntimeFunction};
 
 pub fn pack_i32_type_instructions(
     block: &mut InstrSeqBuilder,
@@ -11,14 +11,14 @@ pub fn pack_i32_type_instructions(
     memory: MemoryId,
     local: LocalId,
     writer_pointer: LocalId,
-) {
+) -> Result<(), AbiError> {
     block.local_get(writer_pointer);
 
     // Load the local value to the stack
     block.local_get(local);
 
     // Little-endian to Big-endian
-    let swap_i32_bytes_function = RuntimeFunction::SwapI32Bytes.get(module, None);
+    let swap_i32_bytes_function = RuntimeFunction::SwapI32Bytes.get(module, None)?;
     block.call(swap_i32_bytes_function);
 
     block.store(
@@ -30,6 +30,8 @@ pub fn pack_i32_type_instructions(
             offset: 28,
         },
     );
+
+    Ok(())
 }
 
 pub fn pack_i64_type_instructions(
@@ -38,14 +40,14 @@ pub fn pack_i64_type_instructions(
     memory: MemoryId,
     local: LocalId,
     writer_pointer: LocalId,
-) {
+) -> Result<(), AbiError> {
     block.local_get(writer_pointer);
 
     // Load the local value to the stack
     block.local_get(local);
 
     // Little-endian to Big-endian
-    let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None);
+    let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None)?;
     block.call(swap_i64_bytes_function);
 
     block.store(
@@ -57,6 +59,8 @@ pub fn pack_i64_type_instructions(
             offset: 24,
         },
     );
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -99,19 +103,21 @@ mod tests {
 
         let writer_pointer = raw_module.locals.add(ValType::I32);
 
-        func_body.i32_const(int_type.encoded_size(&compilation_ctx) as i32);
+        func_body.i32_const(int_type.encoded_size(&compilation_ctx).unwrap() as i32);
         func_body.call(alloc_function);
         func_body.local_set(writer_pointer);
 
         // Args data should already be stored in memory
-        int_type.add_pack_instructions(
-            &mut func_body,
-            &mut raw_module,
-            local,
-            writer_pointer,
-            writer_pointer, // unused for this type
-            &compilation_ctx,
-        );
+        int_type
+            .add_pack_instructions(
+                &mut func_body,
+                &mut raw_module,
+                local,
+                writer_pointer,
+                writer_pointer, // unused for this type
+                &compilation_ctx,
+            )
+            .unwrap();
 
         func_body.local_get(writer_pointer);
 

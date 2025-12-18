@@ -28,19 +28,35 @@ pub fn snake_to_camel(input: &str) -> String {
     }
 
     let mut flag = ChIs::FirstOfStr;
+    let mut chars = input.chars().peekable();
 
-    for ch in input.chars() {
+    while let Some(ch) = chars.next() {
         if flag == ChIs::FirstOfStr {
             result.push(ch.to_ascii_lowercase());
             flag = ChIs::Other;
         } else if ch == '_' {
-            flag = ChIs::NextOfSepMark;
+            // If this is the last character, preserve it
+            if chars.peek().is_none() {
+                result.push('_');
+            } else {
+                flag = ChIs::NextOfSepMark;
+            }
         } else if flag == ChIs::NextOfSepMark {
             result.push(ch.to_ascii_uppercase());
             flag = ChIs::Other;
         } else {
             result.push(ch);
         }
+    }
+
+    result
+}
+
+pub fn snake_to_upper_camel(input: &str) -> String {
+    let mut result = snake_to_camel(input);
+
+    if let Some(first) = result.get_mut(0..1) {
+        first.make_ascii_uppercase();
     }
 
     result

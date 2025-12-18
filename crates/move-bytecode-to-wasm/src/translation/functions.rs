@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
 use move_binary_format::file_format::{
-    DatatypeHandleIndex, FunctionDefinition, Signature, SignatureToken, Visibility,
+    CodeOffset, DatatypeHandleIndex, FunctionDefinition, JumpTableInner, Signature, SignatureToken,
 };
 use walrus::{
     InstrSeqBuilder, LocalId, MemoryId, Module, ValType,
-    ir::{LoadKind, MemArg, StoreKind},
+    ir::{InstrSeqId, LoadKind, MemArg, StoreKind},
 };
 
-use super::types_stack::{TypesStack, TypesStackError};
+use super::{
+    TranslationError, intermediate_types::error::IntermediateTypeError, types_stack::TypesStack,
+};
 
 use crate::{
     CompilationContext, UserDefinedType,
@@ -17,6 +19,23 @@ use crate::{
 };
 
 use super::{intermediate_types::IntermediateType, table::FunctionId};
+
+#[derive(Debug, thiserror::Error)]
+pub enum MappedFunctionError {
+    #[error("an error ocurred while processing an intermediate type")]
+    IntermediateType(#[from] IntermediateTypeError),
+
+    #[error("multiple WASM return values not supported")]
+    MultipleWasmReturnValues,
+}
+
+#[derive(Debug, Clone)]
+pub struct JumpTableData {
+    /// The enum associated with this jump table
+    pub enum_index: usize,
+    /// The target offsets for each variant of the enum
+    pub offsets: Vec<CodeOffset>,
+}
 
 #[derive(Debug)]
 pub struct MappedFunction {
@@ -33,6 +52,10 @@ pub struct MappedFunction {
 
     /// Flag that tells us if the function contains generic arguments or return values
     pub is_generic: bool,
+
+    /// Jump tables associated with the function
+    /// VariantJumpTableIndex(i) corresponds to the ith jump table within this vector
+    pub jump_tables: Vec<JumpTableData>,
 }
 
 impl MappedFunction {
@@ -44,32 +67,46 @@ impl MappedFunction {
         move_locals: &[SignatureToken],
         function_definition: &FunctionDefinition,
         handles_map: &HashMap<DatatypeHandleIndex, UserDefinedType>,
-    ) -> Self {
-        let signature = ISignature::from_signatures(move_args, move_rets, handles_map);
+    ) -> Result<Self, MappedFunctionError> {
+        let signature = ISignature::from_signatures(move_args, move_rets, handles_map)?;
         let results = signature.get_return_wasm_types();
 
-        assert!(results.len() <= 1, "Multiple return values not supported");
+        if results.len() > 1 {
+            return Err(MappedFunctionError::MultipleWasmReturnValues);
+        }
 
         // Declared locals
         let locals = move_locals
             .iter()
             .map(|s| IntermediateType::try_from_signature_token(s, handles_map))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let is_generic = signature.arguments.iter().any(type_contains_generics)
             || signature.returns.iter().any(type_contains_generics);
 
-        Self {
+        // Process jump tables within the function
+        let jump_tables = function_definition
+            .code
+            .iter()
+            .flat_map(|c| &c.jump_tables)
+            .map(|variant_jump_table| JumpTableData {
+                enum_index: variant_jump_table.head_enum.0 as usize,
+                offsets: match &variant_jump_table.jump_table {
+                    JumpTableInner::Full(offsets) => offsets.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        Ok(Self {
             function_id,
             signature,
             locals,
             results,
-            // TODO: change to function_definition.is_entry
-            is_entry: function_definition.visibility == Visibility::Public,
+            is_entry: function_definition.is_entry,
             is_native: function_definition.is_native(),
             is_generic,
-        }
+            jump_tables,
+        })
     }
 }
 
@@ -116,6 +153,7 @@ impl MappedFunction {
             results,
             locals,
             is_generic: false,
+            jump_tables: self.jump_tables.clone(),
             ..*self
         }
     }
@@ -129,9 +167,9 @@ pub fn add_unpack_function_return_values_instructions(
     module: &mut Module,
     returns: &[IntermediateType],
     memory: MemoryId,
-) {
+) -> Result<(), IntermediateTypeError> {
     if returns.is_empty() {
-        return;
+        return Ok(());
     }
 
     let pointer = module.locals.add(ValType::I32);
@@ -140,13 +178,13 @@ pub fn add_unpack_function_return_values_instructions(
     let mut offset = 0;
     for return_ty in returns.iter() {
         builder.local_get(pointer);
-        if return_ty.stack_data_size() == 4 {
+        if return_ty.stack_data_size()? == 4 {
             builder.load(
                 memory,
                 LoadKind::I32 { atomic: false },
                 MemArg { align: 0, offset },
             );
-        } else if return_ty.stack_data_size() == 8 {
+        } else if return_ty.stack_data_size()? == 8 {
             builder.load(
                 memory,
                 LoadKind::I64 { atomic: false },
@@ -155,8 +193,10 @@ pub fn add_unpack_function_return_values_instructions(
         } else {
             unreachable!("Unsupported type size");
         }
-        offset += return_ty.stack_data_size();
+        offset += return_ty.stack_data_size()?;
     }
+
+    Ok(())
 }
 
 /// Packs the return values into a tuple if the function has return values
@@ -168,34 +208,35 @@ pub fn prepare_function_return(
     builder: &mut InstrSeqBuilder,
     returns: &[IntermediateType],
     compilation_ctx: &CompilationContext,
-) {
+    result_block_id: InstrSeqId,
+    result_local_id: LocalId,
+) -> Result<(), TranslationError> {
     if !returns.is_empty() {
         let mut locals = Vec::new();
         let mut total_size = 0;
         for return_ty in returns.iter().rev() {
-            let local = return_ty.add_stack_to_local_instructions(module, builder);
+            let local = return_ty.add_stack_to_local_instructions(module, builder)?;
             locals.push(local);
-            total_size += return_ty.stack_data_size();
+            total_size += return_ty.stack_data_size()?;
         }
         locals.reverse();
 
-        let pointer = module.locals.add(ValType::I32);
-
         builder.i32_const(total_size as i32);
         builder.call(compilation_ctx.allocator);
-        builder.local_set(pointer);
+        builder.local_set(result_local_id);
 
         let mut offset = 0;
         for (return_ty, local) in returns.iter().zip(locals.iter()) {
-            builder.local_get(pointer);
+            builder.local_get(result_local_id);
             builder.local_get(*local);
-            if return_ty.stack_data_size() == 4 {
+
+            if return_ty.stack_data_size()? == 4 {
                 builder.store(
                     compilation_ctx.memory_id,
                     StoreKind::I32 { atomic: false },
                     MemArg { align: 0, offset },
                 );
-            } else if return_ty.stack_data_size() == 8 {
+            } else if return_ty.stack_data_size()? == 8 {
                 builder.store(
                     compilation_ctx.memory_id,
                     StoreKind::I64 { atomic: false },
@@ -204,31 +245,40 @@ pub fn prepare_function_return(
             } else {
                 unreachable!("Unsupported type size");
             }
-            offset += return_ty.stack_data_size();
+            offset += return_ty.stack_data_size()?;
         }
-
-        builder.local_get(pointer);
     }
 
-    builder.return_();
+    builder.br(result_block_id);
+
+    Ok(())
 }
 
 /// This function sets up the arguments for a function call.
 ///
 /// It processes each argument type, checking if it is an immutable (`IRef`) or mutable (`IMutRef`) reference.
 /// If a reference is detected, the function ensures that the pointer to the referenced data is loaded.
+///
+/// Returns the types extracted from the stack and a vector of mutable reference to vector locals (if any)
 pub fn prepare_function_arguments(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     arguments: &[IntermediateType],
     compilation_ctx: &CompilationContext,
     types_stack: &mut TypesStack,
-) -> Result<(), TypesStackError> {
-    // Verify that the types currently on the types stack correspond to the expected argument types.
-    // Additionally, determine if any of these arguments are references.
+) -> Result<(Vec<IntermediateType>, Vec<LocalId>), TranslationError> {
+    let mut result = Vec::new();
+
+    // Vector of mutable reference to vector locals
+    let mut mut_ref_vec_locals: Vec<LocalId> = Vec::new();
+
     let mut has_ref = false;
+
+    // Verify that the types currently on the types stack correspond to the expected argument types and check if any of these arguments are references.
     for arg in arguments.iter().rev() {
-        types_stack.pop_expecting(arg)?;
+        let typestack_arg = types_stack.pop_expecting(arg)?;
+
+        result.insert(0, typestack_arg);
 
         has_ref = has_ref
             || matches!(
@@ -247,6 +297,16 @@ pub fn prepare_function_arguments(
                 arg_ty,
                 IntermediateType::IRef(_) | IntermediateType::IMutRef(_)
             ) {
+                // If this argument is a mutable reference to a vector, record the original address it points to.
+                if let IntermediateType::IMutRef(inner) = arg_ty {
+                    if let IntermediateType::IVector(_) = **inner {
+                        let mut_ref_vec_local =
+                            inner.add_stack_to_local_instructions(module, builder)?;
+                        mut_ref_vec_locals.push(mut_ref_vec_local);
+                        builder.local_get(mut_ref_vec_local);
+                    }
+                }
+
                 // If the argument is a Ref, load the pointer
                 builder.load(
                     compilation_ctx.memory_id,
@@ -257,7 +317,7 @@ pub fn prepare_function_arguments(
                     },
                 );
             }
-            spilled.push(arg_ty.add_stack_to_local_instructions(module, builder));
+            spilled.push(arg_ty.add_stack_to_local_instructions(module, builder)?);
         }
 
         // ii. Rebuild the operand stack in call order (first .. last)
@@ -266,5 +326,5 @@ pub fn prepare_function_arguments(
         }
     };
 
-    Ok(())
+    Ok((result, mut_ref_vec_locals))
 }

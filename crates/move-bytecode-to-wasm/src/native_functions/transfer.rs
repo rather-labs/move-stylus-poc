@@ -1,41 +1,48 @@
+use crate::{
+    CompilationContext,
+    compilation_context::ModuleId,
+    data::{
+        DATA_FROZEN_OBJECTS_KEY_OFFSET, DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET,
+        DATA_SHARED_OBJECTS_KEY_OFFSET,
+    },
+    runtime::RuntimeFunction,
+    translation::intermediate_types::IntermediateType,
+};
 use walrus::{
     FunctionBuilder, FunctionId, Module, ValType,
     ir::{BinaryOp, UnaryOp},
 };
 
-use crate::{
-    CompilationContext,
-    data::{
-        DATA_FROZEN_OBJECTS_KEY_OFFSET, DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET,
-        DATA_SHARED_OBJECTS_KEY_OFFSET,
-    },
-    get_generic_function_name,
-    runtime::RuntimeFunction,
-    translation::intermediate_types::IntermediateType,
-};
-
-use super::NativeFunction;
+use super::{NativeFunction, error::NativeFunctionError};
 
 /// Adds the instructions to transfer an object to a recipient.
+/// This implies deleting the object from the original owner's mapping and adding it to the recipient's mapping.
 pub fn add_transfer_object_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
     itype: &IntermediateType,
-) -> FunctionId {
-    let name = get_generic_function_name(NativeFunction::NATIVE_TRANSFER_OBJECT, &[itype]);
+    module_id: &ModuleId,
+) -> Result<FunctionId, NativeFunctionError> {
+    let name = NativeFunction::get_generic_function_name(
+        NativeFunction::NATIVE_TRANSFER_OBJECT,
+        compilation_ctx,
+        &[itype],
+        module_id,
+    )?;
     if let Some(function) = module.funcs.by_name(&name) {
-        return function;
+        return Ok(function);
     };
 
     // Runtime functions
-    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx));
-    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx));
-    let get_id_bytes_ptr_fn = RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx));
-    let write_object_slot_fn = RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx));
+    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx))?;
+    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx))?;
+    let get_id_bytes_ptr_fn = RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx))?;
+    let write_object_slot_fn =
+        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx))?;
     let storage_save_fn =
-        RuntimeFunction::EncodeAndSaveInStorage.get_generic(module, compilation_ctx, &[itype]);
+        RuntimeFunction::EncodeAndSaveInStorage.get_generic(module, compilation_ctx, &[itype])?;
     let delete_object_fn =
-        RuntimeFunction::DeleteFromStorage.get_generic(module, compilation_ctx, &[itype]);
+        RuntimeFunction::DeleteFromStorage.get_generic(module, compilation_ctx, &[itype])?;
 
     // Function declaration
     let mut function = FunctionBuilder::new(&mut module.types, &[ValType::I32, ValType::I32], &[]);
@@ -48,6 +55,7 @@ pub fn add_transfer_object_fn(
     // Locals
     let owner_ptr = module.locals.add(ValType::I32);
     let id_bytes_ptr = module.locals.add(ValType::I32);
+    let slot_ptr = module.locals.add(ValType::I32);
 
     builder.block(None, |block| {
         let block_id = block.id();
@@ -84,6 +92,7 @@ pub fn add_transfer_object_fn(
         block.unreachable();
     });
 
+    // Delete the object from the owner mapping on the storage
     builder.block(None, |block| {
         let block_id = block.id();
 
@@ -94,6 +103,13 @@ pub fn add_transfer_object_fn(
 
         block.local_get(struct_ptr).call(delete_object_fn);
     });
+
+    // Remove any objects that have been recently transferred into the struct from the original owner's mapping in storage.
+    let check_and_delete_struct_tto_fields_fn = RuntimeFunction::CheckAndDeleteStructTtoFields
+        .get_generic(module, compilation_ctx, &[itype])?;
+    builder
+        .local_get(struct_ptr)
+        .call(check_and_delete_struct_tto_fields_fn);
 
     // Update the object ownership in memory to the recipient's address
     builder
@@ -114,13 +130,23 @@ pub fn add_transfer_object_fn(
         .local_get(id_bytes_ptr)
         .call(write_object_slot_fn);
 
+    // Allocate 32 bytes for the slot pointer and copy the DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET to it
+    // This is needed because DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET might be overwritten later on
+    builder
+        .i32_const(32)
+        .call(compilation_ctx.allocator)
+        .local_tee(slot_ptr)
+        .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+        .i32_const(32)
+        .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
+
     // Store the struct in the slot associated with the new owner's mapping
     builder
         .local_get(struct_ptr)
-        .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+        .local_get(slot_ptr)
         .call(storage_save_fn);
 
-    function.finish(vec![struct_ptr, recipient_ptr], &mut module.funcs)
+    Ok(function.finish(vec![struct_ptr, recipient_ptr], &mut module.funcs))
 }
 
 /// Adds the instructions to share an object.
@@ -128,21 +154,30 @@ pub fn add_share_object_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
     itype: &IntermediateType,
-) -> FunctionId {
-    let name = get_generic_function_name(NativeFunction::NATIVE_SHARE_OBJECT, &[itype]);
+    module_id: &ModuleId,
+) -> Result<FunctionId, NativeFunctionError> {
+    let name = NativeFunction::get_generic_function_name(
+        NativeFunction::NATIVE_SHARE_OBJECT,
+        compilation_ctx,
+        &[itype],
+        module_id,
+    )?;
     if let Some(function) = module.funcs.by_name(&name) {
-        return function;
+        return Ok(function);
     };
 
     // Runtime functions
-    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx));
-    let get_id_bytes_ptr_fn = RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx));
-    let write_object_slot_fn = RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx));
+    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx))?;
+    let get_id_bytes_ptr_fn = RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx))?;
+    let write_object_slot_fn =
+        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx))?;
     let storage_save_fn =
-        RuntimeFunction::EncodeAndSaveInStorage.get_generic(module, compilation_ctx, &[itype]);
+        RuntimeFunction::EncodeAndSaveInStorage.get_generic(module, compilation_ctx, &[itype])?;
     let delete_object_fn =
-        RuntimeFunction::DeleteFromStorage.get_generic(module, compilation_ctx, &[itype]);
-
+        RuntimeFunction::DeleteFromStorage.get_generic(module, compilation_ctx, &[itype])?;
+    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx))?;
+    let check_and_delete_struct_tto_fields_fn = RuntimeFunction::CheckAndDeleteStructTtoFields
+        .get_generic(module, compilation_ctx, &[itype])?;
     // Function declaration
     let mut function = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
     let mut builder = function.name(name).func_body();
@@ -150,6 +185,7 @@ pub fn add_share_object_fn(
     // Locals
     let owner_ptr = module.locals.add(ValType::I32);
     let struct_ptr = module.locals.add(ValType::I32);
+    let slot_ptr = module.locals.add(ValType::I32);
 
     builder.block(None, |block| {
         let block_id = block.id();
@@ -183,7 +219,22 @@ pub fn add_share_object_fn(
             },
             |else_| {
                 // Delete the object from owner mapping on the storage
-                else_.local_get(struct_ptr).call(delete_object_fn);
+                else_.block(None, |block| {
+                    let block_id = block.id();
+
+                    // Check if the owner is zero (means there's no owner, so we don't need to delete anything)
+                    block.local_get(owner_ptr).i32_const(32).call(is_zero_fn);
+
+                    block.br_if(block_id);
+
+                    block.local_get(struct_ptr).call(delete_object_fn);
+                });
+
+                // Remove any objects that have been recently transferred into the struct from the original owner's mapping in storage.
+
+                else_
+                    .local_get(struct_ptr)
+                    .call(check_and_delete_struct_tto_fields_fn);
 
                 // Update the object ownership in memory to the shared objects key
                 else_
@@ -199,16 +250,26 @@ pub fn add_share_object_fn(
                     .call(get_id_bytes_ptr_fn)
                     .call(write_object_slot_fn);
 
+                // Allocate 32 bytes for the slot pointer and copy the DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET to it
+                // This is needed because DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET might be overwritten later on
+                else_
+                    .i32_const(32)
+                    .call(compilation_ctx.allocator)
+                    .local_tee(slot_ptr)
+                    .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+                    .i32_const(32)
+                    .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
+
                 // Save the struct in the shared objects mapping
                 else_
                     .local_get(struct_ptr)
-                    .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+                    .local_get(slot_ptr)
                     .call(storage_save_fn);
             },
         );
     });
 
-    function.finish(vec![struct_ptr], &mut module.funcs)
+    Ok(function.finish(vec![struct_ptr], &mut module.funcs))
 }
 
 /// Adds the instructions to freeze an object.
@@ -216,20 +277,30 @@ pub fn add_freeze_object_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
     itype: &IntermediateType,
-) -> FunctionId {
-    let name = get_generic_function_name(NativeFunction::NATIVE_FREEZE_OBJECT, &[itype]);
+    module_id: &ModuleId,
+) -> Result<FunctionId, NativeFunctionError> {
+    let name = NativeFunction::get_generic_function_name(
+        NativeFunction::NATIVE_FREEZE_OBJECT,
+        compilation_ctx,
+        &[itype],
+        module_id,
+    )?;
     if let Some(function) = module.funcs.by_name(&name) {
-        return function;
+        return Ok(function);
     };
 
     // Runtime functions
-    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx));
-    let get_id_bytes_ptr_fn = RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx));
-    let write_object_slot_fn = RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx));
+    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx))?;
+    let get_id_bytes_ptr_fn = RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx))?;
+    let write_object_slot_fn =
+        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx))?;
     let storage_save_fn =
-        RuntimeFunction::EncodeAndSaveInStorage.get_generic(module, compilation_ctx, &[itype]);
+        RuntimeFunction::EncodeAndSaveInStorage.get_generic(module, compilation_ctx, &[itype])?;
     let delete_object_fn =
-        RuntimeFunction::DeleteFromStorage.get_generic(module, compilation_ctx, &[itype]);
+        RuntimeFunction::DeleteFromStorage.get_generic(module, compilation_ctx, &[itype])?;
+    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx))?;
+    let check_and_delete_struct_tto_fields_fn = RuntimeFunction::CheckAndDeleteStructTtoFields
+        .get_generic(module, compilation_ctx, &[itype])?;
 
     // Function declaration
     let mut function = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
@@ -238,6 +309,7 @@ pub fn add_freeze_object_fn(
     // Locals
     let owner_ptr = module.locals.add(ValType::I32);
     let struct_ptr = module.locals.add(ValType::I32);
+    let slot_ptr = module.locals.add(ValType::I32);
 
     builder.block(None, |block| {
         let block_id = block.id();
@@ -279,7 +351,22 @@ pub fn add_freeze_object_fn(
             },
             |else_| {
                 // Delete the object from the owner mapping on the storage
-                else_.local_get(struct_ptr).call(delete_object_fn);
+                else_.block(None, |block| {
+                    let block_id = block.id();
+
+                    // Check if the owner is zero (means there's no owner, so we don't need to delete anything)
+                    block.local_get(owner_ptr).i32_const(32).call(is_zero_fn);
+
+                    block.br_if(block_id);
+
+                    block.local_get(struct_ptr).call(delete_object_fn);
+                });
+
+                // Remove any objects that have been recently transferred into the struct from the original owner's mapping in storage.
+
+                else_
+                    .local_get(struct_ptr)
+                    .call(check_and_delete_struct_tto_fields_fn);
 
                 // Update the object ownership in memory to the frozen objects key
                 else_
@@ -295,14 +382,23 @@ pub fn add_freeze_object_fn(
                     .call(get_id_bytes_ptr_fn)
                     .call(write_object_slot_fn);
 
+                // Allocate 32 bytes for the slot pointer and copy the DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET to it
+                else_
+                    .i32_const(32)
+                    .call(compilation_ctx.allocator)
+                    .local_tee(slot_ptr)
+                    .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+                    .i32_const(32)
+                    .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
+
                 // Save the struct into the frozen objects mapping
                 else_
                     .local_get(struct_ptr)
-                    .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
+                    .local_get(slot_ptr)
                     .call(storage_save_fn);
             },
         );
     });
 
-    function.finish(vec![struct_ptr], &mut module.funcs)
+    Ok(function.finish(vec![struct_ptr], &mut module.funcs))
 }
