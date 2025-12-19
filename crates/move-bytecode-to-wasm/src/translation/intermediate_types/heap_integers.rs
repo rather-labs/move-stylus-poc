@@ -5,7 +5,7 @@ use walrus::{
 
 use crate::{CompilationContext, runtime::RuntimeFunction};
 
-use super::IntermediateType;
+use super::{IntermediateType, error::IntermediateTypeError};
 
 fn compare_heap_integers_bitwise(
     builder: &mut walrus::InstrSeqBuilder,
@@ -74,12 +74,12 @@ impl IU128 {
         builder: &mut InstrSeqBuilder,
         bytes: &mut std::vec::IntoIter<u8>,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         let bytes: [u8; Self::HEAP_SIZE as usize] = bytes
             .take(Self::HEAP_SIZE as usize)
             .collect::<Vec<u8>>()
             .try_into()
-            .unwrap();
+            .map_err(|_| IntermediateTypeError::CouldNotProcessByteArray)?;
 
         let pointer = module.locals.add(ValType::I32);
 
@@ -92,7 +92,9 @@ impl IU128 {
         while offset < bytes.len() {
             builder.local_get(pointer);
             builder.i64_const(i64::from_le_bytes(
-                bytes[offset..offset + 8].try_into().unwrap(),
+                bytes[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| IntermediateTypeError::CouldNotProcessByteArray)?,
             ));
             builder.store(
                 compilation_ctx.memory_id,
@@ -107,6 +109,8 @@ impl IU128 {
         }
 
         builder.local_get(pointer);
+
+        Ok(())
     }
 
     pub fn bit_or(
@@ -156,7 +160,7 @@ impl IU128 {
         module: &mut walrus::Module,
         original_type: IntermediateType,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         match original_type {
             IntermediateType::IU8 | IntermediateType::IU16 | IntermediateType::IU32 => {
                 let value_local = module.locals.add(ValType::I32);
@@ -256,103 +260,122 @@ impl IU128 {
                 }
                 builder.local_get(pointer);
             }
-            t => panic!("type stack error: trying to cast {t:?}"),
+            t => return Err(IntermediateTypeError::InvalidCast(t.clone())),
         }
+
+        Ok(())
     }
 
     pub fn add(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let add_function_id = RuntimeFunction::HeapIntSum.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let add_function_id = RuntimeFunction::HeapIntSum.get(module, Some(compilation_ctx))?;
         // Alocate space for the result
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(compilation_ctx.allocator);
         builder.i32_const(Self::HEAP_SIZE).call(add_function_id);
+
+        Ok(())
     }
 
     pub fn bit_shift_left(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         let shift_left_function_id =
-            RuntimeFunction::HeapIntShiftLeft.get(module, Some(compilation_ctx));
+            RuntimeFunction::HeapIntShiftLeft.get(module, Some(compilation_ctx))?;
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(shift_left_function_id);
+
+        Ok(())
     }
 
     pub fn bit_shift_right(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         let shift_right_function_id =
-            RuntimeFunction::HeapIntShiftRight.get(module, Some(compilation_ctx));
+            RuntimeFunction::HeapIntShiftRight.get(module, Some(compilation_ctx))?;
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(shift_right_function_id);
+
+        Ok(())
     }
 
     pub fn sub(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let sub_function_id = RuntimeFunction::HeapIntSub.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let sub_function_id = RuntimeFunction::HeapIntSub.get(module, Some(compilation_ctx))?;
         // Alocate space for the result
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(compilation_ctx.allocator);
         builder.i32_const(Self::HEAP_SIZE).call(sub_function_id);
+
+        Ok(())
     }
 
     pub fn mul(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let mul_function_id = RuntimeFunction::HeapIntMul.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let mul_function_id = RuntimeFunction::HeapIntMul.get(module, Some(compilation_ctx))?;
 
         builder.i32_const(Self::HEAP_SIZE).call(mul_function_id);
+
+        Ok(())
     }
 
     pub fn div(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let div_mod_function_id = RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let div_mod_function_id =
+            RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx))?;
 
         builder
-            .i32_const(Self::HEAP_SIZE)
+            .i32_const(128)
             .i32_const(1)
             .call(div_mod_function_id);
+
+        Ok(())
     }
 
     pub fn remainder(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let div_mod_function_id = RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let div_mod_function_id =
+            RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx))?;
 
         builder
-            .i32_const(Self::HEAP_SIZE)
+            .i32_const(128)
             .i32_const(0)
             .call(div_mod_function_id);
+
+        Ok(())
     }
 
     pub fn equality(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let equality_f_id = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let equality_f_id = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx))?;
         builder.i32_const(Self::HEAP_SIZE).call(equality_f_id);
+        Ok(())
     }
 }
 
@@ -368,12 +391,12 @@ impl IU256 {
         builder: &mut InstrSeqBuilder,
         bytes: &mut std::vec::IntoIter<u8>,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         let bytes: [u8; Self::HEAP_SIZE as usize] = bytes
             .take(Self::HEAP_SIZE as usize)
             .collect::<Vec<u8>>()
             .try_into()
-            .unwrap();
+            .map_err(|_| IntermediateTypeError::CouldNotProcessByteArray)?;
 
         let pointer = module.locals.add(ValType::I32);
 
@@ -386,7 +409,9 @@ impl IU256 {
         while offset < bytes.len() {
             builder.local_get(pointer);
             builder.i64_const(i64::from_le_bytes(
-                bytes[offset..offset + 8].try_into().unwrap(),
+                bytes[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| IntermediateTypeError::CouldNotProcessByteArray)?,
             ));
             builder.store(
                 compilation_ctx.memory_id,
@@ -401,6 +426,8 @@ impl IU256 {
         }
 
         builder.local_get(pointer);
+
+        Ok(())
     }
 
     pub fn bit_or(
@@ -450,7 +477,7 @@ impl IU256 {
         module: &mut walrus::Module,
         original_type: IntermediateType,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         match original_type {
             IntermediateType::IU8 | IntermediateType::IU16 | IntermediateType::IU32 => {
                 let value_local = module.locals.add(ValType::I32);
@@ -530,99 +557,118 @@ impl IU256 {
                 builder.local_get(pointer);
             }
             IntermediateType::IU256 => {}
-            t => panic!("type stack error: trying to cast {t:?}"),
+            t => return Err(IntermediateTypeError::InvalidCast(t.clone())),
         }
+
+        Ok(())
     }
 
     pub fn add(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let add_function_id = RuntimeFunction::HeapIntSum.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let add_function_id = RuntimeFunction::HeapIntSum.get(module, Some(compilation_ctx))?;
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(compilation_ctx.allocator);
         builder.i32_const(Self::HEAP_SIZE).call(add_function_id);
+
+        Ok(())
     }
 
     pub fn bit_shift_left(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         let shift_left_function_id =
-            RuntimeFunction::HeapIntShiftLeft.get(module, Some(compilation_ctx));
+            RuntimeFunction::HeapIntShiftLeft.get(module, Some(compilation_ctx))?;
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(shift_left_function_id);
+
+        Ok(())
     }
 
     pub fn bit_shift_right(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), IntermediateTypeError> {
         let shift_right_function_id =
-            RuntimeFunction::HeapIntShiftRight.get(module, Some(compilation_ctx));
+            RuntimeFunction::HeapIntShiftRight.get(module, Some(compilation_ctx))?;
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(shift_right_function_id);
+
+        Ok(())
     }
 
     pub fn sub(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let sub_function_id = RuntimeFunction::HeapIntSub.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let sub_function_id = RuntimeFunction::HeapIntSub.get(module, Some(compilation_ctx))?;
         builder
             .i32_const(Self::HEAP_SIZE)
             .call(compilation_ctx.allocator);
         builder.i32_const(Self::HEAP_SIZE).call(sub_function_id);
+
+        Ok(())
     }
 
     pub fn mul(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let mul_function_id = RuntimeFunction::HeapIntMul.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let mul_function_id = RuntimeFunction::HeapIntMul.get(module, Some(compilation_ctx))?;
         builder.i32_const(Self::HEAP_SIZE).call(mul_function_id);
+        Ok(())
     }
 
     pub fn div(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let div_mod_function_id = RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let div_mod_function_id =
+            RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx))?;
 
         builder
-            .i32_const(Self::HEAP_SIZE)
+            .i32_const(256)
             .i32_const(1)
             .call(div_mod_function_id);
+
+        Ok(())
     }
 
     pub fn remainder(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let div_mod_function_id = RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let div_mod_function_id =
+            RuntimeFunction::HeapIntDivMod.get(module, Some(compilation_ctx))?;
 
         builder
-            .i32_const(Self::HEAP_SIZE)
+            .i32_const(256)
             .i32_const(0)
             .call(div_mod_function_id);
+
+        Ok(())
     }
 
     pub fn equality(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let equality_f_id = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let equality_f_id = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx))?;
         builder.i32_const(Self::HEAP_SIZE).call(equality_f_id);
+
+        Ok(())
     }
 }

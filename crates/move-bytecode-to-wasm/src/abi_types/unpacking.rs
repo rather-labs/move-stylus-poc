@@ -1,8 +1,14 @@
+use error::AbiUnpackError;
 use walrus::{InstrSeqBuilder, LocalId, Module, ValType};
 
 use crate::{
     CompilationContext,
+    compilation_context::{
+        ModuleId,
+        reserved_modules::{SF_MODULE_NAME_OBJECT, STYLUS_FRAMEWORK_ADDRESS},
+    },
     data::DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET,
+    native_functions::NativeFunction,
     runtime::RuntimeFunction,
     translation::intermediate_types::{
         IntermediateType,
@@ -12,15 +18,24 @@ use crate::{
         heap_integers::{IU128, IU256},
         reference::{IMutRef, IRef},
         simple_integers::{IU8, IU16, IU32, IU64},
+        structs::IStruct,
         vector::IVector,
     },
-    vm_handled_types::{VmHandledType, tx_context::TxContext},
+    vm_handled_types::{
+        VmHandledType, bytes::Bytes, fallback::Calldata, named_id::NamedId, string::String_,
+        tx_context::TxContext, uid::Uid,
+    },
 };
 
+use super::error::AbiError;
+
+pub(crate) mod error;
+mod unpack_bytes;
 mod unpack_enum;
 mod unpack_heap_int;
 mod unpack_native_int;
 mod unpack_reference;
+mod unpack_string;
 mod unpack_struct;
 mod unpack_vector;
 
@@ -41,7 +56,7 @@ pub trait Unpackable {
         reader_pointer: LocalId,
         calldata_reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    );
+    ) -> Result<(), AbiError>;
 }
 
 /// Builds the instructions to unpack the abi encoded values to WASM function parameters
@@ -54,7 +69,7 @@ pub fn build_unpack_instructions<T: Unpackable>(
     function_arguments_signature: &[T],
     args_pointer: LocalId,
     compilation_ctx: &CompilationContext,
-) {
+) -> Result<(), AbiError> {
     let reader_pointer = module.locals.add(ValType::I32);
     let calldata_reader_pointer = module.locals.add(ValType::I32);
 
@@ -71,8 +86,10 @@ pub fn build_unpack_instructions<T: Unpackable>(
             reader_pointer,
             calldata_reader_pointer,
             compilation_ctx,
-        );
+        )?;
     }
+
+    Ok(())
 }
 
 impl Unpackable for IntermediateType {
@@ -83,7 +100,7 @@ impl Unpackable for IntermediateType {
         reader_pointer: LocalId,
         calldata_reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         match self {
             IntermediateType::IBool => IBool::add_unpack_instructions(
                 function_builder,
@@ -91,56 +108,56 @@ impl Unpackable for IntermediateType {
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IU8 => IU8::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IU16 => IU16::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IU32 => IU32::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IU64 => IU64::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IU128 => IU128::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IU256 => IU256::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IAddress => IAddress::add_unpack_instructions(
                 function_builder,
                 module,
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IVector(inner) => IVector::add_unpack_instructions(
                 inner,
                 function_builder,
@@ -148,7 +165,7 @@ impl Unpackable for IntermediateType {
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             // The signer must not be unpacked here, since it can't be part of the calldata. It is
             // injected directly by the VM into the stack
             IntermediateType::ISigner => (),
@@ -159,7 +176,7 @@ impl Unpackable for IntermediateType {
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
             IntermediateType::IMutRef(inner) => IMutRef::add_unpack_instructions(
                 inner,
                 function_builder,
@@ -167,28 +184,54 @@ impl Unpackable for IntermediateType {
                 reader_pointer,
                 calldata_reader_pointer,
                 compilation_ctx,
-            ),
+            )?,
 
-            IntermediateType::IStruct { module_id, index }
-                if TxContext::is_vm_type(module_id, *index, compilation_ctx) =>
-            {
+            IntermediateType::IStruct {
+                module_id, index, ..
+            } if TxContext::is_vm_type(module_id, *index, compilation_ctx)? => {
                 TxContext::inject(function_builder, module, compilation_ctx);
             }
-            IntermediateType::IStruct { module_id, index } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
+            IntermediateType::IStruct {
+                module_id, index, ..
+            } if String_::is_vm_type(module_id, *index, compilation_ctx)? => {
+                String_::add_unpack_instructions(
+                    function_builder,
+                    module,
+                    reader_pointer,
+                    calldata_reader_pointer,
+                    compilation_ctx,
+                )?;
+            }
+            IntermediateType::IStruct {
+                module_id, index, ..
+            } if Calldata::is_vm_type(module_id, *index, compilation_ctx)? => {
+                Calldata::inject(function_builder, module, compilation_ctx);
+            }
+            IntermediateType::IStruct {
+                module_id, index, ..
+            } if Bytes::is_vm_type(module_id, *index, compilation_ctx)? => {
+                Bytes::add_unpack_instructions(function_builder, reader_pointer)?;
+            }
+            IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
+                let struct_ = compilation_ctx.get_struct_by_intermediate_type(self)?;
 
-                if struct_.saved_in_storage {
-                    add_unpack_from_storage_instructions(
+                if struct_.has_key {
+                    load_struct_storage_id(
                         function_builder,
                         module,
                         reader_pointer,
                         calldata_reader_pointer,
                         compilation_ctx,
+                        &struct_,
+                    )?;
+
+                    add_unpack_from_storage_instructions(
+                        function_builder,
+                        module,
+                        compilation_ctx,
                         self,
                         false,
-                    );
+                    )?;
                 } else {
                     // TODO: Check if the struct is TxContext. If it is, panic since the only valid
                     // TxContext is the one defined in the stylus framework.
@@ -199,104 +242,134 @@ impl Unpackable for IntermediateType {
                         reader_pointer,
                         calldata_reader_pointer,
                         compilation_ctx,
-                    );
+                    )?;
                 }
             }
-            IntermediateType::IGenericStructInstance {
-                module_id,
-                index,
-                types,
-            } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_index(module_id, *index)
-                    .unwrap();
-                let struct_instance = struct_.instantiate(types);
-                if struct_instance.saved_in_storage {
-                    add_unpack_from_storage_instructions(
-                        function_builder,
-                        module,
-                        reader_pointer,
-                        calldata_reader_pointer,
-                        compilation_ctx,
-                        self,
-                        false,
-                    );
-                } else {
-                    struct_instance.add_unpack_instructions(
-                        function_builder,
-                        module,
-                        reader_pointer,
-                        calldata_reader_pointer,
-                        compilation_ctx,
-                    )
-                }
-            }
-            IntermediateType::IEnum(enum_index) => {
-                let enum_ = compilation_ctx
-                    .root_module_data
-                    .enums
-                    .get_enum_by_index(*enum_index)
-                    .unwrap();
+            IntermediateType::IEnum { .. } | IntermediateType::IGenericEnumInstance { .. } => {
+                let enum_ = compilation_ctx.get_enum_by_intermediate_type(self)?;
                 if !enum_.is_simple {
-                    panic!(
-                        "cannot abi unpack enum with index {enum_index}, it contains at least one variant with fields"
-                    );
+                    return Err(AbiUnpackError::EnumIsNotSimple(enum_.identifier.to_owned()))?;
                 }
+
                 IEnum::add_unpack_instructions(
-                    enum_,
+                    &enum_,
                     function_builder,
                     module,
                     reader_pointer,
                     compilation_ctx,
-                )
+                )?
             }
             IntermediateType::ITypeParameter(_) => {
-                panic!("cannot unpack generic type parameter");
+                return Err(AbiUnpackError::UnpackingGenericTypeParameter)?;
             }
         }
+        Ok(())
     }
 }
 
-/// This function searches in the storage for the structure that belongs to the object UID passed
-/// as argument.
-fn add_unpack_from_storage_instructions(
+/// This function leaves in the stack a pointer containing the ID for the storage struct about to be
+/// unpacked.
+///
+/// If the first field is a `UID`, we just unpack a IAddress.
+/// If the first field is a `NamedId` we compute the named id.
+/// If none of the above is the first field, we found a compiler error and abort
+fn load_struct_storage_id(
     function_builder: &mut InstrSeqBuilder,
     module: &mut Module,
     reader_pointer: LocalId,
     calldata_reader_pointer: LocalId,
     compilation_ctx: &CompilationContext,
+    struct_: &IStruct,
+) -> Result<(), AbiError> {
+    match struct_.fields.first() {
+        Some(IntermediateType::IStruct {
+            module_id, index, ..
+        }) if Uid::is_vm_type(module_id, *index, compilation_ctx)? => {
+            // First we add the instructions to unpack the UID. We use address to unpack it because ids are
+            // 32 bytes static, same as an address
+            IAddress::add_unpack_instructions(
+                function_builder,
+                module,
+                reader_pointer,
+                calldata_reader_pointer,
+                compilation_ctx,
+            )?;
+        }
+        Some(IntermediateType::IGenericStructInstance {
+            module_id,
+            index,
+            types,
+            ..
+        }) if NamedId::is_vm_type(module_id, *index, compilation_ctx)? => {
+            // We use the native function that computes the ID to leave it in the stack so it can
+            // be used by `add_unpack_from_storage_instructions`
+            let compute_named_id_fn = NativeFunction::get_generic(
+                NativeFunction::NATIVE_COMPUTE_NAMED_ID,
+                module,
+                compilation_ctx,
+                &ModuleId {
+                    address: STYLUS_FRAMEWORK_ADDRESS,
+                    module_name: SF_MODULE_NAME_OBJECT.to_owned(),
+                },
+                types,
+            )
+            .map_err(AbiUnpackError::NativeFunction)?;
+
+            function_builder.call(compute_named_id_fn);
+        }
+        _ => {
+            Err(AbiUnpackError::StorageObjectHasNoId(
+                struct_.identifier.clone(),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// This function searches in the storage for the structure that belongs to the object UID passed
+/// as argument.
+fn add_unpack_from_storage_instructions(
+    builder: &mut InstrSeqBuilder,
+    module: &mut Module,
+    compilation_ctx: &CompilationContext,
     itype: &IntermediateType,
     unpack_frozen: bool,
-) {
-    // First we add the instructions to unpack the UID. We use address to unpack it because ids are
-    // 32 bytes static, same as an address
-    IAddress::add_unpack_instructions(
-        function_builder,
-        module,
-        reader_pointer,
-        calldata_reader_pointer,
-        compilation_ctx,
-    );
-
+) -> Result<(), AbiError> {
     // Search for the object in the objects mappings
     let locate_storage_data_fn =
-        RuntimeFunction::LocateStorageData.get(module, Some(compilation_ctx));
+        RuntimeFunction::LocateStorageData.get(module, Some(compilation_ctx))?;
+
+    let uid_ptr = module.locals.add(ValType::I32);
+    builder.local_tee(uid_ptr);
 
     if unpack_frozen {
-        function_builder.i32_const(1);
+        builder.i32_const(1);
     } else {
-        function_builder.i32_const(0);
+        builder.i32_const(0);
     }
 
-    function_builder.call(locate_storage_data_fn);
+    builder.call(locate_storage_data_fn);
 
     // Read the object
-    let read_struct_from_storage_fn =
-        RuntimeFunction::DecodeAndReadFromStorage.get_generic(module, compilation_ctx, &[itype]);
+    let read_and_decode_from_storage_fn =
+        RuntimeFunction::ReadAndDecodeFromStorage.get_generic(module, compilation_ctx, &[itype])?;
 
-    function_builder
+    // Copy the slot number into a local to avoid overwriting it later
+    let slot_ptr = module.locals.add(ValType::I32);
+    builder
+        .i32_const(32)
+        .call(compilation_ctx.allocator)
+        .local_tee(slot_ptr)
         .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
-        .call(read_struct_from_storage_fn);
+        .i32_const(32)
+        .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
+
+    builder
+        .local_get(slot_ptr)
+        .local_get(uid_ptr)
+        .call(read_and_decode_from_storage_fn);
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -314,7 +387,7 @@ mod tests {
     use super::*;
 
     fn validator(param: u32, param2: u32, param3: u64) {
-        println!("validator: {}, {}, {}", param, param2, param3);
+        println!("validator: {param}, {param2}, {param3}");
 
         assert_eq!(param, 1);
         assert_eq!(param2, 1234);
@@ -349,7 +422,8 @@ mod tests {
             ],
             args_pointer,
             &compilation_ctx,
-        );
+        )
+        .unwrap();
 
         // validation
         func_body.call(validator_func);
@@ -361,7 +435,7 @@ mod tests {
 
         let data =
             <sol!((bool, uint16, uint64))>::abi_encode_params(&(true, 1234, 123456789012345));
-        println!("data: {:?}", data);
+        println!("data: {data:?}");
         let data_len = data.len() as i32;
 
         // Define validator function
@@ -406,7 +480,8 @@ mod tests {
             ],
             args_pointer,
             &compilation_ctx,
-        );
+        )
+        .unwrap();
 
         // validation
         func_body.call(validator_func);
@@ -418,14 +493,14 @@ mod tests {
 
         let data =
             <sol!((uint64, uint16, bool))>::abi_encode_params(&(123456789012345, 1234, true));
-        println!("data: {:?}", data);
+        println!("data: {data:?}");
         let data_len = data.len() as i32;
 
         // Define validator function
         let mut linker = Linker::new(&Engine::default());
         linker
             .func_wrap("", "validator", |param: u64, param2: u32, param3: u32| {
-                println!("validator: {}, {}, {}", param, param2, param3);
+                println!("validator: {param}, {param2}, {param3}");
 
                 assert_eq!(param3, 1);
                 assert_eq!(param2, 1234);
@@ -470,7 +545,8 @@ mod tests {
             ],
             args_pointer,
             &compilation_ctx,
-        );
+        )
+        .unwrap();
 
         // validation
         func_body.call(validator_func);
@@ -484,7 +560,7 @@ mod tests {
             <sol!((bool, uint16, uint64))>::abi_encode_params(&(true, 1234, 123456789012345));
         // Offset data by 10 bytes
         data = [vec![0; 10], data].concat();
-        println!("data: {:?}", data);
+        println!("data: {data:?}");
         let data_len = data.len() as i32;
 
         // Define validator function

@@ -1,10 +1,11 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::reroot_path;
+use crate::error::print_error_diagnostic;
+
+use super::{reroot_path, translate_package_cli};
 use clap::*;
 use move_bytecode_source_map::utils::serialize_to_json_string;
-use move_bytecode_to_wasm::translate_package_cli;
 use move_compiler::compiled_unit::NamedCompiledModule;
 use move_disassembler::disassembler::Disassembler;
 use move_package::{BuildConfig, compilation::compiled_package::CompiledUnitWithSource};
@@ -32,7 +33,12 @@ pub struct Disassemble {
 }
 
 impl Disassemble {
-    pub fn execute(self, path: Option<&Path>, config: BuildConfig) -> anyhow::Result<()> {
+    pub fn execute(
+        self,
+        path: Option<&Path>,
+        config: BuildConfig,
+        verbose: bool,
+    ) -> anyhow::Result<()> {
         let rerooted_path = reroot_path(path)?;
         let Self {
             interactive,
@@ -41,6 +47,8 @@ impl Disassemble {
             debug,
             bytecode_map,
         } = self;
+        let install_dir = config.install_dir.clone();
+
         // Make sure the package is built
         let package = config.compile_package(&rerooted_path, &mut Vec::new())?;
 
@@ -78,7 +86,7 @@ impl Disassemble {
                     if bytecode_map {
                         println!("==========> {}", serialize_to_json_string(&bcode_map)?);
                     }
-                    println!("--> {}", disassemble_string);
+                    println!("--> {disassemble_string}");
                     if debug {
                         println!("\n{:#?}", &unit.unit.module)
                     }
@@ -86,7 +94,12 @@ impl Disassemble {
             }
         }
 
-        translate_package_cli(package, &rerooted_path);
+        if let Err(compilation_error) =
+            translate_package_cli(package, &rerooted_path, install_dir, true, verbose, false)
+        {
+            print_error_diagnostic(*compilation_error)
+        }
+
         Ok(())
     }
 }

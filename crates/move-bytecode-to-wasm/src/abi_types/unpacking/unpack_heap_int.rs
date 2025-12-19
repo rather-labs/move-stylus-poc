@@ -6,6 +6,7 @@ use walrus::{
 
 use crate::{
     CompilationContext,
+    abi_types::error::AbiError,
     runtime::RuntimeFunction,
     translation::intermediate_types::{
         address::IAddress,
@@ -20,9 +21,9 @@ impl IU128 {
         reader_pointer: LocalId,
         _calldata_reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         let encoded_size =
-            sol_data::Uint::<128>::ENCODED_SIZE.expect("U128 should have a fixed size") as i32;
+            sol_data::Uint::<128>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)? as i32;
 
         // The data is padded 16 bytes to the right
         block
@@ -38,7 +39,7 @@ impl IU128 {
 
         // Big-endian to Little-endian
         let swap_i128_bytes_function =
-            RuntimeFunction::SwapI128Bytes.get(module, Some(compilation_ctx));
+            RuntimeFunction::SwapI128Bytes.get(module, Some(compilation_ctx))?;
         block.call(swap_i128_bytes_function);
 
         // Increment reader pointer
@@ -49,6 +50,8 @@ impl IU128 {
             .local_set(reader_pointer);
 
         block.local_get(unpacked_pointer);
+
+        Ok(())
     }
 }
 
@@ -59,9 +62,9 @@ impl IU256 {
         reader_pointer: LocalId,
         _calldata_reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         let encoded_size =
-            sol_data::Uint::<256>::ENCODED_SIZE.expect("U256 should have a fixed size") as i32;
+            sol_data::Uint::<256>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)? as i32;
 
         block.local_get(reader_pointer);
 
@@ -73,7 +76,7 @@ impl IU256 {
 
         // Big-endian to Little-endian
         let swap_i256_bytes_function =
-            RuntimeFunction::SwapI256Bytes.get(module, Some(compilation_ctx));
+            RuntimeFunction::SwapI256Bytes.get(module, Some(compilation_ctx))?;
         block.call(swap_i256_bytes_function);
 
         // Increment reader pointer
@@ -84,6 +87,8 @@ impl IU256 {
             .local_set(reader_pointer);
 
         block.local_get(unpacked_pointer);
+
+        Ok(())
     }
 }
 
@@ -95,9 +100,9 @@ impl IAddress {
         reader_pointer: LocalId,
         _calldata_reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         let encoded_size =
-            sol_data::Address::ENCODED_SIZE.expect("Address should have a fixed size");
+            sol_data::Address::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)? as i32;
 
         block.i32_const(32);
         block.call(compilation_ctx.allocator);
@@ -129,11 +134,13 @@ impl IAddress {
 
         // increment reader pointer
         block.local_get(reader_pointer);
-        block.i32_const(encoded_size as i32);
+        block.i32_const(encoded_size);
         block.binop(BinaryOp::I32Add);
         block.local_set(reader_pointer);
 
         block.local_get(unpacked_pointer);
+
+        Ok(())
     }
 }
 
@@ -164,13 +171,15 @@ mod tests {
         func_body.local_set(args_pointer);
 
         // Args data should already be stored in memory
-        int_type.add_unpack_instructions(
-            &mut func_body,
-            &mut raw_module,
-            args_pointer,
-            args_pointer,
-            &compilation_ctx,
-        );
+        int_type
+            .add_unpack_instructions(
+                &mut func_body,
+                &mut raw_module,
+                args_pointer,
+                args_pointer,
+                &compilation_ctx,
+            )
+            .unwrap();
 
         let function = function_builder.finish(vec![], &mut raw_module.funcs);
         raw_module.exports.add("test_function", function);

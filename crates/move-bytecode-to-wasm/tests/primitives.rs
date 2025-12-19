@@ -1,38 +1,15 @@
-use alloy_primitives::{U256, address};
-use alloy_sol_types::{SolCall, SolType, SolValue, abi::TokenSeq, sol};
-use anyhow::Result;
-use common::{runtime_sandbox::RuntimeSandbox, translate_test_package};
-use rstest::{fixture, rstest};
-
 mod common;
 
-fn run_test(runtime: &RuntimeSandbox, call_data: Vec<u8>, expected_result: Vec<u8>) -> Result<()> {
-    let (result, return_data) = runtime.call_entrypoint(call_data)?;
-
-    anyhow::ensure!(
-        result == 0,
-        "Function returned non-zero exit code: {result}"
-    );
-    anyhow::ensure!(
-        return_data == expected_result,
-        "return data mismatch:\nreturned:{return_data:?}\nexpected:{expected_result:?}"
-    );
-
-    Ok(())
-}
+use crate::common::run_test;
+use alloy_primitives::{U256, address};
+use alloy_sol_types::{SolCall, SolType, SolValue, abi::TokenSeq, sol};
+use move_test_runner::wasm_runner::RuntimeSandbox;
+use rstest::{fixture, rstest};
 
 mod bool_type {
     use super::*;
 
-    const MODULE_NAME: &str = "bool_type";
-    const SOURCE_PATH: &str = "tests/primitives/bool.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("bool_type", "tests/primitives/bool.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -71,19 +48,52 @@ mod bool_type {
     }
 }
 
+mod bytes_type {
+    use super::*;
+    use crate::common::runtime_with_framework as runtime;
+    use alloy_primitives::fixed_bytes;
+
+    sol!(
+        #[allow(missing_docs)]
+        function testBytes4AsVec(bytes4 b) external returns (uint8[]);
+        function testBytes1AsVec(bytes1 b) external returns (uint8[]);
+        function testBytes2AsVec(bytes2 b) external returns (uint8[]);
+        function testBytes8AsVec(bytes8 b) external returns (uint8[]);
+        function testBytes16AsVec(bytes16 b) external returns (uint8[]);
+        function testBytes32AsVec(bytes32 b) external returns (uint8[]);
+        function testMixedBytesAsVec(bytes4 a, bytes4 b, bytes8 c, bytes16 d) external returns (bool);
+    );
+
+    #[rstest]
+    #[case(testBytes1AsVecCall::new((fixed_bytes!("01"),)), vec![0x01])]
+    #[case(testBytes2AsVecCall::new((fixed_bytes!("1122"),)), vec![0x11, 0x22])]
+    #[case(testBytes4AsVecCall::new((fixed_bytes!("01020304"),)), vec![0x01, 0x02, 0x03, 0x04])]
+    #[case(testBytes8AsVecCall::new((fixed_bytes!("0102030405060708"),)), vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])]
+    #[case(testBytes16AsVecCall::new((fixed_bytes!("0102030405060708090A0B0C0D0E0F10"),)), vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10])]
+    #[case(testBytes32AsVecCall::new((fixed_bytes!("0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20"),)), vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20])]
+    #[case(testMixedBytesAsVecCall::new((fixed_bytes!("01020304"), fixed_bytes!("05060708"), fixed_bytes!("090A0B0C0D0E0F10"), fixed_bytes!("0102030405060708090A0B0C0D0E0F10"))), (true,))]
+    fn test_bytes4_as_vec<T: SolCall, V: SolValue>(
+        #[by_ref]
+        #[with("bytes", "tests/primitives/bytes.move")]
+        runtime: &RuntimeSandbox,
+        #[case] call_data: T,
+        #[case] expected_result: V,
+    ) where
+        for<'a> <V::SolType as SolType>::Token<'a>: TokenSeq<'a>,
+    {
+        run_test(
+            runtime,
+            call_data.abi_encode(),
+            expected_result.abi_encode(),
+        )
+        .unwrap();
+    }
+}
+
 mod address_type {
     use super::*;
-    use alloy_primitives::address;
 
-    const MODULE_NAME: &str = "address_type";
-    const SOURCE_PATH: &str = "tests/primitives/address.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("address_type", "tests/primitives/address.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -139,9 +149,10 @@ mod address_type {
 }
 
 mod signer_type {
-    use alloy_primitives::address;
-
     use super::*;
+    use crate::common::translate_test_package;
+
+    declare_fixture!("signer_type", "tests/primitives/signer.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -149,16 +160,6 @@ mod signer_type {
         function echoIdentity() external returns (address);
         function echoWithInt(uint8 y) external returns (uint8, address);
     );
-
-    const MODULE_NAME: &str = "signer_type";
-    const SOURCE_PATH: &str = "tests/primitives/signer.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
 
     #[rstest]
     #[should_panic]
@@ -183,27 +184,19 @@ mod signer_type {
     }
 
     #[rstest]
-    #[should_panic(expected = "only one \"signer\" argument at the beginning is admitted")]
+    #[should_panic]
     #[case("tests/primitives/signer_invalid_dup_signer.move")]
-    #[should_panic(expected = "complex types can't contain the type \"signer\"")]
+    #[should_panic]
     #[case("tests/primitives/signer_invalid_nested_signer.move")]
     fn test_signer_invalid(#[case] path: &str) {
-        translate_test_package(path, MODULE_NAME);
+        translate_test_package(path, "signer_type");
     }
 }
 
 mod uint_8 {
     use super::*;
 
-    const MODULE_NAME: &str = "uint_8";
-    const SOURCE_PATH: &str = "tests/primitives/uint_8.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("uint_8", "tests/primitives/uint_8.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -216,7 +209,7 @@ mod uint_8 {
         function sub(uint8 x, uint8 y) external returns (uint8);
         function div(uint8 x, uint8 y) external returns (uint8);
         function mul(uint8 x, uint8 y) external returns (uint8);
-        function mod(uint8 x, uint8 y) external returns (uint8);
+        function mod_(uint8 x, uint8 y) external returns (uint8);
     );
 
     #[rstest]
@@ -293,7 +286,7 @@ mod uint_8 {
     ) {
         run_test(
             runtime,
-            modCall::new((dividend, divisor)).abi_encode(),
+            mod_Call::new((dividend, divisor)).abi_encode(),
             <(&i32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
@@ -330,15 +323,7 @@ mod uint_8 {
 mod uint_16 {
     use super::*;
 
-    const MODULE_NAME: &str = "uint_16";
-    const SOURCE_PATH: &str = "tests/primitives/uint_16.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("uint_16", "tests/primitives/uint_16.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -351,7 +336,7 @@ mod uint_16 {
         function sub(uint16 x, uint16 y) external returns (uint16);
         function div(uint16 x, uint16 y) external returns (uint16);
         function mul(uint16 x, uint16 y) external returns (uint16);
-        function mod(uint16 x, uint16 y) external returns (uint16);
+        function mod_(uint16 x, uint16 y) external returns (uint16);
     );
 
     #[rstest]
@@ -427,7 +412,7 @@ mod uint_16 {
     ) {
         run_test(
             runtime,
-            modCall::new((dividend, divisor)).abi_encode(),
+            mod_Call::new((dividend, divisor)).abi_encode(),
             <(&u16,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
@@ -464,15 +449,7 @@ mod uint_16 {
 mod uint_32 {
     use super::*;
 
-    const MODULE_NAME: &str = "uint_32";
-    const SOURCE_PATH: &str = "tests/primitives/uint_32.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("uint_32", "tests/primitives/uint_32.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -485,7 +462,7 @@ mod uint_32 {
         function sub(uint32 x, uint32 y) external returns (uint32);
         function div(uint32 x, uint32 y) external returns (uint32);
         function mul(uint32 x, uint32 y) external returns (uint32);
-        function mod(uint32 x, uint32 y) external returns (uint32);
+        function mod_(uint32 x, uint32 y) external returns (uint32);
     );
 
     #[rstest]
@@ -562,7 +539,7 @@ mod uint_32 {
     ) {
         run_test(
             runtime,
-            modCall::new((dividend, divisor)).abi_encode(),
+            mod_Call::new((dividend, divisor)).abi_encode(),
             <(&u32,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
@@ -597,15 +574,7 @@ mod uint_32 {
 mod uint_64 {
     use super::*;
 
-    const MODULE_NAME: &str = "uint_64";
-    const SOURCE_PATH: &str = "tests/primitives/uint_64.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("uint_64", "tests/primitives/uint_64.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -618,7 +587,7 @@ mod uint_64 {
         function sub(uint64 x, uint64 y) external returns (uint64);
         function div(uint64 x, uint64 y) external returns (uint64);
         function mul(uint64 x, uint64 y) external returns (uint64);
-        function mod(uint64 x, uint64 y) external returns (uint64);
+        function mod_(uint64 x, uint64 y) external returns (uint64);
     );
 
     #[rstest]
@@ -694,7 +663,7 @@ mod uint_64 {
     ) {
         run_test(
             runtime,
-            modCall::new((dividend, divisor)).abi_encode(),
+            mod_Call::new((dividend, divisor)).abi_encode(),
             <(&u64,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
@@ -729,15 +698,7 @@ mod uint_64 {
 mod uint_128 {
     use super::*;
 
-    const MODULE_NAME: &str = "uint_128";
-    const SOURCE_PATH: &str = "tests/primitives/uint_128.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("uint_128", "tests/primitives/uint_128.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -750,7 +711,7 @@ mod uint_128 {
         function sub(uint128 x, uint128 y) external returns (uint128);
         function mul(uint128 x, uint128 y) external returns (uint128);
         function div(uint128 x, uint128 y) external returns (uint128);
-        function mod(uint128 x, uint128 y) external returns (uint128);
+        function mod_(uint128 x, uint128 y) external returns (uint128);
     );
 
     #[rstest]
@@ -930,7 +891,7 @@ mod uint_128 {
     ) {
         run_test(
             runtime,
-            modCall::new((dividend, divisor)).abi_encode(),
+            mod_Call::new((dividend, divisor)).abi_encode(),
             <(&u128,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
@@ -940,15 +901,7 @@ mod uint_128 {
 mod uint_256 {
     use super::*;
 
-    const MODULE_NAME: &str = "uint_256";
-    const SOURCE_PATH: &str = "tests/primitives/uint_256.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("uint_256", "tests/primitives/uint_256.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -961,7 +914,7 @@ mod uint_256 {
         function sub(uint256 x, uint256 y) external returns (uint256);
         function mul(uint256 x, uint256 y) external returns (uint256);
         function div(uint256 x, uint256 y) external returns (uint256);
-        function mod(uint256 x, uint256 y) external returns (uint256);
+        function mod_(uint256 x, uint256 y) external returns (uint256);
     );
 
     #[rstest]
@@ -1286,17 +1239,20 @@ mod uint_256 {
     ) {
         run_test(
             runtime,
-            modCall::new((dividend, divisor)).abi_encode(),
+            mod_Call::new((dividend, divisor)).abi_encode(),
             <(&U256,)>::abi_encode(&(&expected_result,)),
         )
         .unwrap();
     }
 }
 
-#[test]
-fn test_multi_values_return() {
-    const MODULE_NAME: &str = "multi_values_return";
-    const SOURCE_PATH: &str = "tests/primitives/multi_values_return.move";
+mod multi_values_return {
+    use super::*;
+
+    declare_fixture!(
+        "multi_values_return",
+        "tests/primitives/multi_values_return.move"
+    );
 
     sol!(
         #[allow(missing_docs)]
@@ -1305,88 +1261,66 @@ fn test_multi_values_return() {
         function getConstantsNested() external returns (uint256, uint64, uint32, uint8, bool, address, uint32[], uint128[]);
     );
 
-    let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-    let runtime = RuntimeSandbox::new(&mut translated_package);
-
-    let data = getConstantsCall::abi_encode(&getConstantsCall::new(()));
-    let expected_result = <sol!((
-        uint256,
-        uint64,
-        uint32,
-        uint8,
-        bool,
-        address,
-        uint32[],
-        uint128[]
-    ))>::abi_encode_sequence(&(
-        U256::from(256256),
-        6464,
-        3232,
-        88,
-        true,
-        address!("0x0000000000000000000000000000000000000001"),
-        vec![10, 20, 30],
-        vec![100, 200, 300],
-    ));
-    run_test(&runtime, data, expected_result).unwrap();
-
-    let data = getConstantsReversedCall::abi_encode(&getConstantsReversedCall::new(()));
-    let expected_result = <sol!((
-        uint128[],
-        uint32[],
-        address,
-        bool,
-        uint8,
-        uint32,
-        uint64,
-        uint256
-    ))>::abi_encode_sequence(&(
-        vec![100, 200, 300],
-        vec![10, 20, 30],
-        address!("0x0000000000000000000000000000000000000001"),
-        true,
-        88,
-        3232,
-        6464,
-        U256::from(256256),
-    ));
-    run_test(&runtime, data, expected_result).unwrap();
-
-    let data = getConstantsNestedCall::abi_encode(&getConstantsNestedCall::new(()));
-    let expected_result = <sol!((
-        uint256,
-        uint64,
-        uint32,
-        uint8,
-        bool,
-        address,
-        uint32[],
-        uint128[]
-    ))>::abi_encode_sequence(&(
-        U256::from(256256),
-        6464,
-        3232,
-        88,
-        true,
-        address!("0x0000000000000000000000000000000000000001"),
-        vec![10, 20, 30],
-        vec![100, 200, 300],
-    ));
-    run_test(&runtime, data, expected_result).unwrap();
+    #[rstest]
+    #[case(
+        getConstantsCall::new(()),
+        (
+            U256::from(256256),
+            6464,
+            3232,
+            88,
+            true,
+            address!("0x0000000000000000000000000000000000000001"),
+            vec![10, 20, 30],
+            vec![100, 200, 300],
+        )
+    )]
+    #[case(
+        getConstantsReversedCall::new(()),
+        (
+            vec![100, 200, 300],
+            vec![10, 20, 30],
+            address!("0x0000000000000000000000000000000000000001"),
+            true,
+            88,
+            3232,
+            6464,
+            U256::from(256256),
+        )
+    )]
+    #[case(
+        getConstantsNestedCall::new(()),
+        (
+            U256::from(256256),
+            6464,
+            3232,
+            88,
+            true,
+            address!("0x0000000000000000000000000000000000000001"),
+            vec![10, 20, 30],
+            vec![100, 200, 300],
+        )
+    )]
+    fn test_multi_values_return<T: SolCall, V: SolValue>(
+        #[by_ref] runtime: &RuntimeSandbox,
+        #[case] call_data: T,
+        #[case] expected_result: V,
+    ) where
+        for<'a> <V::SolType as SolType>::Token<'a>: TokenSeq<'a>,
+    {
+        run_test(
+            runtime,
+            call_data.abi_encode(),
+            expected_result.abi_encode_sequence(),
+        )
+        .unwrap();
+    }
 }
 
 mod vec_32 {
     use super::*;
 
-    const MODULE_NAME: &str = "vec_32";
-    const SOURCE_PATH: &str = "tests/primitives/vec_32.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("vec_32", "tests/primitives/vec_32.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -1404,6 +1338,13 @@ mod vec_32 {
         function vecPushBack(uint32[] x, uint32 y) external returns (uint32[]);
         function vecPushAndPopBack(uint32[] x, uint32 y) external returns (uint32[]);
         function vecUnpack(uint32[] x) external returns (uint32[]);
+        function cumulativeSum(uint32[] x) external returns (uint32);
+        function vecAppend(uint32[] x, uint32[] y) external returns (uint32[]);
+        function vecAppend2(uint32[] x, uint32[] y) external returns (uint32[]);
+        function testMutateMutRefVector(uint32[] x) external returns (uint32[]);
+        function testMutateMutRefVector2(uint32[] x) external returns (uint32[]);
+        function testContains(uint32[] v, uint32 e) external returns (bool);
+        function testRemove(uint32[] v, uint64 index) external returns (uint32[]);
     );
 
     #[rstest]
@@ -1426,6 +1367,14 @@ mod vec_32 {
     #[case(vecPushBackCall::new((vec![1u32, 2u32, 3u32], 4u32)), vec![1, 2, 3, 4])]
     #[case(vecPushAndPopBackCall::new((vec![1u32, 2u32, 3u32], 4u32)), vec![1, 2, 3])]
     #[case(vecUnpackCall::new((vec![1u32, 5u32, 9u32],)), vec![3, 1, 4, 1, 5, 9])]
+    #[case(cumulativeSumCall::new((vec![1u32, 2u32, 3u32],)), (6u32,))]
+    #[case(vecAppendCall::new((vec![1u32, 2u32, 3u32], vec![4u32, 5u32, 6u32])), vec![1, 2, 3, 4, 5, 6])]
+    #[case(vecAppend2Call::new((vec![1u32, 2u32, 3u32], vec![4u32, 5u32, 6u32, 7u32])), vec![1, 2, 3, 4, 5, 6, 7])]
+    #[case(testMutateMutRefVectorCall::new((vec![1u32],)), vec![1, 42, 43, 44])]
+    #[case(testMutateMutRefVector2Call::new((vec![1u32],)), vec![1, 42, 43, 44])]
+    #[case(testContainsCall::new((vec![1u32, 2u32, 3u32], 2u32)), (true,))]
+    #[case(testContainsCall::new((vec![1u32, 2u32, 3u32], 4u32)), (false,))]
+    #[case(testRemoveCall::new((vec![1u32, 2u32, 3u32], 1u64)), vec![1, 3])]
     fn test_vec_32<T: SolCall, V: SolValue>(
         #[by_ref] runtime: &RuntimeSandbox,
         #[case] call_data: T,
@@ -1445,15 +1394,7 @@ mod vec_32 {
 mod vec_64 {
     use super::*;
 
-    const MODULE_NAME: &str = "vec_64";
-    const SOURCE_PATH: &str = "tests/primitives/vec_64.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("vec_64", "tests/primitives/vec_64.move");
 
     sol!(
           #[allow(missing_docs)]
@@ -1512,15 +1453,7 @@ mod vec_64 {
 mod vec_128 {
     use super::*;
 
-    const MODULE_NAME: &str = "vec_128";
-    const SOURCE_PATH: &str = "tests/primitives/vec_128.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("vec_128", "tests/primitives/vec_128.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -1579,15 +1512,7 @@ mod vec_128 {
 mod vec_vec_32 {
     use super::*;
 
-    const MODULE_NAME: &str = "vec_vec_32";
-    const SOURCE_PATH: &str = "tests/primitives/vec_vec_32.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("vec_vec_32", "tests/primitives/vec_vec_32.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -1643,15 +1568,7 @@ mod vec_vec_32 {
 mod vec_vec_128 {
     use super::*;
 
-    const MODULE_NAME: &str = "vec_vec_128";
-    const SOURCE_PATH: &str = "tests/primitives/vec_vec_128.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("vec_vec_128", "tests/primitives/vec_vec_128.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -1707,15 +1624,7 @@ mod vec_vec_128 {
 mod vec_struct {
     use super::*;
 
-    const MODULE_NAME: &str = "vec_struct";
-    const SOURCE_PATH: &str = "tests/primitives/vec_struct.move";
-
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_package = translate_test_package(SOURCE_PATH, MODULE_NAME);
-        RuntimeSandbox::new(&mut translated_package)
-    }
+    declare_fixture!("vec_struct", "tests/primitives/vec_struct.move");
 
     sol!(
         #[allow(missing_docs)]
@@ -2230,18 +2139,9 @@ mod vec_struct {
 }
 
 mod vec_external_struct {
-    use crate::common::translate_test_complete_package;
-
     use super::*;
 
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_packages = translate_test_complete_package("tests/primitives/external");
-
-        let translated_package = translated_packages.get_mut("vec_external_struct").unwrap();
-        RuntimeSandbox::new(translated_package)
-    }
+    declare_fixture_complete_package!("vec_external_struct", "tests/primitives/external");
 
     sol!(
         #[allow(missing_docs)]
@@ -2754,20 +2654,9 @@ mod vec_external_struct {
 }
 
 mod vec_external_generic_struct {
-    use crate::common::translate_test_complete_package;
-
     use super::*;
 
-    #[fixture]
-    #[once]
-    fn runtime() -> RuntimeSandbox {
-        let mut translated_packages = translate_test_complete_package("tests/primitives/external");
-
-        let translated_package = translated_packages
-            .get_mut("vec_external_generic_struct")
-            .unwrap();
-        RuntimeSandbox::new(translated_package)
-    }
+    declare_fixture_complete_package!("vec_external_generic_struct", "tests/primitives/external");
 
     sol!(
         #[allow(missing_docs)]

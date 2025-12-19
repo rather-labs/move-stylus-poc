@@ -1,11 +1,12 @@
 use walrus::{FunctionBuilder, FunctionId, Module, ValType};
 
 use crate::{
-    CompilationContext, get_generic_function_name,
-    translation::intermediate_types::IntermediateType,
+    CompilationContext,
+    compilation_context::ModuleId,
+    translation::intermediate_types::{IntermediateType, structs::IStructType},
 };
 
-use super::NativeFunction;
+use super::{NativeFunction, error::NativeFunctionError};
 
 /// Checks if the given signature token is a one-time witness type.
 //
@@ -18,17 +19,21 @@ pub fn add_is_one_time_witness_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
     itype: &IntermediateType,
-) -> FunctionId {
+    module_id: &ModuleId,
+) -> Result<FunctionId, NativeFunctionError> {
     // TODO: should we check if itype is a reference to a struct here?
-    let name = get_generic_function_name(NativeFunction::NATIVE_IS_ONE_TIME_WITNESS, &[itype]);
+    let name = NativeFunction::get_generic_function_name(
+        NativeFunction::NATIVE_IS_ONE_TIME_WITNESS,
+        compilation_ctx,
+        &[itype],
+        module_id,
+    )?;
 
     if let Some(function) = module.funcs.by_name(&name) {
-        return function;
+        return Ok(function);
     };
 
-    let struct_ = compilation_ctx
-        .get_struct_by_intermediate_type(itype)
-        .unwrap();
+    let struct_ = compilation_ctx.get_struct_by_intermediate_type(itype)?;
 
     // Function declaration
     let mut function = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::I32]);
@@ -36,11 +41,11 @@ pub fn add_is_one_time_witness_fn(
 
     let ptr = module.locals.add(ValType::I32);
 
-    if struct_.is_one_time_witness {
+    if struct_.type_ == IStructType::OneTimeWitness {
         builder.i32_const(1);
     } else {
         builder.i32_const(0);
     }
 
-    function.finish(vec![ptr], &mut module.funcs)
+    Ok(function.finish(vec![ptr], &mut module.funcs))
 }

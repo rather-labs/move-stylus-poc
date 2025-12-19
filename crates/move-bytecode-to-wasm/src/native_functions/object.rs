@@ -1,11 +1,12 @@
-use super::NativeFunction;
+use super::{NativeFunction, error::NativeFunctionError};
 use crate::{
     CompilationContext,
+    compilation_context::ModuleId,
     hostio::host_functions::{
-        block_number, block_timestamp, emit_log, native_keccak256, storage_cache_bytes32,
+        block_number, block_timestamp, native_keccak256, storage_cache_bytes32,
         storage_flush_cache, storage_load_bytes32,
     },
-    translation::intermediate_types::address::IAddress,
+    translation::intermediate_types::{IntermediateType, address::IAddress},
     utils::keccak_string_to_memory,
 };
 use walrus::{
@@ -13,17 +14,110 @@ use walrus::{
     ir::{BinaryOp, LoadKind, MemArg, StoreKind},
 };
 
+pub fn add_compute_named_id_fn(
+    module: &mut Module,
+    compilation_ctx: &CompilationContext,
+    itype: &IntermediateType,
+    module_id: &ModuleId,
+) -> Result<FunctionId, NativeFunctionError> {
+    let name = NativeFunction::get_generic_function_name(
+        NativeFunction::NATIVE_COMPUTE_NAMED_ID,
+        compilation_ctx,
+        &[itype],
+        module_id,
+    )?;
+    if let Some(function) = module.funcs.by_name(&name) {
+        return Ok(function);
+    };
+
+    if let IntermediateType::IStruct {
+        module_id, index, ..
+    } = itype
+    {
+        let mut function = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
+
+        let id_ptr = module.locals.add(ValType::I32);
+
+        let mut builder = function.name(name).func_body();
+
+        // ID
+        builder
+            .i32_const(IAddress::HEAP_SIZE)
+            .call(compilation_ctx.allocator)
+            .local_set(id_ptr);
+
+        let struct_ = compilation_ctx.get_struct_by_index(module_id, *index)?;
+
+        // Store the keccak256 hash of the counter key into linear memory at #counter_key_ptr
+        keccak_string_to_memory(&mut builder, compilation_ctx, &struct_.identifier, id_ptr);
+
+        // Return the ID ptr
+        builder.local_get(id_ptr);
+
+        Ok(function.finish(vec![], &mut module.funcs))
+    } else {
+        Err(NativeFunctionError::WrongGenericType(
+            NativeFunction::NATIVE_COMPUTE_NAMED_ID.to_owned(),
+            itype.clone(),
+        ))
+    }
+}
+
+/// Takes a reference of a NamedId<T> and returns it casted as a UID
+///
+/// This function is used internally by the stylus framework
+pub fn add_as_uid_fn(
+    module: &mut Module,
+    compilation_ctx: &CompilationContext,
+    module_id: &ModuleId,
+) -> FunctionId {
+    let name = NativeFunction::get_function_name(NativeFunction::NATIVE_AS_UID, module_id);
+    if let Some(function) = module.funcs.by_name(&name) {
+        return function;
+    };
+
+    let mut function = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::I32]);
+
+    let named_id_ptr = module.locals.add(ValType::I32);
+
+    let mut builder = function.name(name).func_body();
+
+    let result = module.locals.add(ValType::I32);
+    builder
+        .i32_const(4)
+        .call(compilation_ctx.allocator)
+        .local_tee(result)
+        .local_get(named_id_ptr)
+        .store(
+            compilation_ctx.memory_id,
+            StoreKind::I32 { atomic: false },
+            MemArg {
+                align: 0,
+                offset: 0,
+            },
+        );
+
+    builder.local_get(result);
+
+    function.finish(vec![named_id_ptr], &mut module.funcs)
+}
+
 pub fn add_native_fresh_id_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    module_id: &ModuleId,
 ) -> FunctionId {
+    let name = NativeFunction::get_function_name(NativeFunction::NATIVE_FRESH_ID, module_id);
+    if let Some(function) = module.funcs.by_name(&name) {
+        return function;
+    };
+
     let (native_keccak, _) = native_keccak256(module);
     let (block_number, _) = block_number(module);
     let (block_timestamp, _) = block_timestamp(module);
     let (storage_load_fn, _) = storage_load_bytes32(module);
     let (storage_cache_fn, _) = storage_cache_bytes32(module);
     let (storage_flush_cache_fn, _) = storage_flush_cache(module);
-    let (emit_log_fn, _) = emit_log(module);
 
     let mut function = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
 
@@ -32,9 +126,7 @@ pub fn add_native_fresh_id_fn(
     let counter_key_ptr = module.locals.add(ValType::I32); // Pointer for the storage key
     let counter_value_ptr = module.locals.add(ValType::I32); // Pointer to receive value read from storage
 
-    let mut builder = function
-        .name(NativeFunction::NATIVE_FRESH_ID.to_owned())
-        .func_body();
+    let mut builder = function.name(name).func_body();
 
     // Counter key
     builder
@@ -174,13 +266,6 @@ pub fn add_native_fresh_id_fn(
         .call(storage_cache_fn)
         .i32_const(1)
         .call(storage_flush_cache_fn);
-
-    // Emit log with the ID
-    builder
-        .local_get(id_ptr)
-        .i32_const(32)
-        .i32_const(0)
-        .call(emit_log_fn);
 
     // Return the ID ptr
     builder.local_get(id_ptr);

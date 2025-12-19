@@ -5,6 +5,8 @@ use walrus::{
 
 use crate::{CompilationContext, runtime::RuntimeFunction};
 
+use super::error::IntermediateTypeError;
+
 #[derive(Clone, Copy)]
 pub struct IAddress;
 
@@ -17,11 +19,17 @@ impl IAddress {
         builder: &mut InstrSeqBuilder,
         bytes: &mut std::vec::IntoIter<u8>,
         compilation_ctx: &CompilationContext,
-    ) {
-        let bytes: [u8; 32] = bytes.take(32).collect::<Vec<u8>>().try_into().unwrap();
+    ) -> Result<(), IntermediateTypeError> {
+        let bytes: [u8; 32] = bytes
+            .take(32)
+            .collect::<Vec<u8>>()
+            .try_into()
+            .map_err(|_| IntermediateTypeError::CouldNotProcessByteArray)?;
 
         // Ensure the first 12 bytes are 0. Abi encoding restricts the address to be 20 bytes
-        assert!(bytes[0..12].iter().all(|b| *b == 0));
+        if !bytes[0..12].iter().all(|b| *b == 0) {
+            return Err(IntermediateTypeError::ConstantAddressTooLarge);
+        }
 
         let pointer = module.locals.add(ValType::I32);
 
@@ -34,7 +42,9 @@ impl IAddress {
         while offset < bytes.len() {
             builder.local_get(pointer);
             builder.i64_const(i64::from_le_bytes(
-                bytes[offset..offset + 8].try_into().unwrap(),
+                bytes[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| IntermediateTypeError::CouldNotProcessByteArray)?,
             ));
             builder.store(
                 compilation_ctx.memory_id,
@@ -49,14 +59,18 @@ impl IAddress {
         }
 
         builder.local_get(pointer);
+
+        Ok(())
     }
 
     pub fn equality(
         builder: &mut walrus::InstrSeqBuilder,
         module: &mut walrus::Module,
         compilation_ctx: &CompilationContext,
-    ) {
-        let equality_f_id = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx));
+    ) -> Result<(), IntermediateTypeError> {
+        let equality_f_id = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx))?;
         builder.i32_const(Self::HEAP_SIZE).call(equality_f_id);
+
+        Ok(())
     }
 }

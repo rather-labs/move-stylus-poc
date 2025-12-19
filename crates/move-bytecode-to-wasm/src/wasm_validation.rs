@@ -1,18 +1,19 @@
 use walrus::{ExportItem, ImportKind, Module, ValType};
 
+use crate::error::{CompilationError, ICEError, ICEErrorKind};
+
+#[derive(thiserror::Error, Debug)]
 pub enum WasmValidationError {
+    #[error("invalid Wasm: {0}")]
     InvalidWasm(String),
+
+    #[error("invalid Stylus interface: {0}")]
     InvalidStylusInterface(String),
 }
 
-impl std::fmt::Debug for WasmValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WasmValidationError::InvalidWasm(s) => write!(f, "Invalid Wasm: {}", s),
-            WasmValidationError::InvalidStylusInterface(s) => {
-                write!(f, "Invalid Stylus Interface: {}", s)
-            }
-        }
+impl From<WasmValidationError> for CompilationError {
+    fn from(value: WasmValidationError) -> Self {
+        CompilationError::ICE(ICEError::new(ICEErrorKind::WasmValidation(value)))
     }
 }
 
@@ -82,11 +83,11 @@ fn validate_entrypoint_function(module: &mut Module) -> Result<(), WasmValidatio
 }
 
 /// The module should create a local memory with the following characteristics:
-/// - shared: false
-/// - memory64: false
-/// - page_size_log2: None
-/// - initial: 1
-/// - maximum: None
+/// * shared: false
+/// * memory64: false
+/// * page_size_log2: None
+/// * initial: 1
+/// * maximum: None
 ///
 /// And export it as `memory`
 fn validate_memory_export(module: &mut Module) -> Result<(), WasmValidationError> {

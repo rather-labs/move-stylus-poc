@@ -1,0 +1,18 @@
+[package]
+name = "move-evm-abi-generator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+move-compiler.workspace = true
+move-parse-special-attributes.workspace = true
+move-bytecode-to-wasm.workspace = true
+move-package.workspace = true
+move-binary-format.workspace = true
+move-core-types.workspace = true
+serde = "1.0.228"
+serde_json = "1.0.145"
+
+[dev-dependencies]
+move-packages-build.workspace = true
+rstest = "0.25.0"

@@ -1,7 +1,12 @@
-use walrus::{FunctionId, InstrSeqBuilder, LocalId, Module, ValType, ir::BinaryOp};
+use walrus::{
+    FunctionId, GlobalId, InstrSeqBuilder, LocalId, Module, ValType,
+    ir::{BinaryOp, LoadKind, MemArg},
+};
 
 use crate::{
     CompilationContext,
+    data::DATA_ABORT_MESSAGE_PTR_OFFSET,
+    runtime::RuntimeFunction,
     translation::{
         functions::add_unpack_function_return_values_instructions,
         intermediate_types::{ISignature, IntermediateType},
@@ -10,12 +15,13 @@ use crate::{
 };
 
 use super::{
-    function_encoding::{AbiFunctionSelector, move_signature_to_abi_selector},
-    packing::build_pack_instructions,
+    abi_encoding::AbiFunctionSelector, error::AbiError,
+    function_encoding::move_signature_to_abi_selector, packing::build_pack_instructions,
     unpacking::build_unpack_instructions,
 };
 
 #[derive(thiserror::Error, Debug)]
+#[cfg_attr(test, derive(Eq, PartialEq))]
 pub enum PublicFunctionValidationError {
     #[error(r#"error in argument {0} of function "{1}", only one "signer" argument at the beginning is admitted"#)]
     SignatureArgumentPosition(usize, String),
@@ -33,7 +39,8 @@ pub enum PublicFunctionValidationError {
 /// injecting these arguments in the functions and packing the return values using `write_result` host function.
 pub struct PublicFunction<'a> {
     function_id: FunctionId,
-    function_selector: AbiFunctionSelector,
+    pub(crate) function_name: String,
+    pub(crate) function_selector: AbiFunctionSelector,
     signature: &'a ISignature,
 }
 
@@ -43,18 +50,18 @@ impl<'a> PublicFunction<'a> {
         function_name: &str,
         signature: &'a ISignature,
         compilation_ctx: &CompilationContext,
-    ) -> Self {
-        Self::check_signature_arguments(function_name, &signature.arguments)
-            .unwrap_or_else(|e| panic!("ABI error: {e}"));
+    ) -> Result<Self, AbiError> {
+        Self::check_signature_arguments(function_name, &signature.arguments)?;
 
         let function_selector =
-            move_signature_to_abi_selector(function_name, &signature.arguments, compilation_ctx);
+            move_signature_to_abi_selector(function_name, &signature.arguments, compilation_ctx)?;
 
-        Self {
+        Ok(Self {
             function_id,
+            function_name: function_name.to_string(),
             function_selector,
             signature,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -74,9 +81,16 @@ impl<'a> PublicFunction<'a> {
         args_pointer: LocalId,
         args_len: LocalId,
         write_return_data_function: FunctionId,
-        storage_flush_cache_function: FunctionId,
         compilation_ctx: &CompilationContext,
-    ) {
+        dynamic_fields_global_variables: &Vec<(GlobalId, IntermediateType)>,
+    ) -> Result<(), AbiError> {
+        let mut inner_result = Ok(());
+        let commit_changes_to_storage_function = RuntimeFunction::get_commit_changes_to_storage_fn(
+            module,
+            compilation_ctx,
+            dynamic_fields_global_variables,
+        )?;
+
         router_builder.block(None, |block| {
             let block_id = block.id();
 
@@ -111,7 +125,7 @@ impl<'a> PublicFunction<'a> {
             }
 
             // Wrap function to pack/unpack parameters
-            self.wrap_public_function(module, block, args_pointer, compilation_ctx);
+            inner_result = self.wrap_public_function(module, block, args_pointer, compilation_ctx);
 
             // Stack: [return_data_pointer] [return_data_length] [status]
             let status = module.locals.add(ValType::I32);
@@ -121,27 +135,32 @@ impl<'a> PublicFunction<'a> {
             // Stack: [return_data_pointer] [return_data_length]
             block.call(write_return_data_function);
 
-            block.i32_const(0); // Do not clear cache
-            block.call(storage_flush_cache_function);
+            // TODO: This is repeated for every function, we should move this and the return below
+            // outside this into the main body of the entrypoint so we don't needlesly repeat code
+            block.call(commit_changes_to_storage_function);
 
             // Return status
             block.local_get(status);
             block.return_();
         });
+
+        inner_result
     }
 
     /// Wraps the function unpacking input parameters from memory and packing output parameters to memory
     ///
     /// Input parameters are read from memory and unpacked as *abi encoded* values
     /// Output parameters are packed as *abi encoded* values and written to memory
-    fn wrap_public_function(
+    pub fn wrap_public_function(
         &self,
         module: &mut Module,
         block: &mut InstrSeqBuilder,
         args_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
-        let memory_id = module.get_memory_id().expect("memory not found");
+    ) -> Result<(), AbiError> {
+        let status = module.locals.add(ValType::I32);
+        let data_ptr = module.locals.add(ValType::I32);
+        let data_len = module.locals.add(ValType::I32);
 
         build_unpack_instructions(
             block,
@@ -149,28 +168,86 @@ impl<'a> PublicFunction<'a> {
             &self.signature.arguments,
             args_pointer,
             compilation_ctx,
-        );
+        )?;
+
         block.call(self.function_id);
+
+        // Unpack function return values
         add_unpack_function_return_values_instructions(
             block,
             module,
             &self.signature.returns,
-            memory_id,
-        );
+            compilation_ctx.memory_id,
+        )?;
 
         if self.signature.returns.is_empty() {
-            block.i32_const(0).i32_const(0).i32_const(0);
-            return;
+            // Set data_ptr and data_len to 0
+            block.i32_const(0).local_set(data_ptr);
+            block.i32_const(0).local_set(data_len);
+        } else {
+            // Set data_ptr and data_len to the result of packing the return values
+            let (data_ptr_, data_len_) =
+                build_pack_instructions(block, &self.signature.returns, module, compilation_ctx)?;
+            block.local_get(data_ptr_).local_set(data_ptr);
+            block.local_get(data_len_).local_set(data_len);
         }
 
-        // If we pack a unique value we proceed as always
-        let (data_start, data_end) =
-            build_pack_instructions(block, &self.signature.returns, module, compilation_ctx);
+        // Load the abort message pointer from DATA_ABORT_MESSAGE_PTR_OFFSET
+        // If not null, an abort occurred and we need to return the error message
+        block.block(None, |abort_block| {
+            let abort_block_id = abort_block.id();
 
-        block.local_get(data_start).local_get(data_end);
-        // TODO: Define error handling strategy, for now it will always result in traps
-        // So it will only reach this point in the case of success
-        block.i32_const(0);
+            // Load the ptr
+            let ptr = module.locals.add(ValType::I32);
+            abort_block
+                .i32_const(DATA_ABORT_MESSAGE_PTR_OFFSET)
+                .load(
+                    compilation_ctx.memory_id,
+                    LoadKind::I32 { atomic: false },
+                    MemArg {
+                        align: 0,
+                        offset: 0,
+                    },
+                )
+                .local_tee(ptr);
+
+            // Check if the ptr is null
+            abort_block.i32_const(0).binop(BinaryOp::I32Eq);
+
+            // If the ptr is null, jump to the end of the block, skipping the error message loading
+            abort_block.br_if(abort_block_id);
+
+            // Load the abort message length from the ptr and set data_len
+            abort_block
+                .local_get(ptr)
+                .load(
+                    compilation_ctx.memory_id,
+                    LoadKind::I32 { atomic: false },
+                    MemArg {
+                        align: 0,
+                        offset: 0,
+                    },
+                )
+                .local_set(data_len);
+
+            // Load the abort message pointer and set data_ptr
+            abort_block
+                .local_get(ptr)
+                .i32_const(4)
+                .binop(BinaryOp::I32Add)
+                .local_set(data_ptr);
+
+            // Set status to 1
+            abort_block.i32_const(1).local_set(status);
+        });
+
+        // [data_ptr][data_len][status]
+        block
+            .local_get(data_ptr)
+            .local_get(data_len)
+            .local_get(status);
+
+        Ok(())
     }
 
     /// This function checks if the arguments of a public functions is valid. A signature is not
@@ -262,20 +339,49 @@ mod tests {
         linker
             .func_wrap(
                 "vm_hooks",
+                "native_keccak256",
+                |mut caller: wasmtime::Caller<'_, ()>,
+                 input_data_ptr: u32,
+                 data_length: u32,
+                 return_data_ptr: u32| {
+                    let memory = match caller.get_export("memory") {
+                        Some(wasmtime::Extern::Memory(mem)) => mem,
+                        _ => panic!("failed to find host memory"),
+                    };
+
+                    let mut input_data = vec![0; data_length as usize];
+                    memory
+                        .read(&caller, input_data_ptr as usize, &mut input_data)
+                        .unwrap();
+
+                    let hash = alloy_primitives::keccak256(input_data);
+
+                    memory
+                        .write(&mut caller, return_data_ptr as usize, hash.as_slice())
+                        .unwrap();
+
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        linker
+            .func_wrap(
+                "vm_hooks",
                 "write_result",
                 move |mut caller: Caller<'_, ()>,
                       return_data_pointer: u32,
                       return_data_length: u32| {
                     println!("write_result");
-                    println!("return_data_pointer: {}", return_data_pointer);
-                    println!("return_data_length: {}", return_data_length);
+                    println!("return_data_pointer: {return_data_pointer}");
+                    println!("return_data_length: {return_data_length}");
 
                     let mem = get_memory(&mut caller);
 
                     let mut buffer = vec![0; return_data_length as usize];
                     mem.read(&mut caller, return_data_pointer as usize, &mut buffer)
                         .unwrap();
-                    println!("return_data: {:?}", buffer);
+                    println!("return_data: {buffer:?}");
 
                     assert_eq!(buffer, expected_result);
 
@@ -351,7 +457,6 @@ mod tests {
         let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
         // Build mock router
         let (write_return_data_function, _) = host_functions::write_result(module);
-        let (storage_flush_cache_function, _) = host_functions::storage_flush_cache(module);
 
         let selector = module.locals.add(ValType::I32);
         let args_pointer = module.locals.add(ValType::I32);
@@ -384,16 +489,18 @@ mod tests {
         );
         mock_router_body.local_set(selector);
 
-        public_function.build_router_block(
-            &mut mock_router_body,
-            module,
-            selector,
-            args_pointer,
-            args_len,
-            write_return_data_function,
-            storage_flush_cache_function,
-            &compilation_ctx,
-        );
+        public_function
+            .build_router_block(
+                &mut mock_router_body,
+                module,
+                selector,
+                args_pointer,
+                args_len,
+                write_return_data_function,
+                &compilation_ctx,
+                &vec![],
+            )
+            .unwrap();
 
         // if no match, return -1
         mock_router_body.i32_const(-1);
@@ -420,25 +527,45 @@ mod tests {
 
         let mut func_body = function_builder.func_body();
 
-        // Load arguments to stack
-        func_body.local_get(param1);
-        func_body.i32_const(1);
-        func_body.binop(BinaryOp::I32Add);
-
-        func_body.local_get(param2);
-        func_body.i32_const(1);
-        func_body.binop(BinaryOp::I32Add);
-
-        func_body.local_get(param3);
-        func_body.i64_const(1);
-        func_body.binop(BinaryOp::I64Add);
-
         let returns = vec![
             IntermediateType::IU32,
             IntermediateType::IU16,
             IntermediateType::IU64,
         ];
-        prepare_function_return(&mut raw_module, &mut func_body, &returns, &compilation_ctx);
+
+        let result_local_id = raw_module.locals.add(ValType::I32);
+        func_body.block(None, |result_block| {
+            let result_block_id = result_block.id();
+
+            // Compute return values inside the block
+            result_block.local_get(param1);
+            result_block.i32_const(1);
+            result_block.binop(BinaryOp::I32Add);
+
+            result_block.local_get(param2);
+            result_block.i32_const(1);
+            result_block.binop(BinaryOp::I32Add);
+
+            result_block.local_get(param3);
+            result_block.i64_const(1);
+            result_block.binop(BinaryOp::I64Add);
+
+            // Now prepare_function_return can consume the return values from the stack
+            prepare_function_return(
+                &mut raw_module,
+                result_block,
+                &returns,
+                &compilation_ctx,
+                result_block_id,
+                result_local_id,
+            )
+            .unwrap();
+        });
+
+        // Load the result if there are return values
+        if !returns.is_empty() {
+            func_body.local_get(result_local_id);
+        }
 
         let function = function_builder.finish(vec![param1, param2, param3], &mut raw_module.funcs);
         raw_module.exports.add("test_function", function);
@@ -452,7 +579,7 @@ mod tests {
             returns,
         };
         let public_function =
-            PublicFunction::new(function, "test_function", &signature, &compilation_ctx);
+            PublicFunction::new(function, "test_function", &signature, &compilation_ctx).unwrap();
 
         let mut data =
             <sol!((bool, uint16, uint64))>::abi_encode_params(&(true, 1234, 123456789012345));
@@ -497,14 +624,35 @@ mod tests {
 
         let mut func_body = function_builder.func_body();
 
-        func_body.i32_const(1);
-        func_body.local_get(param2);
-        func_body.binop(BinaryOp::I32Add);
-
-        func_body.local_get(param1);
-
         let returns = vec![IntermediateType::IU8, IntermediateType::ISigner];
-        prepare_function_return(&mut raw_module, &mut func_body, &returns, &compilation_ctx);
+
+        let result_local_id = raw_module.locals.add(ValType::I32);
+        func_body.block(None, |result_block| {
+            let result_block_id = result_block.id();
+
+            // Compute return values inside the block
+            result_block.i32_const(1);
+            result_block.local_get(param2);
+            result_block.binop(BinaryOp::I32Add);
+
+            result_block.local_get(param1);
+
+            // Now prepare_function_return can consume the return values from the stack
+            prepare_function_return(
+                &mut raw_module,
+                result_block,
+                &returns,
+                &compilation_ctx,
+                result_block_id,
+                result_local_id,
+            )
+            .unwrap();
+        });
+
+        // Load the result if there are return values
+        if !returns.is_empty() {
+            func_body.local_get(result_local_id);
+        }
 
         let function = function_builder.finish(vec![param1, param2], &mut raw_module.funcs);
         raw_module.exports.add("test_function", function);
@@ -514,7 +662,7 @@ mod tests {
             returns,
         };
         let public_function =
-            PublicFunction::new(function, "test_function", &signature, &compilation_ctx);
+            PublicFunction::new(function, "test_function", &signature, &compilation_ctx).unwrap();
 
         let mut data = <sol!((uint8,))>::abi_encode_params(&(1,));
         data = [public_function.get_selector().to_vec(), data].concat();
@@ -587,7 +735,7 @@ mod tests {
             returns: vec![IntermediateType::IU32],
         };
         let public_function =
-            PublicFunction::new(function, "test_function", &signature, &compilation_ctx);
+            PublicFunction::new(function, "test_function", &signature, &compilation_ctx).unwrap();
 
         let mut data =
             <sol!((bool, uint16, uint64))>::abi_encode_params(&(true, 1234, 123456789012345));
@@ -642,13 +790,10 @@ mod tests {
             ],
             returns: vec![],
         };
-        PublicFunction::new(function, "test_function", &signature, &compilation_ctx);
+        PublicFunction::new(function, "test_function", &signature, &compilation_ctx).unwrap();
     }
 
     #[test]
-    #[should_panic(
-        expected = r#"ABI error: error in argument 2 of function "test_function", only one "signer" argument at the beginning is admitted"#
-    )]
     fn test_fail_public_function_signature() {
         let (mut raw_module, allocator, memory_id) = build_module(None);
         let compilation_ctx = test_compilation_context!(memory_id, allocator);
@@ -671,13 +816,21 @@ mod tests {
             ],
             returns: vec![],
         };
-        PublicFunction::new(function, "test_function", &signature, &compilation_ctx);
+        let err = PublicFunction::new(function, "test_function", &signature, &compilation_ctx)
+            .err()
+            .unwrap();
+
+        let err = match err {
+            AbiError::PublicFunction(e) => e,
+            _ => panic!("expected PublicFunctionValidationError"),
+        };
+        assert_eq!(
+            PublicFunctionValidationError::SignatureArgumentPosition(2, "test_function".to_owned()),
+            err
+        );
     }
 
     #[test]
-    #[should_panic(
-        expected = r#"ABI error: error in argument 3 of function "test_function", complex types can't contain the type "signer""#
-    )]
     fn test_fail_public_function_signature_complex_type() {
         let (mut raw_module, allocator, memory_id) = build_module(None);
         let compilation_ctx = test_compilation_context!(memory_id, allocator);
@@ -700,13 +853,22 @@ mod tests {
             ],
             returns: vec![],
         };
-        PublicFunction::new(function, "test_function", &signature, &compilation_ctx);
+
+        let err = PublicFunction::new(function, "test_function", &signature, &compilation_ctx)
+            .err()
+            .unwrap();
+
+        let err = match err {
+            AbiError::PublicFunction(e) => e,
+            _ => panic!("expected PublicFunctionValidationError"),
+        };
+        assert_eq!(
+            PublicFunctionValidationError::ComplexTypeContainsSigner(3, "test_function".to_owned()),
+            err
+        );
     }
 
     #[test]
-    #[should_panic(
-        expected = r#"ABI error: error in argument 3 of function "test_function", complex types can't contain the type "signer""#
-    )]
     fn test_fail_public_function_signature_complex_type_2() {
         let (mut raw_module, allocator, memory_id) = build_module(None);
         let compilation_ctx = test_compilation_context!(memory_id, allocator);
@@ -731,6 +893,19 @@ mod tests {
             ],
             returns: vec![],
         };
-        PublicFunction::new(function, "test_function", &signature, &compilation_ctx);
+        PublicFunction::new(function, "test_function", &signature, &compilation_ctx).err();
+
+        let err = PublicFunction::new(function, "test_function", &signature, &compilation_ctx)
+            .err()
+            .unwrap();
+
+        let err = match err {
+            AbiError::PublicFunction(e) => e,
+            _ => panic!("expected PublicFunctionValidationError"),
+        };
+        assert_eq!(
+            PublicFunctionValidationError::ComplexTypeContainsSigner(3, "test_function".to_owned()),
+            err
+        );
     }
 }

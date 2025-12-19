@@ -1,4 +1,9 @@
-mod function_encoding;
+pub(crate) mod abi_encoding;
+pub mod error;
+pub mod error_encoding;
+pub(crate) mod event_encoding;
+pub mod function_encoding;
 pub(crate) mod packing;
 pub mod public_function;
-mod unpacking;
+pub mod sol_name;
+pub(crate) mod unpacking;

@@ -10,7 +10,7 @@ public struct Foo has key {
     value: u64
 }
 
-fun init(ctx: &mut TxContext) {
+entry fun init(ctx: &mut TxContext) {
   let foo = Foo {
     id: object::new(ctx),
     value: 101,
@@ -19,10 +19,10 @@ fun init(ctx: &mut TxContext) {
   transfer::share_object(foo);
 }
 
-public fun read_value(foo: &Foo): u64 {
+entry fun read_value(foo: &Foo): u64 {
     foo.value
 }
 
-public fun set_value(foo: &mut Foo, value: u64) {
+entry fun set_value(foo: &mut Foo, value: u64) {
     foo.value = value;
 }

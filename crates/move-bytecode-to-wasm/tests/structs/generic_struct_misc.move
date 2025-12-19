@@ -30,7 +30,7 @@ public struct Baz<T: copy> has drop, copy {
     b: vector<u256>,
 }
 
-public fun create_foo<T: copy>(g: T): Foo<T, u64> {
+fun create_foo<T: copy>(g: T): Foo<T, u64> {
     Foo {
         g,
         q: @0xcafe000000000000000000000000000000007357,
@@ -48,11 +48,11 @@ public fun create_foo<T: copy>(g: T): Foo<T, u64> {
     }
 }
 
-public fun create_foo_u32(g: u32): Foo<u32, u64> {
+entry fun create_foo_u32(g: u32): Foo<u32, u64> {
     create_foo(g)
 }
 
-public fun create_foo_vec_u32(g: vector<u32>): Foo<vector<u32>, u64> {
+entry fun create_foo_vec_u32(g: vector<u32>): Foo<vector<u32>, u64> {
     create_foo(g)
 }
 
@@ -61,10 +61,45 @@ public struct Fu<T: copy> has drop, copy {
     b: vector<T>,
 }
 
-public fun create_fu<T: copy>(t: T): Fu<T> {
+fun create_fu<T: copy>(t: T): Fu<T> {
     Fu {a: t, b: vector[t, t, t]}
 }
 
-public fun create_fu_u32(t: u32): Fu<u32> {
+entry fun create_fu_u32(t: u32): Fu<u32> {
     create_fu(t)
+}
+
+public struct GenericStruct<S, T, U> has drop, copy {
+    a: S,
+    b: T,
+    c: U,
+}
+
+fun inner_create_generic_struct<T>(a: u16, b: T, c: u64): GenericStruct<u16, T, u64> {
+    GenericStruct {a, b, c}
+}
+
+entry fun create_generic_struct(a: u16, b: u32, c: u64): GenericStruct<u16, u32, u64> {
+    inner_create_generic_struct<u32>(a, b, c)
+}
+
+public struct ComplexGenericStruct<S, T, U> has drop, copy {
+    a: S,
+    b: GenericStruct<S, T, U>,
+    c: vector<U>,
+    d: vector<vector<U>>,
+}
+
+fun inner_create_complex_generic_struct<T, U: copy>(a: u16, b: T, c: U): ComplexGenericStruct<u16, T, U> {
+    ComplexGenericStruct {a, b: GenericStruct {a, b, c}, c: vector[c, c, c], d: vector[vector[c], vector[c, c]]}
+}
+
+fun inner_pack_unpack_generic_struct<T: drop, U: drop + copy>(a: u16, t: T, u: U) {
+    let s = ComplexGenericStruct {a, b: GenericStruct{a, b: t, c: u}, c: vector[u, u, u], d: vector[vector[u], vector[u, u]]};
+    let ComplexGenericStruct {a: _a_val, b: _b, c: _c, d: _d} = s;
+}
+
+entry fun create_complex_generic_struct(a: u16, b: u32, c: u64): ComplexGenericStruct<u16, u32, u64> {
+    inner_pack_unpack_generic_struct(a, b, c);
+    inner_create_complex_generic_struct<u32, u64>(a, b, c)
 }

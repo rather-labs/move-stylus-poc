@@ -20,6 +20,22 @@ name = "counter"
 path = "scripts/counter.rs"
 
 [[bin]]
+name = "erc20"
+path = "scripts/erc20.rs"
+
+[[bin]]
+name = "erc721"
+path = "scripts/erc721.rs"
+
+[[bin]]
+name = "cross_contract_call"
+path = "scripts/cross_contract_call.rs"
+
+[[bin]]
+name = "counter_named_id"
+path = "scripts/counter_named_id.rs"
+
+[[bin]]
 name = "counter_with_init"
 path = "scripts/counter_with_init.rs"
 
@@ -27,9 +43,21 @@ path = "scripts/counter_with_init.rs"
 name = "dog_walker"
 path = "scripts/dog_walker.rs"
 
+[[bin]]
+name = "delegated_counter"
+path = "scripts/delegated_counter.rs"
+
+[[bin]]
+name = "delegated_counter_named_id"
+path = "scripts/delegated_counter_named_id.rs"
+
+[[bin]]
+name = "revert_errors"
+path = "scripts/revert_errors.rs"
+
 [dependencies]
 dotenv = "0.15.0"
 eyre = "0.6.8"
 tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] }
-alloy = "1.0.23"
+alloy = "1.1.2"
 

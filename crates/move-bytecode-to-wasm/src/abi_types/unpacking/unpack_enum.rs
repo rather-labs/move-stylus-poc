@@ -4,7 +4,9 @@ use walrus::{
     ir::{BinaryOp, MemArg, StoreKind},
 };
 
-use crate::{CompilationContext, translation::intermediate_types::enums::IEnum};
+use crate::{
+    CompilationContext, abi_types::error::AbiError, translation::intermediate_types::enums::IEnum,
+};
 
 use super::unpack_native_int::unpack_i32_type_instructions;
 
@@ -15,18 +17,19 @@ impl IEnum {
         module: &mut Module,
         reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         let enum_ptr = module.locals.add(ValType::I32);
         let variant_number = module.locals.add(ValType::I32);
 
-        let encoded_size = sol_data::Uint::<8>::ENCODED_SIZE.expect("U8 should have a fixed size");
+        let encoded_size =
+            sol_data::Uint::<8>::ENCODED_SIZE.ok_or(AbiError::UnableToGetTypeAbiSize)?;
         unpack_i32_type_instructions(
             block,
             module,
             compilation_ctx.memory_id,
             reader_pointer,
             encoded_size,
-        );
+        )?;
 
         // Save the variant to check it later
         block.local_tee(variant_number);
@@ -48,19 +51,18 @@ impl IEnum {
             .i32_const(4)
             .call(compilation_ctx.allocator)
             .local_tee(enum_ptr)
-            .local_get(variant_number);
-
-        // Read the variant number
-
-        block.store(
-            compilation_ctx.memory_id,
-            StoreKind::I32 { atomic: false },
-            MemArg {
-                align: 0,
-                offset: 0,
-            },
-        );
+            .local_get(variant_number)
+            .store(
+                compilation_ctx.memory_id,
+                StoreKind::I32 { atomic: false },
+                MemArg {
+                    align: 0,
+                    offset: 0,
+                },
+            );
 
         block.local_get(enum_ptr);
+
+        Ok(())
     }
 }

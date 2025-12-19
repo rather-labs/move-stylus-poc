@@ -4,6 +4,7 @@ use walrus::{
 };
 
 use crate::{
+    abi_types::error::AbiError,
     runtime::RuntimeFunction,
     translation::intermediate_types::{
         address::IAddress,
@@ -18,9 +19,9 @@ impl IU128 {
         local: LocalId,
         writer_pointer: LocalId,
         memory: MemoryId,
-    ) {
+    ) -> Result<(), AbiError> {
         // Little-endian to Big-endian
-        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None);
+        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None)?;
 
         for i in 0..2 {
             block.local_get(writer_pointer);
@@ -48,6 +49,8 @@ impl IU128 {
                 },
             );
         }
+
+        Ok(())
     }
 }
 
@@ -58,9 +61,9 @@ impl IU256 {
         local: LocalId,
         writer_pointer: LocalId,
         memory: MemoryId,
-    ) {
+    ) -> Result<(), AbiError> {
         // Little-endian to Big-endian
-        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None);
+        let swap_i64_bytes_function = RuntimeFunction::SwapI64Bytes.get(module, None)?;
 
         for i in 0..4 {
             block.local_get(writer_pointer);
@@ -87,6 +90,8 @@ impl IU256 {
                 },
             );
         }
+
+        Ok(())
     }
 }
 
@@ -153,19 +158,21 @@ mod tests {
         func_body.call(alloc_function);
         func_body.local_set(local);
 
-        func_body.i32_const(int_type.encoded_size(&compilation_ctx) as i32);
+        func_body.i32_const(int_type.encoded_size(&compilation_ctx).unwrap() as i32);
         func_body.call(alloc_function);
         func_body.local_set(writer_pointer);
 
         // Args data should already be stored in memory
-        int_type.add_pack_instructions(
-            &mut func_body,
-            &mut raw_module,
-            local,
-            writer_pointer,
-            writer_pointer, // unused for this type
-            &compilation_ctx,
-        );
+        int_type
+            .add_pack_instructions(
+                &mut func_body,
+                &mut raw_module,
+                local,
+                writer_pointer,
+                writer_pointer, // unused for this type
+                &compilation_ctx,
+            )
+            .unwrap();
 
         func_body.local_get(writer_pointer);
 

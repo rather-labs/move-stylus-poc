@@ -4,21 +4,23 @@ use walrus::{
 };
 
 use crate::{
-    CompilationContext, runtime::RuntimeFunction, translation::intermediate_types::enums::IEnum,
+    CompilationContext, abi_types::error::AbiError, runtime::RuntimeFunction,
+    translation::intermediate_types::enums::IEnum,
 };
 
 impl IEnum {
     pub fn add_pack_instructions(
+        &self,
         block: &mut InstrSeqBuilder,
         module: &mut Module,
         local: LocalId,
         writer_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         block.local_get(writer_pointer);
 
         // Little-endian to Big-endian
-        let swap_i32_bytes_function = RuntimeFunction::SwapI32Bytes.get(module, None);
+        let swap_i32_bytes_function = RuntimeFunction::SwapI32Bytes.get(module, None)?;
 
         // Read variant number
         block
@@ -42,5 +44,7 @@ impl IEnum {
                 offset: 28,
             },
         );
+
+        Ok(())
     }
 }

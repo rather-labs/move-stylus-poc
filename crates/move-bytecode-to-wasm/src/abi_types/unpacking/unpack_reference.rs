@@ -1,5 +1,7 @@
-use super::Unpackable;
+use super::error::AbiUnpackError;
+use super::{Unpackable, load_struct_storage_id};
 use crate::CompilationContext;
+use crate::abi_types::error::AbiError;
 use crate::abi_types::unpacking::add_unpack_from_storage_instructions;
 use crate::translation::intermediate_types::IntermediateType;
 use crate::translation::intermediate_types::reference::{IMutRef, IRef};
@@ -16,40 +18,47 @@ impl IRef {
         reader_pointer: LocalId,
         calldata_reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         match inner {
             // If inner is a heap type, forward the pointer
-            IntermediateType::IVector(_)
+            IntermediateType::IU128
+            | IntermediateType::IU256
             | IntermediateType::IAddress
             | IntermediateType::ISigner
-            | IntermediateType::IU128
-            | IntermediateType::IU256 => {
+            | IntermediateType::IVector(_)
+            | IntermediateType::IEnum { .. }
+            | IntermediateType::IGenericEnumInstance { .. } => {
                 inner.add_unpack_instructions(
                     builder,
                     module,
                     reader_pointer,
                     calldata_reader_pointer,
                     compilation_ctx,
-                );
+                )?;
             }
             IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
-                let struct_ = compilation_ctx
-                    .get_struct_by_intermediate_type(inner)
-                    .unwrap();
+                let struct_ = compilation_ctx.get_struct_by_intermediate_type(inner)?;
 
                 // This is the only place where we pass the flag unpack_frozen = true.
                 // This is because we only want to unpack frozen objects from the storage
                 // if the object is passed as an immutable reference to the function arguments.
-                if struct_.saved_in_storage {
-                    add_unpack_from_storage_instructions(
+                if struct_.has_key {
+                    load_struct_storage_id(
                         builder,
                         module,
                         reader_pointer,
                         calldata_reader_pointer,
                         compilation_ctx,
+                        &struct_,
+                    )?;
+
+                    add_unpack_from_storage_instructions(
+                        builder,
+                        module,
+                        compilation_ctx,
                         inner,
                         true,
-                    );
+                    )?;
                 } else {
                     inner.add_unpack_instructions(
                         builder,
@@ -57,7 +66,7 @@ impl IRef {
                         reader_pointer,
                         calldata_reader_pointer,
                         compilation_ctx,
-                    );
+                    )?;
                 }
             }
             // For immediates, allocate and store
@@ -68,7 +77,7 @@ impl IRef {
             | IntermediateType::IBool => {
                 let ptr_local = module.locals.add(walrus::ValType::I32);
 
-                builder.i32_const(inner.stack_data_size() as i32);
+                builder.i32_const(inner.stack_data_size()? as i32);
                 builder.call(compilation_ctx.allocator);
                 builder.local_tee(ptr_local);
 
@@ -78,14 +87,14 @@ impl IRef {
                     reader_pointer,
                     calldata_reader_pointer,
                     compilation_ctx,
-                );
+                )?;
 
                 builder.store(
                     compilation_ctx.memory_id,
-                    match inner.stack_data_size() {
+                    match inner.stack_data_size()? {
                         4 => StoreKind::I32 { atomic: false },
                         8 => StoreKind::I64 { atomic: false },
-                        _ => panic!("Unsupported stack_data_size for IRef"),
+                        s => return Err(AbiUnpackError::RefInvalidStackDataSize(s))?,
                     },
                     MemArg {
                         align: 0,
@@ -97,13 +106,13 @@ impl IRef {
             }
 
             IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
-                panic!("Inner type cannot be a reference!");
+                return Err(AbiUnpackError::RefInsideRef)?;
             }
             IntermediateType::ITypeParameter(_) => {
-                panic!("cannot unpack generic type parameter");
+                return Err(AbiUnpackError::UnpackingGenericTypeParameter)?;
             }
-            IntermediateType::IEnum(_) => todo!(),
         }
+        Ok(())
     }
 }
 
@@ -115,23 +124,25 @@ impl IMutRef {
         reader_pointer: LocalId,
         calldata_reader_pointer: LocalId,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), AbiError> {
         match inner {
             // If inner is a heap type, forward the pointer
-            IntermediateType::IVector(_)
+            IntermediateType::IU128
+            | IntermediateType::IU256
             | IntermediateType::IAddress
             | IntermediateType::ISigner
-            | IntermediateType::IU128
-            | IntermediateType::IU256
+            | IntermediateType::IVector(_)
             | IntermediateType::IStruct { .. }
-            | IntermediateType::IGenericStructInstance { .. } => {
+            | IntermediateType::IGenericStructInstance { .. }
+            | IntermediateType::IEnum { .. }
+            | IntermediateType::IGenericEnumInstance { .. } => {
                 inner.add_unpack_instructions(
                     builder,
                     module,
                     reader_pointer,
                     calldata_reader_pointer,
                     compilation_ctx,
-                );
+                )?;
             }
             // For immediates, allocate and store
             IntermediateType::IU8
@@ -141,7 +152,7 @@ impl IMutRef {
             | IntermediateType::IBool => {
                 let ptr_local = module.locals.add(walrus::ValType::I32);
 
-                builder.i32_const(inner.stack_data_size() as i32);
+                builder.i32_const(inner.stack_data_size()? as i32);
                 builder.call(compilation_ctx.allocator);
                 builder.local_tee(ptr_local);
 
@@ -151,14 +162,14 @@ impl IMutRef {
                     reader_pointer,
                     calldata_reader_pointer,
                     compilation_ctx,
-                );
+                )?;
 
                 builder.store(
                     compilation_ctx.memory_id,
-                    match inner.stack_data_size() {
+                    match inner.stack_data_size()? {
                         4 => StoreKind::I32 { atomic: false },
                         8 => StoreKind::I64 { atomic: false },
-                        _ => panic!("Unsupported stack_data_size for IRef"),
+                        s => return Err(AbiUnpackError::RefInvalidStackDataSize(s))?,
                     },
                     MemArg {
                         align: 0,
@@ -170,13 +181,14 @@ impl IMutRef {
             }
 
             IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
-                panic!("Inner type cannot be a reference!");
+                return Err(AbiUnpackError::RefInsideRef)?;
             }
             IntermediateType::ITypeParameter(_) => {
-                panic!("cannot unpack generic type parameter");
+                return Err(AbiUnpackError::UnpackingGenericTypeParameter)?;
             }
-            IntermediateType::IEnum(_) => todo!(),
         }
+
+        Ok(())
     }
 }
 
@@ -207,13 +219,15 @@ mod tests {
         func_body.local_tee(args_pointer);
         func_body.local_set(calldata_reader_pointer);
 
-        ref_type.add_unpack_instructions(
-            &mut func_body,
-            &mut raw_module,
-            args_pointer,
-            calldata_reader_pointer,
-            &compilation_ctx,
-        );
+        ref_type
+            .add_unpack_instructions(
+                &mut func_body,
+                &mut raw_module,
+                args_pointer,
+                calldata_reader_pointer,
+                &compilation_ctx,
+            )
+            .unwrap();
 
         let function = function_builder.finish(vec![], &mut raw_module.funcs);
         raw_module.exports.add("test_function", function);
