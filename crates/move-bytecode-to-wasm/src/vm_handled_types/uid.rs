@@ -17,8 +17,9 @@ impl VmHandledType for Uid {
         _block: &mut InstrSeqBuilder,
         _module: &mut Module,
         _compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), VmHandledTypeError> {
         // UID is not injected, is created with a native function
+        Ok(())
     }
 
     fn is_vm_type(
@@ -30,11 +31,11 @@ impl VmHandledType for Uid {
             .get_struct_by_index(module_id, index)?
             .identifier;
 
-        if identifier == Self::IDENTIFIER {
+        if **identifier == *Self::IDENTIFIER {
             if module_id.address != STYLUS_FRAMEWORK_ADDRESS
-                || module_id.module_name != SF_MODULE_NAME_OBJECT
+                || module_id.module_name.as_str() != SF_MODULE_NAME_OBJECT
             {
-                return Err(VmHandledTypeError::InvalidFrameworkType(Self::IDENTIFIER));
+                return Err(VmHandledTypeError::InvalidFrameworkType(*identifier));
             }
             return Ok(true);
         }
@@ -48,6 +49,6 @@ impl Uid {
     pub fn is_delete_function(module_id: &ModuleId, identifier: &str) -> bool {
         identifier == Self::DELETE_FN_IDENTIFIER
             && module_id.address == STYLUS_FRAMEWORK_ADDRESS
-            && module_id.module_name == SF_MODULE_NAME_OBJECT
+            && module_id.module_name.as_str() == SF_MODULE_NAME_OBJECT
     }
 }

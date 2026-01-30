@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 pub mod abi_error;
 pub mod error;
 pub mod event;
@@ -18,13 +21,14 @@ pub use event::Event;
 use event::EventParseError;
 pub use external_call::error::{ExternalCallFunctionError, ExternalCallStructError};
 pub use function_validation::FunctionValidationError;
+use function_validation::check_repeated_storage_object_param;
+use function_validation::check_storage_object_param;
+use move_symbol_pool::Symbol;
 pub use reserved_modules::{SF_ADDRESS, SF_RESERVED_STRUCTS};
 pub use struct_validation::StructValidationError;
-// TODO: Create error struct with LOC and error info
 
 use external_call::{
-    external_struct::{ExternalStruct, ExternalStructError},
-    validate_external_call_function, validate_external_call_struct,
+    external_struct::ExternalStruct, validate_external_call_function, validate_external_call_struct,
 };
 use function_modifiers::{Function, FunctionModifier, Visibility};
 use function_validation::validate_function;
@@ -35,7 +39,7 @@ use move_compiler::{
 };
 use move_ir_types::location::Loc;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 use struct_modifiers::StructModifier;
@@ -44,31 +48,55 @@ use types::Type;
 
 #[derive(Debug, Clone)]
 pub struct Struct_ {
-    pub name: String,
-    pub fields: Vec<(String, Type)>,
+    pub name: Symbol,
+    pub fields: Vec<(Symbol, Type)>,
     pub positional_fields: bool,
     pub loc: Loc,
     pub has_key: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct Enum_ {
+    pub name: Symbol,
+    pub variants: Vec<(Symbol, Loc)>,
+    pub loc: Loc,
+}
+
 #[derive(Debug)]
 pub struct TestFunction {
-    pub name: String,
-    pub skip: bool,
+    pub name: Symbol,
     pub expect_failure: bool,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct SpecialAttributes {
-    pub module_name: String,
-    pub events: HashMap<String, Event>,
+    pub module_name: Symbol,
+    pub events: HashMap<Symbol, Event>,
     pub functions: Vec<Function>,
     pub structs: Vec<Struct_>,
-    pub external_calls: HashMap<String, Function>,
-    pub external_struct: HashMap<String, ExternalStruct>,
-    pub external_call_structs: HashSet<String>,
-    pub abi_errors: HashMap<String, AbiError>,
+    pub enums: Vec<Enum_>,
+    pub external_calls: HashMap<Symbol, Function>,
+    pub external_struct: HashMap<Symbol, ExternalStruct>,
+    pub external_call_structs: HashSet<Symbol>,
+    pub abi_errors: HashMap<Symbol, AbiError>,
     pub test_functions: Vec<TestFunction>,
+}
+
+impl Default for SpecialAttributes {
+    fn default() -> Self {
+        Self {
+            module_name: Symbol::from(""),
+            events: HashMap::default(),
+            functions: Vec::default(),
+            structs: Vec::default(),
+            enums: Vec::default(),
+            external_calls: HashMap::default(),
+            external_struct: HashMap::default(),
+            external_call_structs: HashSet::default(),
+            abi_errors: HashMap::default(),
+            test_functions: Vec::default(),
+        }
+    }
 }
 
 /// ModuleId represents a unique identifier for a Move module.
@@ -76,20 +104,20 @@ pub struct SpecialAttributes {
 #[derive(PartialEq, Eq, Hash, Debug, Clone)]
 pub struct ModuleId {
     pub address: [u8; 32],
-    pub module_name: String,
+    pub module_name: Symbol,
 }
 
 pub fn process_special_attributes(
     path: &Path,
     package_address: [u8; 32],
     deps_structs: &HashMap<ModuleId, Vec<Struct_>>,
-    address_alias_instantiation: &HashMap<String, [u8; 32]>,
+    address_alias_instantiation: &HashMap<Symbol, [u8; 32]>,
 ) -> Result<SpecialAttributes, (MappedFiles, Vec<SpecialAttributeError>)> {
     let (mapped_files, program_res) = Compiler::from_files(
         None,
         vec![path.to_str().unwrap()],
         Vec::new(),
-        BTreeMap::<String, NumericalAddress>::new(),
+        BTreeMap::<Symbol, NumericalAddress>::new(),
     )
     .run::<PASS_PARSER>()
     .unwrap();
@@ -104,34 +132,36 @@ pub fn process_special_attributes(
     // ones) that should have as first argument structs marked with a modifier.
     for source in &ast.source_definitions {
         if let Definition::Module(ref module) = source.def {
-            result.module_name = module.name.0.to_string();
+            result.module_name = module.name.0.value;
             for module_member in &module.members {
                 match module_member {
                     ModuleMember::Struct(s) => {
-                        let struct_name = s.name.value().as_str().to_string();
+                        let struct_name = s.name.value();
 
                         // No matter if it is a struct marked with special attributes, we collect
                         // its information.
-                        let fields: Vec<(String, Type)> = match &s.fields {
+                        let fields: Vec<(Symbol, Type)> = match &s.fields {
                             move_compiler::parser::ast::StructFields::Named(items) => items
                                 .iter()
                                 .map(|(_, field, type_)| {
-                                    let name = field.value();
-                                    (name.to_string(), Type::parse_type(&type_.value))
+                                    (field.value(), Type::parse_type(&type_.value))
                                 })
                                 .collect(),
                             move_compiler::parser::ast::StructFields::Positional(items) => items
                                 .iter()
                                 .enumerate()
                                 .map(|(index, (_, type_))| {
-                                    (format!("pos{index}"), Type::parse_type(&type_.value))
+                                    (
+                                        Symbol::from(format!("pos{index}")),
+                                        Type::parse_type(&type_.value),
+                                    )
                                 })
                                 .collect(),
                             move_compiler::parser::ast::StructFields::Native(_) => todo!(),
                         };
 
                         result.structs.push(Struct_ {
-                            name: struct_name.clone(),
+                            name: struct_name,
                             fields,
                             positional_fields: matches!(
                                 s.fields,
@@ -141,108 +171,108 @@ pub fn process_special_attributes(
                             has_key: s.abilities.iter().any(|a| a.value == Ability_::Key),
                         });
 
-                        let mut found_modifier: bool = false;
-                        'loop_att: for attributes in &s.attributes {
-                            if let Some(att) = attributes.value.first() {
-                                let modifier = StructModifier::parse_struct_modifier(&att.value);
-                                if let Some(modifier) = modifier {
-                                    if found_modifier {
-                                        // Found a second match
+                        for attributes in &s.attributes {
+                            let mut modifiers: Vec<StructModifier> = Vec::new();
+                            for attr in &attributes.value {
+                                match StructModifier::parse_struct_modifier(&attr.value) {
+                                    Ok(Some(modifier)) => modifiers.push(modifier),
+                                    Ok(None) => {}
+                                    Err(e) => {
                                         found_error = true;
-                                        module_errors.push(SpecialAttributeError {
-                                            kind: SpecialAttributeErrorKind::TooManyAttributes,
-                                            line_of_code: s.loc,
-                                        });
-                                        break 'loop_att;
-                                    }
-
-                                    match modifier {
-                                        StructModifier::ExternalCall => {
-                                            match validate_external_call_struct(s) {
-                                                Ok(_)
-                                                    if !result
-                                                        .external_call_structs
-                                                        .contains(&struct_name) =>
-                                                {
-                                                    result.external_call_structs.insert(struct_name.clone());
-                                                    found_modifier = true;
-                                                }
-                                                Ok(_) => {
-                                                    found_modifier = true;
-                                                }
-                                                Err(e) => {
-                                                    found_error = true;
-                                                    module_errors.extend(e);
-                                                    break 'loop_att;
-                                                }
-                                            }
-                                        }
-                                        StructModifier::ExternalStruct => {
-                                            match ExternalStruct::try_from(s) {
-                                                Ok(external_struct) => {
-                                                    result
-                                                        .external_struct
-                                                        .insert(struct_name.clone(), external_struct);
-                                                    found_modifier = true;
-                                                }
-                                                Err(SpecialAttributeError {
-                                                    kind:
-                                                        SpecialAttributeErrorKind::ExternalStruct(
-                                                            ExternalStructError::NotAnExternalStruct,
-                                                        ),
-                                                    ..
-                                                }) => {}
-                                                Err(e) => {
-                                                    found_error = true;
-                                                    module_errors.push(e);
-                                                    break 'loop_att;
-                                                }
-                                            }
-                                        }
-                                        StructModifier::Event => {
-                                            match Event::try_from(s) {
-                                                Ok(event) => {
-                                                    result.events.insert(struct_name.clone(), event);
-                                                    found_modifier = true;
-                                                }
-                                                Err(SpecialAttributeError {
-                                                    kind:
-                                                        SpecialAttributeErrorKind::Event(
-                                                            EventParseError::NotAnEvent,
-                                                        ),
-                                                    ..
-                                                }) => {}
-                                                Err(e) => {
-                                                    found_error = true;
-                                                    module_errors.push(e);
-                                                    break 'loop_att;
-                                                }
-                                            }
-                                        }
-                                        StructModifier::AbiError => {
-                                            match AbiError::try_from(s) {
-                                                Ok(abi_error) => {
-                                                    result.abi_errors.insert(struct_name.clone(), abi_error);
-                                                    found_modifier = true;
-                                                }
-                                                Err(SpecialAttributeError {
-                                                    kind:
-                                                        SpecialAttributeErrorKind::AbiError(
-                                                            AbiErrorParseError::NotAnAbiError,
-                                                        ),
-                                                    ..
-                                                }) => {}
-                                                Err(e) => {
-                                                    found_error = true;
-                                                    module_errors.push(e);
-                                                    break 'loop_att;
-                                                }
-                                            }
-                                        }
+                                        module_errors.push(e);
                                     }
                                 }
                             }
+
+                            for modifier in modifiers {
+                                match modifier {
+                                    StructModifier::ExternalStruct {
+                                        address,
+                                        module_name,
+                                    } => {
+                                        result.external_struct.insert(
+                                            struct_name,
+                                            ExternalStruct {
+                                                name: struct_name,
+                                                address,
+                                                module_name,
+                                            },
+                                        );
+                                    }
+                                    StructModifier::ExternalCall => {
+                                        match validate_external_call_struct(s) {
+                                            Ok(_)
+                                                if !result
+                                                    .external_call_structs
+                                                    .contains(&struct_name) =>
+                                            {
+                                                result.external_call_structs.insert(struct_name);
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                found_error = true;
+                                                module_errors.extend(e);
+                                            }
+                                        }
+                                    }
+                                    StructModifier::Event {
+                                        is_anonymous,
+                                        indexes,
+                                    } => {
+                                        // Check if the event has the key ability
+                                        if s.abilities.iter().any(|a| a.value == Ability_::Key) {
+                                            module_errors.push(SpecialAttributeError {
+                                                kind: SpecialAttributeErrorKind::Event(
+                                                    EventParseError::EventWithKey,
+                                                ),
+                                                line_of_code: s.loc,
+                                            });
+                                            found_error = true;
+                                            continue;
+                                        }
+
+                                        result.events.insert(
+                                            struct_name,
+                                            Event {
+                                                name: struct_name,
+                                                is_anonymous,
+                                                indexes,
+                                            },
+                                        );
+                                    }
+                                    StructModifier::AbiError => match AbiError::try_from(s) {
+                                        Ok(abi_error) => {
+                                            result.abi_errors.insert(struct_name, abi_error);
+                                        }
+                                        Err(SpecialAttributeError {
+                                            kind:
+                                                SpecialAttributeErrorKind::AbiError(
+                                                    AbiErrorParseError::NotAnAbiError,
+                                                ),
+                                            ..
+                                        }) => {}
+                                        Err(e) => {
+                                            found_error = true;
+                                            module_errors.push(e);
+                                        }
+                                    },
+                                }
+                            }
                         }
+                    }
+                    ModuleMember::Enum(enum_def) => {
+                        let enum_name = enum_def.name.value();
+                        let variants: Vec<(Symbol, Loc)> = enum_def
+                            .variants
+                            .iter()
+                            .map(|variant| (variant.name.value(), variant.loc))
+                            .collect();
+
+                        result.enums.push(Enum_ {
+                            name: enum_name,
+                            variants,
+                            loc: enum_def.loc,
+                        });
                     }
                     _ => continue,
                 }
@@ -274,7 +304,7 @@ pub fn process_special_attributes(
     // Members can either be Datatypes (structs or enums) or Functions.
     // imported_members is a HashMap of module id (address + module name) to a vector of tuples,
     // where the first element is the name of the member and the second element is the alias (if any).
-    let mut imported_members: HashMap<ModuleId, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut imported_members: HashMap<ModuleId, Vec<(Symbol, Option<Symbol>)>> = HashMap::new();
     for source in ast.source_definitions.clone() {
         if let Definition::Module(module) = source.def {
             for module_member in module.members {
@@ -292,13 +322,13 @@ pub fn process_special_attributes(
                                 move_compiler::parser::ast::LeadingNameAccess_::GlobalAddress(name) => {
                                     // GlobalAddress is a named address, look it up in address_alias_instantiation
                                     address_alias_instantiation
-                                        .get(name.value.as_str())
+                                        .get(&name.value)
                                         .copied()
                                         .or_else(|| {
                                             found_error = true;
                                             module_errors.push(SpecialAttributeError {
                                                 kind: SpecialAttributeErrorKind::NamedAddressNotFound(
-                                                    name.value.as_str().to_string(),
+                                                    name.value,
                                                 ),
                                                 line_of_code: use_decl.loc,
                                             });
@@ -308,13 +338,13 @@ pub fn process_special_attributes(
                                 move_compiler::parser::ast::LeadingNameAccess_::Name(name) => {
                                     // Name is also a named address, look it up in address_alias_instantiation
                                     address_alias_instantiation
-                                        .get(name.value.as_str())
+                                        .get(&name.value)
                                         .copied()
                                         .or_else(|| {
                                             found_error = true;
                                             module_errors.push(SpecialAttributeError {
                                                 kind: SpecialAttributeErrorKind::NamedAddressNotFound(
-                                                    name.value.as_str().to_string(),
+                                                    name.value,
                                                 ),
                                                 line_of_code: use_decl.loc,
                                             });
@@ -329,14 +359,12 @@ pub fn process_special_attributes(
 
                             let module_id = ModuleId {
                                 address: module_address,
-                                module_name: module_ident.value.module.to_string(),
+                                module_name: module_ident.value.module.0.value,
                             };
 
                             for member in members {
-                                let member_tuple = (
-                                    member.0.value.as_str().to_string(),
-                                    member.1.as_ref().map(|s| s.value.as_str().to_string()),
-                                );
+                                let member_tuple =
+                                    (member.0.value, member.1.as_ref().map(|s| s.value));
                                 imported_members
                                     .entry(module_id.to_owned())
                                     .or_default()
@@ -357,8 +385,15 @@ pub fn process_special_attributes(
             for module_member in module.members {
                 match module_member {
                     ModuleMember::Function(ref f) => {
+                        // This hashset is used to detect repeated storage object identifiers when declaring
+                        // owned/shared/frozen objects
+                        let mut processed_storage_objects: HashSet<Symbol> = HashSet::new();
+
                         let visibility: Visibility = (&f.visibility).into();
                         let signature = Function::parse_signature(&f.signature);
+
+                        let mut function =
+                            Function::new(f.name.0.value, signature.clone(), visibility);
 
                         // Function validation checks:
                         // - Entry functions must not be generic.
@@ -379,96 +414,177 @@ pub fn process_special_attributes(
                             module_errors.push(error);
                         }
 
-                        if let Some(attributes) = f.attributes.first() {
-                            let mut modifiers = attributes
+                        for attributes in &f.attributes {
+                            let modifiers = attributes
                                 .value
                                 .iter()
-                                .flat_map(|s| FunctionModifier::parse_modifiers(&s.value))
-                                .collect::<VecDeque<FunctionModifier>>();
+                                .map(|s| FunctionModifier::parse_modifiers(&s.value))
+                                .collect::<Result<Vec<Vec<FunctionModifier>>, SpecialAttributeError>>();
 
-                            let first_modifier = modifiers.pop_front();
-                            match first_modifier {
-                                // TODO: Process this only if test mode is enabled
-                                Some(FunctionModifier::Test) => {
-                                    let modifiers =
-                                        modifiers.into_iter().collect::<Vec<FunctionModifier>>();
-
-                                    result.test_functions.push(TestFunction {
-                                        name: f.name.to_owned().to_string(),
-                                        skip: modifiers.contains(&FunctionModifier::Skip),
-                                        expect_failure: modifiers
-                                            .contains(&FunctionModifier::ExpectedFailure),
-                                    });
-
-                                    result.functions.push(Function {
-                                        name: f.name.to_owned().to_string(),
-                                        modifiers: vec![],
-                                        signature,
-                                        visibility,
-                                    });
+                            let modifiers = match modifiers {
+                                Ok(modifiers) => modifiers.concat(),
+                                Err(e) => {
+                                    found_error = true;
+                                    module_errors.push(e);
+                                    continue;
                                 }
-                                Some(FunctionModifier::ExternalCall) => {
-                                    let modifiers =
-                                        modifiers.into_iter().collect::<Vec<FunctionModifier>>();
+                            };
 
-                                    let errors = validate_external_call_function(
-                                        f,
-                                        &modifiers,
-                                        &result.external_call_structs,
-                                    );
+                            for modifier in modifiers {
+                                match modifier {
+                                    FunctionModifier::OwnedObjects(owned_objects) => {
+                                        // TODO: Check declared attributes exist
 
-                                    if let Err(errors) = errors {
-                                        found_error = true;
-                                        module_errors.extend(errors);
-                                    } else if !found_error {
-                                        result.external_calls.insert(
-                                            f.name.to_owned().to_string(),
-                                            Function {
-                                                name: f.name.to_owned().to_string(),
-                                                modifiers,
-                                                signature,
-                                                visibility,
-                                            },
-                                        );
-                                    }
-                                }
-                                Some(FunctionModifier::Abi) => {
-                                    let modifiers =
-                                        modifiers.into_iter().collect::<Vec<FunctionModifier>>();
+                                        for (owned_object_identifier, loc) in &owned_objects {
+                                            if let Err(e) = check_repeated_storage_object_param(
+                                                &mut processed_storage_objects,
+                                                *owned_object_identifier,
+                                                *loc,
+                                            ) {
+                                                found_error = true;
+                                                module_errors.push(e);
+                                            }
 
-                                    if !found_error {
-                                        result.functions.push(Function {
-                                            name: f.name.to_owned().to_string(),
-                                            modifiers,
-                                            signature,
-                                            visibility,
-                                        });
-                                    }
-                                }
-                                _ => {
-                                    if !found_error {
-                                        if let Some(modifier) = first_modifier {
-                                            modifiers.push_front(modifier);
+                                            if let Err(e) = check_storage_object_param(
+                                                &signature,
+                                                *owned_object_identifier,
+                                                *loc,
+                                                &result.structs,
+                                            ) {
+                                                found_error = true;
+                                                module_errors.push(e);
+                                                continue;
+                                            }
                                         }
-                                        let modifiers = modifiers
-                                            .into_iter()
-                                            .collect::<Vec<FunctionModifier>>();
-                                        result.functions.push(Function {
-                                            name: f.name.to_owned().to_string(),
-                                            modifiers,
-                                            signature,
-                                            visibility,
+
+                                        if found_error {
+                                            continue;
+                                        }
+
+                                        function
+                                            .owned_objects
+                                            .extend(owned_objects.iter().map(|(id, _)| *id));
+                                    }
+                                    FunctionModifier::SharedObjects(shared_objects) => {
+                                        for (shared_object_identifier, loc) in &shared_objects {
+                                            if let Err(e) = check_repeated_storage_object_param(
+                                                &mut processed_storage_objects,
+                                                *shared_object_identifier,
+                                                *loc,
+                                            ) {
+                                                found_error = true;
+                                                module_errors.push(e);
+                                            }
+
+                                            if let Err(e) = check_storage_object_param(
+                                                &signature,
+                                                *shared_object_identifier,
+                                                *loc,
+                                                &result.structs,
+                                            ) {
+                                                found_error = true;
+                                                module_errors.push(e);
+                                                continue;
+                                            }
+                                        }
+
+                                        if found_error {
+                                            continue;
+                                        }
+
+                                        function
+                                            .shared_objects
+                                            .extend(shared_objects.iter().map(|(id, _)| *id));
+                                    }
+                                    FunctionModifier::FrozenObjects(frozen_objects) => {
+                                        for (frozen_object_identifier, loc) in &frozen_objects {
+                                            if let Err(e) = check_repeated_storage_object_param(
+                                                &mut processed_storage_objects,
+                                                *frozen_object_identifier,
+                                                *loc,
+                                            ) {
+                                                found_error = true;
+                                                module_errors.push(e);
+                                            }
+
+                                            if let Err(e) = check_storage_object_param(
+                                                &signature,
+                                                *frozen_object_identifier,
+                                                *loc,
+                                                &result.structs,
+                                            ) {
+                                                found_error = true;
+                                                module_errors.push(e);
+                                                continue;
+                                            }
+                                        }
+
+                                        if found_error {
+                                            continue;
+                                        }
+
+                                        function
+                                            .frozen_objects
+                                            .extend(frozen_objects.iter().map(|(id, _)| *id));
+                                    }
+                                    // TODO: Process this only if test mode is enabled
+                                    FunctionModifier::Test => {
+                                        result.test_functions.push(TestFunction {
+                                            name: f.name.0.value,
+                                            expect_failure: false,
                                         });
                                     }
+                                    FunctionModifier::ExpectedFailure => {
+                                        if let Some(test_function) = result
+                                            .test_functions
+                                            .iter_mut()
+                                            .find(|tf| tf.name == f.name.0.value)
+                                        {
+                                            test_function.expect_failure = true;
+                                        } else {
+                                            found_error = true;
+                                            module_errors.push(SpecialAttributeError {
+                                                kind: SpecialAttributeErrorKind::ExpectedFailureWithoutTest,
+                                                line_of_code: f.loc,
+                                            });
+                                        }
+                                    }
+                                    FunctionModifier::ExternalCall(solidity_modifiers) => {
+                                        let errors = validate_external_call_function(
+                                            f,
+                                            &solidity_modifiers,
+                                            &result.external_call_structs,
+                                        );
+
+                                        if let Err(errors) = errors {
+                                            found_error = true;
+                                            module_errors.extend(errors);
+                                        } else if !found_error {
+                                            result.external_calls.insert(
+                                                f.name.0.value,
+                                                Function {
+                                                    name: f.name.0.value,
+                                                    modifiers: solidity_modifiers,
+                                                    owned_objects: vec![],
+                                                    shared_objects: vec![],
+                                                    frozen_objects: vec![],
+                                                    signature: signature.clone(),
+                                                    visibility,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    FunctionModifier::Abi(solidity_modifiers) => {
+                                        if !found_error {
+                                            function.modifiers.extend(solidity_modifiers);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                        } else if !found_error {
-                            result.functions.push(Function {
-                                name: f.name.to_owned().to_string(),
-                                modifiers: Vec::new(),
-                                signature,
-                                visibility,
-                            });
+                        }
+                        if !found_error {
+                            result.functions.push(function);
                         }
                     }
                     _ => continue,

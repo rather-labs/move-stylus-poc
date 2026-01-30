@@ -3,7 +3,6 @@ pub mod boolean;
 pub mod enums;
 pub mod error;
 pub mod heap_integers;
-pub mod reference;
 pub mod signer;
 pub mod simple_integers;
 pub mod structs;
@@ -11,30 +10,33 @@ pub(crate) mod user_type_fields;
 pub mod vector;
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use crate::{
     CompilationContext, UserDefinedType,
-    compilation_context::{ModuleData, ModuleId, module_data::Address},
+    compilation_context::{ModuleId, module_data::Address},
+    data::RuntimeErrorData,
     hasher::get_hasher,
     runtime::RuntimeFunction,
     wasm_builder_extensions::WasmBuilderExtension,
 };
 
-use error::IntermediateTypeError;
-use move_binary_format::file_format::{DatatypeHandleIndex, Signature, SignatureToken};
-
 use address::IAddress;
 use boolean::IBool;
+use error::IntermediateTypeError;
 use heap_integers::{IU128, IU256};
+use move_binary_format::file_format::{DatatypeHandleIndex, Signature, SignatureToken};
+use move_symbol_pool::Symbol;
 use simple_integers::{IU8, IU16, IU32, IU64};
 use vector::IVector;
 
 use walrus::{
     InstrSeqBuilder, LocalId, MemoryId, Module, ValType,
-    ir::{BinaryOp, LoadKind, MemArg, StoreKind},
+    ir::{BinaryOp, ExtendedLoad, LoadKind, MemArg, StoreKind},
 };
 
 use super::TranslationError;
@@ -65,9 +67,9 @@ pub enum IntermediateType {
     IU256,
     IAddress,
     ISigner,
-    IVector(Box<IntermediateType>),
-    IRef(Box<IntermediateType>),
-    IMutRef(Box<IntermediateType>),
+    IVector(Arc<IntermediateType>),
+    IRef(Arc<IntermediateType>),
+    IMutRef(Arc<IntermediateType>),
 
     /// Type parameter, used for generic enums and structs
     /// The u16 is the index of the type parameter in the signature
@@ -115,13 +117,11 @@ pub enum IntermediateType {
 
 impl IntermediateType {
     /// Returns the size in bytes, that this type needs in memory to be stored
-    pub fn stack_data_size(&self) -> Result<u32, IntermediateTypeError> {
+    pub fn wasm_memory_data_size(&self) -> Result<i32, IntermediateTypeError> {
         let size = match self {
-            IntermediateType::IU64 => 8,
-            IntermediateType::IBool
-            | IntermediateType::IU8
-            | IntermediateType::IU16
-            | IntermediateType::IU32
+            IntermediateType::IBool | IntermediateType::IU8 => 1,
+            IntermediateType::IU16 => 2,
+            IntermediateType::IU32
             | IntermediateType::IU128
             | IntermediateType::IU256
             | IntermediateType::IAddress
@@ -133,12 +133,65 @@ impl IntermediateType {
             | IntermediateType::IGenericStructInstance { .. }
             | IntermediateType::IEnum { .. }
             | IntermediateType::IGenericEnumInstance { .. } => 4,
+            IntermediateType::IU64 => 8,
             IntermediateType::ITypeParameter(_) => {
                 return Err(IntermediateTypeError::FoundTypeParameter);
             }
         };
 
         Ok(size)
+    }
+
+    pub fn store_kind(&self) -> Result<StoreKind, IntermediateTypeError> {
+        let store_kind = match self {
+            IntermediateType::IBool | IntermediateType::IU8 => StoreKind::I32_8 { atomic: false },
+            IntermediateType::IU16 => StoreKind::I32_16 { atomic: false },
+            IntermediateType::IU32
+            | IntermediateType::IU128
+            | IntermediateType::IU256
+            | IntermediateType::IAddress
+            | IntermediateType::ISigner
+            | IntermediateType::IVector(_)
+            | IntermediateType::IRef(_)
+            | IntermediateType::IMutRef(_)
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. }
+            | IntermediateType::IEnum { .. }
+            | IntermediateType::IGenericEnumInstance { .. } => StoreKind::I32 { atomic: false },
+            IntermediateType::IU64 => StoreKind::I64 { atomic: false },
+            IntermediateType::ITypeParameter(_) => {
+                return Err(IntermediateTypeError::FoundTypeParameter);
+            }
+        };
+        Ok(store_kind)
+    }
+
+    pub fn load_kind(&self) -> Result<LoadKind, IntermediateTypeError> {
+        let load_kind = match self {
+            IntermediateType::IBool | IntermediateType::IU8 => LoadKind::I32_8 {
+                kind: ExtendedLoad::ZeroExtend,
+            },
+            IntermediateType::IU16 => LoadKind::I32_16 {
+                kind: ExtendedLoad::ZeroExtend,
+            },
+            IntermediateType::IU32
+            | IntermediateType::IU128
+            | IntermediateType::IU256
+            | IntermediateType::IAddress
+            | IntermediateType::ISigner
+            | IntermediateType::IVector(_)
+            | IntermediateType::IRef(_)
+            | IntermediateType::IMutRef(_)
+            | IntermediateType::IStruct { .. }
+            | IntermediateType::IGenericStructInstance { .. }
+            | IntermediateType::IEnum { .. }
+            | IntermediateType::IGenericEnumInstance { .. } => LoadKind::I32 { atomic: false },
+            IntermediateType::IU64 => LoadKind::I64 { atomic: false },
+            IntermediateType::ITypeParameter(_) => {
+                return Err(IntermediateTypeError::FoundTypeParameter);
+            }
+        };
+        Ok(load_kind)
     }
 
     pub fn try_from_signature_token(
@@ -157,26 +210,26 @@ impl IntermediateType {
             SignatureToken::Signer => Ok(Self::ISigner),
             SignatureToken::Vector(token) => {
                 let itoken = Self::try_from_signature_token(token.as_ref(), handles_map)?;
-                Ok(IntermediateType::IVector(Box::new(itoken)))
+                Ok(IntermediateType::IVector(Arc::new(itoken)))
             }
             SignatureToken::Reference(token) => {
                 let itoken = Self::try_from_signature_token(token.as_ref(), handles_map)?;
-                Ok(IntermediateType::IRef(Box::new(itoken)))
+                Ok(IntermediateType::IRef(Arc::new(itoken)))
             }
             SignatureToken::MutableReference(token) => {
                 let itoken = Self::try_from_signature_token(token.as_ref(), handles_map)?;
-                Ok(IntermediateType::IMutRef(Box::new(itoken)))
+                Ok(IntermediateType::IMutRef(Arc::new(itoken)))
             }
             SignatureToken::Datatype(datatype_index) => {
                 if let Some(udt) = handles_map.get(datatype_index) {
                     Ok(match udt {
                         UserDefinedType::Struct { module_id, index } => IntermediateType::IStruct {
-                            module_id: module_id.clone(),
+                            module_id: *module_id,
                             index: *index,
                             vm_handled_struct: VmHandledStruct::None,
                         },
                         UserDefinedType::Enum { module_id, index } => IntermediateType::IEnum {
-                            module_id: module_id.clone(),
+                            module_id: *module_id,
                             index: *index,
                         },
                     })
@@ -197,7 +250,7 @@ impl IntermediateType {
                     Ok(match udt {
                         UserDefinedType::Struct { module_id, index } => {
                             IntermediateType::IGenericStructInstance {
-                                module_id: module_id.clone(),
+                                module_id: *module_id,
                                 index: *index,
                                 types,
                                 vm_handled_struct: VmHandledStruct::None,
@@ -205,7 +258,7 @@ impl IntermediateType {
                         }
                         UserDefinedType::Enum { module_id, index } => {
                             IntermediateType::IGenericEnumInstance {
-                                module_id: module_id.clone(),
+                                module_id: *module_id,
                                 index: *index,
                                 types: types.clone(),
                             }
@@ -227,7 +280,7 @@ impl IntermediateType {
         &self,
         module: &mut Module,
         builder: &mut InstrSeqBuilder,
-        bytes: &mut std::vec::IntoIter<u8>,
+        bytes: &mut std::slice::Iter<'_, u8>,
         compilation_ctx: &CompilationContext,
     ) -> Result<(), IntermediateTypeError> {
         match self {
@@ -274,56 +327,12 @@ impl IntermediateType {
     ) -> Result<(), IntermediateTypeError> {
         builder.local_get(local);
         match self {
-            IntermediateType::IBool
-            | IntermediateType::IU8
-            | IntermediateType::IU16
-            | IntermediateType::IU32 => {
-                builder
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    )
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
+            IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {}
+            IntermediateType::ITypeParameter(_) => {
+                return Err(IntermediateTypeError::FoundTypeParameter);
             }
-            IntermediateType::IU64 => {
-                builder
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    )
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I64 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
-            }
-            IntermediateType::IU128
-            | IntermediateType::IU256
-            | IntermediateType::IAddress
-            | IntermediateType::ISigner
-            | IntermediateType::IVector(_)
-            | IntermediateType::IStruct { .. }
-            | IntermediateType::IGenericStructInstance { .. }
-            | IntermediateType::IEnum { .. }
-            | IntermediateType::IGenericEnumInstance { .. } => {
+            _ => {
+                // Load the middle ptr
                 builder.load(
                     compilation_ctx.memory_id,
                     LoadKind::I32 { atomic: false },
@@ -332,10 +341,27 @@ impl IntermediateType {
                         offset: 0,
                     },
                 );
-            }
-            IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {}
-            IntermediateType::ITypeParameter(_) => {
-                return Err(IntermediateTypeError::FoundTypeParameter);
+
+                // For stach types, load the value
+                match self {
+                    IntermediateType::IBool
+                    | IntermediateType::IU8
+                    | IntermediateType::IU16
+                    | IntermediateType::IU32
+                    | IntermediateType::IU64 => {
+                        builder.load(
+                            compilation_ctx.memory_id,
+                            self.load_kind()?,
+                            MemArg {
+                                align: 0,
+                                offset: 0,
+                            },
+                        );
+                    }
+                    _ => {
+                        // For heap types we can't load the value directly, so the ptr is ok
+                    }
+                }
             }
         }
 
@@ -347,133 +373,13 @@ impl IntermediateType {
         module: &mut Module,
         builder: &mut InstrSeqBuilder,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
         local: LocalId,
     ) -> Result<(), IntermediateTypeError> {
         builder.local_get(local);
         match self {
-            IntermediateType::IBool
-            | IntermediateType::IU8
-            | IntermediateType::IU16
-            | IntermediateType::IU32 => {
-                builder
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    )
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
-            }
-            IntermediateType::IU64 => {
-                builder
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    )
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I64 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
-            }
-            IntermediateType::IU128 => {
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-                let copy_f = RuntimeFunction::CopyU128.get(module, Some(compilation_ctx))?;
-                builder.call(copy_f);
-            }
-            IntermediateType::IU256 | IntermediateType::IAddress => {
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-                let copy_f = RuntimeFunction::CopyU256.get(module, Some(compilation_ctx))?;
-                builder.call(copy_f);
-            }
-            IntermediateType::IVector(inner_type) => {
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-                builder.i32_const(1); // This is the length "multiplier", i.e. length * multiplier = capacity
-                IVector::copy_local_instructions(
-                    inner_type,
-                    module,
-                    builder,
-                    compilation_ctx,
-                    module_data,
-                )?;
-            }
-            IntermediateType::IStruct {
-                module_id, index, ..
-            } => {
-                let struct_ = compilation_ctx.get_struct_by_index(module_id, *index)?;
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-                struct_.copy_local_instructions(module, builder, compilation_ctx, module_data)?;
-            }
-            IntermediateType::IGenericStructInstance {
-                module_id,
-                index,
-                types,
-                ..
-            } => {
-                let struct_ = compilation_ctx.get_struct_by_index(module_id, *index)?;
-                let struct_instance = struct_.instantiate(types);
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-                struct_instance.copy_local_instructions(
-                    module,
-                    builder,
-                    compilation_ctx,
-                    module_data,
-                )?;
-            }
             IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
-                // Nothing to be done, pointer is already correct
+                // Forward the local directly
             }
             IntermediateType::ISigner => {
                 return Err(IntermediateTypeError::SignerCannotBeCopied);
@@ -481,8 +387,8 @@ impl IntermediateType {
             IntermediateType::ITypeParameter(_) => {
                 return Err(IntermediateTypeError::FoundTypeParameter);
             }
-            IntermediateType::IEnum { .. } | IntermediateType::IGenericEnumInstance { .. } => {
-                let enum_ = compilation_ctx.get_enum_by_intermediate_type(self)?;
+            _ => {
+                // Load the middle ptr
                 builder.load(
                     compilation_ctx.memory_id,
                     LoadKind::I32 { atomic: false },
@@ -491,7 +397,69 @@ impl IntermediateType {
                         offset: 0,
                     },
                 );
-                enum_.copy_local_instructions(module, builder, compilation_ctx, module_data)?;
+                match self {
+                    IntermediateType::IBool
+                    | IntermediateType::IU8
+                    | IntermediateType::IU16
+                    | IntermediateType::IU32
+                    | IntermediateType::IU64 => {
+                        builder.load(
+                            compilation_ctx.memory_id,
+                            self.load_kind()?,
+                            MemArg {
+                                align: 0,
+                                offset: 0,
+                            },
+                        );
+                    }
+                    IntermediateType::IU128 => {
+                        let copy_f =
+                            RuntimeFunction::CopyU128.get(module, Some(compilation_ctx), None)?;
+                        builder.call(copy_f);
+                    }
+                    IntermediateType::IU256 | IntermediateType::IAddress => {
+                        let copy_f =
+                            RuntimeFunction::CopyU256.get(module, Some(compilation_ctx), None)?;
+                        builder.call(copy_f);
+                    }
+                    IntermediateType::IVector(inner_type) => {
+                        builder.i32_const(1); // This is the length "multiplier", i.e. length * multiplier = capacity
+                        let copy_local_function = RuntimeFunction::VecCopyLocal.get_generic(
+                            module,
+                            compilation_ctx,
+                            Some(runtime_error_data),
+                            &[inner_type],
+                        )?;
+                        builder.call(copy_local_function);
+                    }
+                    IntermediateType::IStruct { .. }
+                    | IntermediateType::IGenericStructInstance { .. } => {
+                        let struct_ = compilation_ctx.get_struct_by_intermediate_type(self)?;
+                        struct_.copy_local_instructions(
+                            module,
+                            builder,
+                            compilation_ctx,
+                            runtime_error_data,
+                        )?;
+                    }
+                    IntermediateType::IEnum { .. }
+                    | IntermediateType::IGenericEnumInstance { .. } => {
+                        let enum_ = compilation_ctx.get_enum_by_intermediate_type(self)?;
+                        enum_.copy_local_instructions(
+                            module,
+                            builder,
+                            compilation_ctx,
+                            runtime_error_data,
+                        )?;
+                    }
+                    IntermediateType::ISigner
+                    | IntermediateType::IRef(_)
+                    | IntermediateType::IMutRef(_)
+                    | IntermediateType::ITypeParameter(_) => {
+                        // These cases are handled in the outer match.
+                        builder.unreachable();
+                    }
+                }
             }
         }
 
@@ -505,55 +473,20 @@ impl IntermediateType {
         pointer: LocalId,
         memory: MemoryId,
     ) -> Result<LocalId, IntermediateTypeError> {
-        match self {
-            IntermediateType::IBool
-            | IntermediateType::IU8
-            | IntermediateType::IU16
-            | IntermediateType::IU32
-            | IntermediateType::IU128
-            | IntermediateType::IU256
-            | IntermediateType::IAddress
-            | IntermediateType::ISigner
-            | IntermediateType::IVector(_)
-            | IntermediateType::IRef(_)
-            | IntermediateType::IMutRef(_)
-            | IntermediateType::IStruct { .. }
-            | IntermediateType::IGenericStructInstance { .. }
-            | IntermediateType::IEnum { .. }
-            | IntermediateType::IGenericEnumInstance { .. } => {
-                let local = module.locals.add(ValType::I32);
-
-                builder.local_get(pointer);
-                builder.load(
-                    memory,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-                builder.local_set(local);
-
-                Ok(local)
-            }
-            IntermediateType::IU64 => {
-                let local = module.locals.add(ValType::I64);
-
-                builder.local_get(pointer);
-                builder.load(
-                    memory,
-                    LoadKind::I64 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-                builder.local_set(local);
-
-                Ok(local)
-            }
-            IntermediateType::ITypeParameter(_) => Err(IntermediateTypeError::FoundTypeParameter),
-        }
+        let val_type = ValType::try_from(self)?;
+        let local = module.locals.add(val_type);
+        builder
+            .local_get(pointer)
+            .load(
+                memory,
+                self.load_kind()?,
+                MemArg {
+                    align: 0,
+                    offset: 0,
+                },
+            )
+            .local_set(local);
+        Ok(local)
     }
 
     /// Adds the instructions to load the value into a local variable
@@ -563,33 +496,10 @@ impl IntermediateType {
         module: &mut Module,
         builder: &mut InstrSeqBuilder,
     ) -> Result<LocalId, IntermediateTypeError> {
-        match self {
-            IntermediateType::IBool
-            | IntermediateType::IU8
-            | IntermediateType::IU16
-            | IntermediateType::IU32
-            | IntermediateType::IU128
-            | IntermediateType::IU256
-            | IntermediateType::IVector(_)
-            | IntermediateType::IAddress
-            | IntermediateType::ISigner
-            | IntermediateType::IRef(_)
-            | IntermediateType::IMutRef(_)
-            | IntermediateType::IStruct { .. }
-            | IntermediateType::IGenericStructInstance { .. }
-            | IntermediateType::IEnum { .. }
-            | IntermediateType::IGenericEnumInstance { .. } => {
-                let local = module.locals.add(ValType::I32);
-                builder.local_set(local);
-                Ok(local)
-            }
-            IntermediateType::IU64 => {
-                let local = module.locals.add(ValType::I64);
-                builder.local_set(local);
-                Ok(local)
-            }
-            IntermediateType::ITypeParameter(_) => Err(IntermediateTypeError::FoundTypeParameter),
-        }
+        let val_type = ValType::try_from(self)?;
+        let local = module.locals.add(val_type);
+        builder.local_set(local);
+        Ok(local)
     }
 
     pub fn add_read_ref_instructions(
@@ -597,8 +507,9 @@ impl IntermediateType {
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
     ) -> Result<(), IntermediateTypeError> {
+        // Load the middle ptr
         builder.load(
             compilation_ctx.memory_id,
             LoadKind::I32 { atomic: false },
@@ -611,20 +522,11 @@ impl IntermediateType {
             IntermediateType::IBool
             | IntermediateType::IU8
             | IntermediateType::IU16
-            | IntermediateType::IU32 => {
+            | IntermediateType::IU32
+            | IntermediateType::IU64 => {
                 builder.load(
                     compilation_ctx.memory_id,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-            }
-            IntermediateType::IU64 => {
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I64 { atomic: false },
+                    self.load_kind()?,
                     MemArg {
                         align: 0,
                         offset: 0,
@@ -632,33 +534,43 @@ impl IntermediateType {
                 );
             }
             IntermediateType::IU128 => {
-                let copy_f = RuntimeFunction::CopyU128.get(module, Some(compilation_ctx))?;
+                let copy_f = RuntimeFunction::CopyU128.get(module, Some(compilation_ctx), None)?;
                 builder.call(copy_f);
             }
             IntermediateType::IU256 | IntermediateType::IAddress => {
-                let copy_f = RuntimeFunction::CopyU256.get(module, Some(compilation_ctx))?;
+                let copy_f = RuntimeFunction::CopyU256.get(module, Some(compilation_ctx), None)?;
                 builder.call(copy_f);
             }
             IntermediateType::IVector(inner_type) => {
                 builder.i32_const(1); // Length multiplier
-                IVector::copy_local_instructions(
-                    inner_type,
+                let copy_local_function = RuntimeFunction::VecCopyLocal.get_generic(
                     module,
-                    builder,
                     compilation_ctx,
-                    module_data,
+                    Some(runtime_error_data),
+                    &[inner_type],
                 )?;
+                builder.call(copy_local_function);
             }
             IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
                 let struct_ = compilation_ctx.get_struct_by_intermediate_type(self)?;
-                struct_.copy_local_instructions(module, builder, compilation_ctx, module_data)?;
-            }
-            IntermediateType::ISigner => {
-                // Signer type is read-only, we push the pointer only
+                struct_.copy_local_instructions(
+                    module,
+                    builder,
+                    compilation_ctx,
+                    runtime_error_data,
+                )?;
             }
             IntermediateType::IEnum { .. } | IntermediateType::IGenericEnumInstance { .. } => {
                 let enum_ = compilation_ctx.get_enum_by_intermediate_type(self)?;
-                enum_.copy_local_instructions(module, builder, compilation_ctx, module_data)?;
+                enum_.copy_local_instructions(
+                    module,
+                    builder,
+                    compilation_ctx,
+                    runtime_error_data,
+                )?;
+            }
+            IntermediateType::ISigner => {
+                // Signer type is read-only, we push the pointer only
             }
             _ => return Err(IntermediateTypeError::CannotReadRefOfType(self.clone())),
         }
@@ -678,12 +590,7 @@ impl IntermediateType {
             | IntermediateType::IU16
             | IntermediateType::IU32
             | IntermediateType::IU64 => {
-                let (val_type, store_kind) = if *self == IntermediateType::IU64 {
-                    (ValType::I64, StoreKind::I64 { atomic: false })
-                } else {
-                    (ValType::I32, StoreKind::I32 { atomic: false })
-                };
-                let val = module.locals.add(val_type);
+                let val = module.locals.add(ValType::try_from(self)?);
                 let ptr = module.locals.add(ValType::I32);
                 builder
                     .load(
@@ -694,13 +601,10 @@ impl IntermediateType {
                             offset: 0,
                         },
                     )
-                    .local_set(ptr)
-                    .local_set(val)
-                    .local_get(ptr)
-                    .local_get(val)
+                    .swap(ptr, val)
                     .store(
                         compilation_ctx.memory_id,
-                        store_kind,
+                        self.store_kind()?,
                         MemArg {
                             align: 0,
                             offset: 0,
@@ -813,17 +717,22 @@ impl IntermediateType {
             IntermediateType::IBool
             | IntermediateType::IU8
             | IntermediateType::IU16
-            | IntermediateType::IU32 => {
-                let val = module.locals.add(ValType::I32);
+            | IntermediateType::IU32
+            | IntermediateType::IU64 => {
+                let val = module.locals.add(ValType::try_from(self)?);
                 let ptr = module.locals.add(ValType::I32);
+                builder.local_set(val);
                 builder
-                    .local_set(val)
                     .i32_const(4)
                     .call(compilation_ctx.allocator)
-                    .local_tee(local)
-                    .i32_const(self.stack_data_size()? as i32)
+                    .local_tee(local);
+
+                builder
+                    .i32_const(self.wasm_memory_data_size()?)
                     .call(compilation_ctx.allocator)
-                    .local_tee(ptr)
+                    .local_tee(ptr);
+
+                builder
                     .store(
                         compilation_ctx.memory_id,
                         StoreKind::I32 { atomic: false },
@@ -836,37 +745,7 @@ impl IntermediateType {
                     .local_get(val)
                     .store(
                         compilation_ctx.memory_id,
-                        StoreKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
-            }
-            IntermediateType::IU64 => {
-                let val = module.locals.add(ValType::I64);
-                let ptr = module.locals.add(ValType::I32);
-                builder
-                    .local_set(val)
-                    .i32_const(4)
-                    .call(compilation_ctx.allocator)
-                    .local_tee(local)
-                    .i32_const(8)
-                    .call(compilation_ctx.allocator)
-                    .local_tee(ptr)
-                    .store(
-                        compilation_ctx.memory_id,
-                        StoreKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    )
-                    .local_get(ptr)
-                    .local_get(val)
-                    .store(
-                        compilation_ctx.memory_id,
-                        StoreKind::I64 { atomic: false },
+                        self.store_kind()?,
                         MemArg {
                             align: 0,
                             offset: 0,
@@ -885,20 +764,20 @@ impl IntermediateType {
             | IntermediateType::IEnum { .. }
             | IntermediateType::IGenericEnumInstance { .. } => {
                 let ptr = module.locals.add(ValType::I32);
+                builder.local_set(ptr);
+
                 builder
-                    .local_set(ptr)
                     .i32_const(4)
                     .call(compilation_ctx.allocator)
-                    .local_tee(local)
-                    .local_get(ptr)
-                    .store(
-                        compilation_ctx.memory_id,
-                        StoreKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
+                    .local_tee(local);
+                builder.local_get(ptr).store(
+                    compilation_ctx.memory_id,
+                    StoreKind::I32 { atomic: false },
+                    MemArg {
+                        align: 0,
+                        offset: 0,
+                    },
+                );
             }
             IntermediateType::ITypeParameter(_) => {
                 return Err(IntermediateTypeError::FoundTypeParameter);
@@ -913,7 +792,7 @@ impl IntermediateType {
         module: &mut Module,
         builder: &mut InstrSeqBuilder,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
     ) -> Result<(), IntermediateTypeError> {
         match self {
             Self::IBool | Self::IU8 | Self::IU16 | Self::IU32 => {
@@ -932,13 +811,19 @@ impl IntermediateType {
                 builder.i32_const(1);
             }
             Self::IVector(inner) => {
-                IVector::equality(builder, module, compilation_ctx, module_data, inner)?
+                let equality_f = RuntimeFunction::VecEquality.get_generic(
+                    module,
+                    compilation_ctx,
+                    Some(runtime_error_data),
+                    &[inner],
+                )?;
+                builder.call(equality_f);
             }
             Self::IStruct {
                 index, module_id, ..
             } => {
                 let struct_ = compilation_ctx.get_struct_by_index(module_id, *index)?;
-                struct_.equality(builder, module, compilation_ctx, module_data)?
+                struct_.equality(builder, module, compilation_ctx, runtime_error_data)?
             }
             Self::IGenericStructInstance {
                 index,
@@ -951,12 +836,12 @@ impl IntermediateType {
                     builder,
                     module,
                     compilation_ctx,
-                    module_data,
+                    runtime_error_data,
                 )?
             }
             Self::IEnum { .. } | Self::IGenericEnumInstance { .. } => {
                 let enum_ = compilation_ctx.get_enum_by_intermediate_type(self)?;
-                enum_.equality(builder, module, compilation_ctx, module_data)?;
+                enum_.equality(builder, module, compilation_ctx, runtime_error_data)?;
             }
             Self::IRef(inner) | Self::IMutRef(inner) => {
                 let ptr1 = module.locals.add(ValType::I32);
@@ -994,11 +879,7 @@ impl IntermediateType {
                             .local_get(ptr1)
                             .load(
                                 compilation_ctx.memory_id,
-                                if **inner == IntermediateType::IU64 {
-                                    LoadKind::I64 { atomic: false }
-                                } else {
-                                    LoadKind::I32 { atomic: false }
-                                },
+                                inner.load_kind()?,
                                 MemArg {
                                     align: 0,
                                     offset: 0,
@@ -1007,11 +888,7 @@ impl IntermediateType {
                             .local_get(ptr2)
                             .load(
                                 compilation_ctx.memory_id,
-                                if **inner == IntermediateType::IU64 {
-                                    LoadKind::I64 { atomic: false }
-                                } else {
-                                    LoadKind::I32 { atomic: false }
-                                },
+                                inner.load_kind()?,
                                 MemArg {
                                     align: 0,
                                     offset: 0,
@@ -1039,7 +916,12 @@ impl IntermediateType {
                     }
                 }
 
-                inner.load_equality_instructions(module, builder, compilation_ctx, module_data)?
+                inner.load_equality_instructions(
+                    module,
+                    builder,
+                    compilation_ctx,
+                    runtime_error_data,
+                )?
             }
 
             IntermediateType::ITypeParameter(_) => {
@@ -1055,9 +937,9 @@ impl IntermediateType {
         module: &mut Module,
         builder: &mut InstrSeqBuilder,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
     ) -> Result<(), TranslationError> {
-        self.load_equality_instructions(module, builder, compilation_ctx, module_data)?;
+        self.load_equality_instructions(module, builder, compilation_ctx, runtime_error_data)?;
         builder.negate();
         Ok(())
     }
@@ -1086,33 +968,35 @@ impl IntermediateType {
         }
     }
 
-    pub fn get_name(
-        &self,
-        compilation_ctx: &CompilationContext,
-    ) -> Result<String, IntermediateTypeError> {
+    pub fn get_name<'a>(
+        &'a self,
+        compilation_ctx: &'a CompilationContext,
+    ) -> Result<Cow<'a, str>, IntermediateTypeError> {
         let name = match self {
-            IntermediateType::IBool => "bool".to_string(),
-            IntermediateType::IU8 => "u8".to_string(),
-            IntermediateType::IU16 => "u16".to_string(),
-            IntermediateType::IU32 => "u32".to_string(),
-            IntermediateType::IU64 => "u64".to_string(),
-            IntermediateType::IU128 => "u128".to_string(),
-            IntermediateType::IU256 => "u256".to_string(),
-            IntermediateType::IAddress => "address".to_string(),
-            IntermediateType::ISigner => "signer".to_string(),
+            IntermediateType::IBool => Cow::Borrowed("bool"),
+            IntermediateType::IU8 => Cow::Borrowed("u8"),
+            IntermediateType::IU16 => Cow::Borrowed("u16"),
+            IntermediateType::IU32 => Cow::Borrowed("u32"),
+            IntermediateType::IU64 => Cow::Borrowed("u64"),
+            IntermediateType::IU128 => Cow::Borrowed("u128"),
+            IntermediateType::IU256 => Cow::Borrowed("u256"),
+            IntermediateType::IAddress => Cow::Borrowed("address"),
+            IntermediateType::ISigner => Cow::Borrowed("signer"),
             IntermediateType::IVector(inner) => {
-                format!("vector<{}>", inner.get_name(compilation_ctx)?)
+                Cow::Owned(format!("vector<{}>", inner.get_name(compilation_ctx)?))
             }
-            IntermediateType::IRef(inner) => format!("&{}", inner.get_name(compilation_ctx)?),
+            IntermediateType::IRef(inner) => {
+                Cow::Owned(format!("&{}", inner.get_name(compilation_ctx)?))
+            }
             IntermediateType::IMutRef(inner) => {
-                format!("&mut {}", inner.get_name(compilation_ctx)?)
+                Cow::Owned(format!("&mut {}", inner.get_name(compilation_ctx)?))
             }
             IntermediateType::IStruct {
                 module_id, index, ..
             } => {
                 let struct_ = compilation_ctx.get_struct_by_index(module_id, *index)?;
 
-                struct_.identifier.clone()
+                Cow::Borrowed(struct_.identifier.as_str())
             }
             IntermediateType::IGenericStructInstance {
                 module_id,
@@ -1125,17 +1009,33 @@ impl IntermediateType {
                 let types = types
                     .iter()
                     .map(|t| t.get_name(compilation_ctx))
-                    .collect::<Result<Vec<String>, IntermediateTypeError>>()?
+                    .collect::<Result<Vec<Cow<str>>, IntermediateTypeError>>()?
                     .join(",");
 
-                format!("{}<{types}>", struct_.identifier.clone())
+                Cow::Owned(format!("{}<{types}>", struct_.identifier.clone()))
             }
             IntermediateType::ITypeParameter(_) => {
                 return Err(IntermediateTypeError::FoundTypeParameter);
             }
-            IntermediateType::IEnum { .. } | IntermediateType::IGenericEnumInstance { .. } => {
-                let enum_ = compilation_ctx.get_enum_by_intermediate_type(self)?;
-                enum_.identifier.clone()
+            IntermediateType::IEnum { index, module_id } => {
+                let enum_ = compilation_ctx.get_enum_by_index(module_id, *index)?;
+                Cow::Borrowed(enum_.identifier.as_str())
+            }
+            IntermediateType::IGenericEnumInstance {
+                module_id,
+                index,
+                types,
+                ..
+            } => {
+                let struct_ = compilation_ctx.get_enum_by_index(module_id, *index)?;
+
+                let types = types
+                    .iter()
+                    .map(|t| t.get_name(compilation_ctx))
+                    .collect::<Result<Vec<Cow<str>>, IntermediateTypeError>>()?
+                    .join(",");
+
+                Cow::Owned(format!("{}<{types}>", struct_.identifier.clone()))
             }
         };
 
@@ -1166,18 +1066,18 @@ impl IntermediateType {
                 if let Some(external_struct) = module_data
                     .special_attributes
                     .external_struct
-                    .get(struct_.identifier.as_str())
+                    .get(&struct_.identifier)
                 {
-                    let foreign_module_id = ModuleId {
-                        address: Address::from_bytes(external_struct.address),
-                        module_name: external_struct.module_name.clone(),
-                    };
+                    let foreign_module_id = ModuleId::new(
+                        Address::from_bytes(external_struct.address),
+                        external_struct.module_name.as_str(),
+                    );
 
                     Hash::hash(&foreign_module_id, &mut hasher);
                 } else {
                     Hash::hash(&module_id, &mut hasher);
                 }
-                struct_.identifier.hash(&mut hasher);
+                struct_.identifier.as_str().hash(&mut hasher);
             }
             IntermediateType::IGenericStructInstance {
                 module_id,
@@ -1190,11 +1090,11 @@ impl IntermediateType {
                 if let Some(external_struct) = module_data
                     .special_attributes
                     .external_struct
-                    .get(struct_.identifier.as_str())
+                    .get(&struct_.identifier)
                 {
                     let foreign_module_id = ModuleId {
                         address: Address::from_bytes(external_struct.address),
-                        module_name: external_struct.module_name.clone(),
+                        module_name: Symbol::from(external_struct.module_name.as_str()),
                     };
 
                     Hash::hash(&foreign_module_id, &mut hasher);
@@ -1205,7 +1105,7 @@ impl IntermediateType {
                 for t in types {
                     t.process_hash(&mut hasher, compilation_ctx)?;
                 }
-                struct_.identifier.hash(&mut hasher);
+                struct_.identifier.as_str().hash(&mut hasher);
             }
             _ => {
                 self.hash(&mut hasher);

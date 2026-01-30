@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use super::{VmHandledType, error::VmHandledTypeError};
 use crate::{
     CompilationContext,
@@ -17,8 +20,9 @@ impl VmHandledType for TxContext {
         block: &mut InstrSeqBuilder,
         _module: &mut Module,
         compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), VmHandledTypeError> {
         block.i32_const(4).call(compilation_ctx.allocator);
+        Ok(())
     }
 
     fn is_vm_type(
@@ -30,11 +34,11 @@ impl VmHandledType for TxContext {
             .get_struct_by_index(module_id, index)?
             .identifier;
 
-        if identifier == Self::IDENTIFIER {
+        if **identifier == *Self::IDENTIFIER {
             if module_id.address != STYLUS_FRAMEWORK_ADDRESS
-                || module_id.module_name != SF_MODULE_NAME_TX_CONTEXT
+                || module_id.module_name.as_str() != SF_MODULE_NAME_TX_CONTEXT
             {
-                return Err(VmHandledTypeError::InvalidFrameworkType(Self::IDENTIFIER));
+                return Err(VmHandledTypeError::InvalidFrameworkType(*identifier));
             }
             return Ok(true);
         }

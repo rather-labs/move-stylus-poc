@@ -1,9 +1,13 @@
+// Copyright (c) 2025 Rather Labs, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 module hello_world::counter_named_id;
 
-use stylus::tx_context::TxContext;
-use stylus::object as object;
-use stylus::object::NamedId;
-use stylus::transfer as transfer;
+use stylus::{
+    tx_context::TxContext, 
+    object::{Self, NamedId}, 
+    transfer::{Self}
+};
 
 public struct COUNTER_ has key {}
 

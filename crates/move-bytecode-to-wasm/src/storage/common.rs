@@ -3,7 +3,7 @@
 
 use crate::{
     CompilationContext,
-    data::{DATA_SLOT_DATA_PTR_OFFSET, DATA_ZERO_OFFSET},
+    data::{DATA_SLOT_DATA_PTR_OFFSET, DATA_ZERO_OFFSET, RuntimeErrorData},
     hostio::host_functions::{native_keccak256, storage_cache_bytes32, storage_load_bytes32},
     runtime::RuntimeFunction,
     storage::storage_layout::field_size,
@@ -12,7 +12,7 @@ use crate::{
 };
 use walrus::{
     InstrSeqBuilder, LocalId, Module, ValType,
-    ir::{BinaryOp, LoadKind, MemArg},
+    ir::{BinaryOp, LoadKind, MemArg, UnaryOp},
 };
 
 use super::error::StorageError;
@@ -31,6 +31,7 @@ pub fn add_delete_storage_struct_instructions(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     slot_ptr: LocalId,
     slot_offset: LocalId,
     struct_: &IStruct,
@@ -49,6 +50,7 @@ pub fn add_delete_storage_struct_instructions(
             module,
             builder,
             compilation_ctx,
+            runtime_error_data,
             slot_ptr,
             slot_offset,
             field,
@@ -69,15 +71,16 @@ pub fn add_delete_storage_enum_instructions(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     slot_ptr: LocalId,
     slot_offset: LocalId,
     itype: &IntermediateType,
 ) -> Result<(), StorageError> {
     let (storage_cache, _) = storage_cache_bytes32(module);
-    let next_slot_fn = RuntimeFunction::StorageNextSlot.get(module, Some(compilation_ctx))?;
-    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx))?;
+    let next_slot_fn = RuntimeFunction::StorageNextSlot.get(module, Some(compilation_ctx), None)?;
+    let equality_fn = RuntimeFunction::HeapTypeEquality.get(module, Some(compilation_ctx), None)?;
     let compute_enum_storage_tail_position_fn = RuntimeFunction::ComputeEnumStorageTailPosition
-        .get_generic(module, compilation_ctx, &[itype])?;
+        .get_generic(module, compilation_ctx, Some(runtime_error_data), &[itype])?;
 
     // Compute the end slot
     let tail_slot_ptr = module.locals.add(ValType::I32);
@@ -148,6 +151,7 @@ pub fn add_delete_storage_vector_instructions(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     slot_ptr: LocalId,
     inner: &IntermediateType,
 ) -> Result<(), StorageError> {
@@ -157,7 +161,7 @@ pub fn add_delete_storage_vector_instructions(
     let (native_keccak, _) = native_keccak256(module);
 
     // Runtime functions
-    let swap_fn = RuntimeFunction::SwapI32Bytes.get(module, None)?;
+    let swap_fn = RuntimeFunction::SwapI32Bytes.get(module, None, None)?;
 
     // Locals
     let len = module.locals.add(ValType::I32);
@@ -200,11 +204,7 @@ pub fn add_delete_storage_vector_instructions(
         let block_id = block.id();
 
         // Check if length == 0. If so, skip the rest of the instructions.
-        block
-            .local_get(len)
-            .i32_const(0)
-            .binop(BinaryOp::I32Eq)
-            .br_if(block_id);
+        block.local_get(len).unop(UnaryOp::I32Eqz).br_if(block_id);
 
         // Element size in STORAGE
         match field_size(inner, compilation_ctx) {
@@ -231,6 +231,7 @@ pub fn add_delete_storage_vector_instructions(
                             module,
                             loop_,
                             compilation_ctx,
+                            runtime_error_data,
                             elem_slot_ptr,
                             elem_slot_offset,
                             inner,
@@ -282,17 +283,22 @@ pub fn add_delete_storage_vector_instructions(
 /// `itype` - intermediate type of the element to be deleted
 /// `size` - size of the itype in storage
 /// `slot_offset` - number of bytes already used in the current slot
+#[allow(clippy::too_many_arguments)]
 pub fn add_delete_field_instructions(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     slot_ptr: LocalId,
     slot_offset: LocalId,
     itype: &IntermediateType,
     size: i32,
 ) -> Result<(), StorageError> {
-    let accumulate_or_advance_slot_delete_fn =
-        RuntimeFunction::AccumulateOrAdvanceSlotDelete.get(module, Some(compilation_ctx))?;
+    let accumulate_or_advance_slot_delete_fn = RuntimeFunction::AccumulateOrAdvanceSlotDelete.get(
+        module,
+        Some(compilation_ctx),
+        Some(runtime_error_data),
+    )?;
 
     // Use accumulate_or_advance_slot with mode=2 (delete) to handle slot advancement
     // Mode 2 will wipe the slot to zero before advancing when needed
@@ -327,6 +333,7 @@ pub fn add_delete_field_instructions(
                     module,
                     builder,
                     compilation_ctx,
+                    runtime_error_data,
                     slot_ptr,
                     slot_offset,
                     &child_struct,
@@ -338,6 +345,7 @@ pub fn add_delete_field_instructions(
                 module,
                 builder,
                 compilation_ctx,
+                runtime_error_data,
                 slot_ptr,
                 slot_offset,
                 itype,
@@ -351,6 +359,7 @@ pub fn add_delete_field_instructions(
                 module,
                 builder,
                 compilation_ctx,
+                runtime_error_data,
                 slot_ptr,
                 inner_,
             )?;

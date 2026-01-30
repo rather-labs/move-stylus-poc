@@ -1,6 +1,6 @@
 /**
  * This file was automatically generated and represents a Move program.
- * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus-poc).
+ * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus).
  */
 
 // SPDX-License-Identifier: MIT-OR-APACHE-2.0
@@ -18,8 +18,8 @@ interface Generics2 {
         uint64 b;
     }
 
-    function testGenericStructs(GenericStructUint32Uint64 s1, GenericStructUint128Uint256 s2) external (uint32, uint64, uint128, uint256);
-    function unpack1(GenericStructUint32Uint64 s) external (uint32, uint64);
-    function unpack2(GenericStructUint128Uint256 s) external (uint128, uint256);
+    function testGenericStructs(GenericStructUint32Uint64 s1, GenericStructUint128Uint256 s2) external returns (uint32, uint64, uint128, uint256);
+    function unpack1(GenericStructUint32Uint64 s) external returns (uint32, uint64);
+    function unpack2(GenericStructUint128Uint256 s) external returns (uint128, uint256);
 
 }

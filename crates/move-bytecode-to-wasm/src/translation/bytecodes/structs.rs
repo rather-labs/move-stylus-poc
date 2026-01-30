@@ -26,14 +26,14 @@ pub fn borrow_field(
     let Some(field_type) = struct_.fields_types.get(field_id) else {
         return Err(TranslationError::StructFieldNotFound {
             field_id: field_id.into_index(),
-            struct_identifier: struct_.identifier.clone(),
+            struct_identifier: struct_.identifier,
         });
     };
 
     let Some(field_offset) = struct_.field_offsets.get(field_id) else {
         return Err(TranslationError::StructFieldOffsetNotFound {
             field_id: field_id.into_index(),
-            struct_identifier: struct_.identifier.clone(),
+            struct_identifier: struct_.identifier,
         });
     };
 
@@ -68,8 +68,6 @@ pub fn pack(
     // Pointer for simple types
     let ptr_to_data = module.locals.add(ValType::I32);
 
-    let val_32 = module.locals.add(ValType::I32);
-    let val_64 = module.locals.add(ValType::I64);
     let mut offset = struct_.heap_size;
 
     // If the struct is saved in storage (has key ability), the owner's id must be prepended to the
@@ -95,19 +93,16 @@ pub fn pack(
                     | IntermediateType::IU16
                     | IntermediateType::IU32
                     | IntermediateType::IU64 => {
-                        let data_size = pack_type.stack_data_size()?;
-                        let (val, store_kind) = if data_size == 8 {
-                            (val_64, StoreKind::I64 { atomic: false })
-                        } else {
-                            (val_32, StoreKind::I32 { atomic: false })
-                        };
+                        let data_size = pack_type.wasm_memory_data_size()?;
+                        let val = module.locals.add(ValType::try_from(pack_type)?);
+                        let store_kind = pack_type.store_kind()?;
 
                         // Save the actual value
                         builder.local_set(val);
 
                         // Create a pointer for the value
                         builder
-                            .i32_const(data_size as i32)
+                            .i32_const(data_size)
                             .call(compilation_ctx.allocator)
                             .local_tee(ptr_to_data);
 
@@ -245,11 +240,7 @@ pub fn unpack_fields(
                 // Load the actual value
                 builder.load(
                     compilation_ctx.memory_id,
-                    if field.stack_data_size()? == 8 {
-                        LoadKind::I64 { atomic: false }
-                    } else {
-                        LoadKind::I32 { atomic: false }
-                    },
+                    field.load_kind()?,
                     MemArg {
                         align: 0,
                         offset: 0,
@@ -293,13 +284,13 @@ pub fn unpack_fields(
                         module_id: parent_module_id,
                         index: parent_index,
                         ..
-                    } => (None, parent_module_id.clone(), *parent_index),
+                    } => (None, *parent_module_id, *parent_index),
                     IntermediateType::IGenericStructInstance {
                         module_id: parent_module_id,
                         index: parent_index,
                         types,
                         ..
-                    } => (Some(types.clone()), parent_module_id.clone(), *parent_index),
+                    } => (Some(types.clone()), *parent_module_id, *parent_index),
                     _ => {
                         return Err(TranslationError::InvalidTypeInUnpackFunction(
                             parent_type.clone(),
@@ -308,7 +299,7 @@ pub fn unpack_fields(
                 };
 
                 types_stack.push(IntermediateType::IStruct {
-                    module_id: module_id.clone(),
+                    module_id: *module_id,
                     index: *index,
                     vm_handled_struct: VmHandledStruct::StorageId {
                         parent_module_id,
@@ -329,13 +320,13 @@ pub fn unpack_fields(
                         module_id: parent_module_id,
                         index: parent_index,
                         ..
-                    } => (None, parent_module_id.clone(), *parent_index),
+                    } => (None, *parent_module_id, *parent_index),
                     IntermediateType::IGenericStructInstance {
                         module_id: parent_module_id,
                         index: parent_index,
                         types,
                         ..
-                    } => (Some(types.clone()), parent_module_id.clone(), *parent_index),
+                    } => (Some(types.clone()), *parent_module_id, *parent_index),
                     _ => {
                         return Err(TranslationError::InvalidTypeInUnpackFunction(
                             parent_type.clone(),
@@ -344,7 +335,7 @@ pub fn unpack_fields(
                 };
 
                 types_stack.push(IntermediateType::IGenericStructInstance {
-                    module_id: module_id.clone(),
+                    module_id: *module_id,
                     index: *index,
                     types: types.clone(),
                     vm_handled_struct: VmHandledStruct::StorageId {

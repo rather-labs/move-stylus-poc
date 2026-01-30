@@ -17,8 +17,9 @@ impl VmHandledType for ContractCallResult {
         _block: &mut InstrSeqBuilder,
         _module: &mut Module,
         _compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), VmHandledTypeError> {
         // Contract call result is not injected
+        Ok(())
     }
 
     fn is_vm_type(
@@ -30,11 +31,11 @@ impl VmHandledType for ContractCallResult {
             .get_struct_by_index(module_id, index)?
             .identifier;
 
-        if identifier == Self::IDENTIFIER {
+        if **identifier == *Self::IDENTIFIER {
             if module_id.address != STYLUS_FRAMEWORK_ADDRESS
-                || module_id.module_name != SF_MODULE_NAME_CONTRACT_CALLS
+                || module_id.module_name.as_str() != SF_MODULE_NAME_CONTRACT_CALLS
             {
-                return Err(VmHandledTypeError::InvalidFrameworkType(Self::IDENTIFIER));
+                return Err(VmHandledTypeError::InvalidFrameworkType(*identifier));
             }
             return Ok(true);
         }
@@ -51,8 +52,9 @@ impl VmHandledType for ContractCallEmptyResult {
         _block: &mut InstrSeqBuilder,
         _module: &mut Module,
         _compilation_ctx: &CompilationContext,
-    ) {
+    ) -> Result<(), VmHandledTypeError> {
         // Contract call result is not injected
+        Ok(())
     }
 
     fn is_vm_type(
@@ -64,11 +66,11 @@ impl VmHandledType for ContractCallEmptyResult {
             .get_struct_by_index(module_id, index)?
             .identifier;
 
-        if identifier == Self::IDENTIFIER {
+        if **identifier == *Self::IDENTIFIER {
             if module_id.address != STYLUS_FRAMEWORK_ADDRESS
-                || module_id.module_name != SF_MODULE_NAME_CONTRACT_CALLS
+                || module_id.module_name.as_str() != SF_MODULE_NAME_CONTRACT_CALLS
             {
-                return Err(VmHandledTypeError::InvalidFrameworkType(Self::IDENTIFIER));
+                return Err(VmHandledTypeError::InvalidFrameworkType(*identifier));
             }
             return Ok(true);
         }

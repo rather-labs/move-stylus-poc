@@ -1,6 +1,6 @@
 /**
  * This file was automatically generated and represents a Move program.
- * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus-poc).
+ * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus).
  */
 
 // SPDX-License-Identifier: MIT-OR-APACHE-2.0
@@ -21,6 +21,16 @@ interface MiscStructs {
         bool[] b;
     }
 
-    function testMisc(uint32 a, uint128 b, GenericEnum c, SimpleEnum d, NestedStructUint32Uint128 e) external (GenericStructUint32Uint128);
+    enum GenericEnum {
+        A,
+        B,
+    }
+
+    enum SimpleEnum {
+        A,
+        B,
+    }
+
+    function testMisc(uint32 a, uint128 b, GenericEnum c, SimpleEnum d, NestedStructUint32Uint128 e) external returns (GenericStructUint32Uint128);
 
 }

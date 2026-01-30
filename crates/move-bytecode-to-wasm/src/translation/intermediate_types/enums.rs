@@ -15,8 +15,9 @@
 //! For stack types the data is saved in-place, for heap-types we just save the pointer to the
 //! data.
 use crate::{
-    CompilationContext, compilation_context::module_data::ModuleData,
+    CompilationContext, data::RuntimeErrorData, error::RuntimeError,
     generics::replace_type_parameters, storage::error::StorageError,
+    wasm_builder_extensions::WasmBuilderExtension,
 };
 
 use super::{
@@ -24,6 +25,7 @@ use super::{
     user_type_fields::{FieldsErrorContext, UserTypeFields},
 };
 
+use move_symbol_pool::Symbol;
 use walrus::{
     InstrSeqBuilder, LocalId, Module, ValType,
     ir::{BinaryOp, LoadKind, MemArg, StoreKind},
@@ -45,7 +47,7 @@ pub struct IEnumVariant {
 
 #[derive(Debug, Clone)]
 pub struct IEnum {
-    pub identifier: String,
+    pub identifier: Symbol,
 
     pub index: u16,
 
@@ -66,14 +68,14 @@ impl IEnumVariant {
 
 impl IEnum {
     pub fn new(
-        identifier: String,
+        identifier: &str,
         index: u16,
         variants: Vec<IEnumVariant>,
     ) -> Result<Self, IntermediateTypeError> {
         let is_simple = variants.iter().all(|v| v.fields.is_empty());
 
         Ok(Self {
-            identifier,
+            identifier: Symbol::from(identifier),
             is_simple,
             variants,
             index,
@@ -124,7 +126,7 @@ impl IEnum {
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
     ) -> Result<(), IntermediateTypeError> {
         let e1_ptr = module.locals.add(ValType::I32);
         let e2_ptr = module.locals.add(ValType::I32);
@@ -179,19 +181,26 @@ impl IEnum {
                 then.i32_const(0).local_set(result);
 
                 // Copy fields for the active arm, then jump to join
-                self.match_on_variant(then, variant_index, |variant, arm| {
-                    // Use the same logic as structs to compare the fields
-                    inner_result = UserTypeFields::compare_fields(
-                        &variant.fields,
-                        arm,
-                        module,
-                        compilation_ctx,
-                        module_data,
-                        e1_ptr,
-                        e2_ptr,
-                    );
-                    arm.local_set(result);
-                });
+                self.match_on_variant(
+                    then,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    variant_index,
+                    |variant, arm, mod_ref, err_ref| {
+                        // Use the same logic as structs to compare the fields
+                        inner_result = UserTypeFields::compare_fields(
+                            &variant.fields,
+                            arm,
+                            mod_ref,
+                            compilation_ctx,
+                            err_ref,
+                            e1_ptr,
+                            e2_ptr,
+                        );
+                        arm.local_set(result);
+                    },
+                );
                 then.local_get(result);
             },
             |else_| {
@@ -215,7 +224,7 @@ impl IEnum {
         module: &mut Module,
         builder: &mut InstrSeqBuilder,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
     ) -> Result<(), IntermediateTypeError> {
         let src_ptr = module.locals.add(ValType::I32);
         let ptr = module.locals.add(ValType::I32);
@@ -258,22 +267,30 @@ impl IEnum {
 
         // Copy fields for the active arm, then jump to join
         let mut inner_result = Ok(());
-        self.match_on_variant(builder, variant_index, |variant, arm| {
-            inner_result = UserTypeFields::copy_fields(
-                &variant.fields,
-                arm,
-                module,
-                compilation_ctx,
-                module_data,
-                src_ptr,
-                ptr,
-                4,
-                FieldsErrorContext::Enum {
-                    enum_index: self.index,
-                    variant_index: variant.index,
-                },
-            );
-        });
+        self.match_on_variant(
+            builder,
+            module,
+            compilation_ctx,
+            runtime_error_data,
+            variant_index,
+            |variant, arm, mod_ref, err_ref| {
+                inner_result = UserTypeFields::copy_fields(
+                    &variant.fields,
+                    arm,
+                    mod_ref,
+                    compilation_ctx,
+                    err_ref,
+                    src_ptr,
+                    ptr,
+                    4,
+                    FieldsErrorContext::Enum {
+                        enum_index: self.index,
+                        variant_index: variant.index,
+                    },
+                );
+            },
+        );
+
         inner_result?;
 
         builder.local_get(ptr);
@@ -301,7 +318,7 @@ impl IEnum {
             .collect();
 
         Self {
-            identifier: self.identifier.clone(),
+            identifier: self.identifier,
             index: self.index,
             is_simple: self.is_simple,
             variants,
@@ -332,37 +349,42 @@ impl IEnum {
     /// `on_match` receives:
     ///   - &IEnumVariant: the matched variant
     ///   - &mut InstrSeqBuilder: the builder for this arm
-    ///   - InstrSeqId: a `join_id` you can `br` to when you’re done
+    ///   - InstrSeqId: a `join_id` you can `br` to when you're done
     pub fn match_on_variant<F>(
         &self,
         builder: &mut InstrSeqBuilder,
+        module: &mut Module, // Still takes it here
+        compilation_ctx: &CompilationContext,
+        runtime_error_data: &mut RuntimeErrorData,
         variant_index: LocalId,
         mut on_match: F,
     ) where
-        F: FnMut(&IEnumVariant, &mut InstrSeqBuilder),
+        F: FnMut(&IEnumVariant, &mut InstrSeqBuilder, &mut Module, &mut RuntimeErrorData),
     {
         builder.block(None, |join| {
             let join_id = join.id();
-
             for variant in &self.variants {
                 join.block(None, |case| {
                     let case_id = case.id();
-
-                    // Guard: skip if runtime index != this variant
                     case.local_get(variant_index)
                         .i32_const(variant.index as i32)
                         .binop(BinaryOp::I32Ne)
                         .br_if(case_id);
 
-                    // Matched: emit caller-provided body
-                    on_match(variant, case);
+                    on_match(variant, case, module, runtime_error_data);
 
                     case.br(join_id);
                 });
             }
 
-            // Should be unreachable if the enum is well-formed
-            join.unreachable();
+            // Return error if variant index is out of bounds
+            join.return_error(
+                module,
+                compilation_ctx,
+                Some(ValType::I32),
+                runtime_error_data,
+                RuntimeError::OutOfBounds,
+            );
         });
     }
 }

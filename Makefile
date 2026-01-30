@@ -178,7 +178,7 @@ deploy-revert-errors:
 		| tee /dev/tty | ./update_contract_env.sh CONTRACT_ADDRESS_REVERT_ERRORS
 
 setup-stylus:
-	RUSTFLAGS="-C link-args=-rdynamic" cargo install --force cargo-stylus
+	RUSTFLAGS="-C link-args=-rdynamic" cargo install --force --version 0.6.3 cargo-stylus
 
 install-wasm-tools:
 	cargo install --locked wasm-tools
@@ -187,7 +187,7 @@ parse-rust-example:
 	wasm-tools print ./example-rust/target/wasm32-unknown-unknown/release/stylus_hello_world.wasm -o ./example-rust/target/wasm32-unknown-unknown/release/stylus_hello_world.wat
 
 install:
-	# $(MAKE) setup-stylus
+	@which cargo-stylus > /dev/null || (echo "Installing mdbook..." && $(MAKE) setup-stylus)
 	cargo install --locked --path crates/move-cli
 
 .PHONY: test setup-stylus install deploy-*

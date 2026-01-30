@@ -1,5 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
+// Copyright (c) 2025 Rather Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+// Portions of this file were modified by Rather Labs, Inc on 2025-2026.
 
 /// A table is a map-like collection. But unlike a traditional collection, it's keys and values are
 /// not stored within the `Table` value, but instead are stored using Sui's object system. The
@@ -18,10 +20,11 @@
 /// ```
 module stylus::table;
 
-use stylus::dynamic_field as field;
-use stylus::object as object;
-use stylus::object::UID;
-use stylus::tx_context::TxContext;
+use stylus::{
+    dynamic_field as field, 
+    object::{Self, UID}, 
+    tx_context::TxContext
+};
 
 // Attempted to destroy a non-empty table
 const ETableNotEmpty: u64 = 0;

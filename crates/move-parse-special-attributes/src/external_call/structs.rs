@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use move_compiler::parser::ast::{Ability_, StructDefinition};
 
 use crate::{
@@ -32,7 +35,7 @@ fn check_fields(s: &StructDefinition) -> Option<Vec<SpecialAttributeError>> {
             } else {
                 let (_, type_) = &fields[0];
                 if let Some(name) = get_single_type_name(&type_.value) {
-                    if name != CONFIGURATION_TYPE_NAME {
+                    if name.as_str() != CONFIGURATION_TYPE_NAME {
                         errors.push(SpecialAttributeError {
                             kind: SpecialAttributeErrorKind::ExternalCallStruct(
                                 ExternalCallStructError::InvalidConfigurationField,

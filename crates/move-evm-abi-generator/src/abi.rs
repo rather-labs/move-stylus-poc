@@ -1,18 +1,22 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use std::collections::{HashMap, HashSet};
 
 use move_bytecode_to_wasm::compilation_context::{
     ModuleData, ModuleId,
-    module_data::struct_data::{IStruct, IntermediateType},
+    module_data::struct_data::{IStruct, IStructType, IntermediateType},
     reserved_modules::{
         SF_MODULE_NAME_OBJECT, SF_MODULE_NAME_TX_CONTEXT, STYLUS_FRAMEWORK_ADDRESS,
     },
 };
-use move_parse_special_attributes::function_modifiers::{FunctionModifier, Parameter};
+use move_parse_special_attributes::function_modifiers::{Parameter, SolidityFunctionModifier};
+use move_symbol_pool::Symbol;
 
 use crate::{
     ErrorStruct, EventStruct,
     common::snake_to_camel,
-    special_types::{is_named_id, is_string, is_uid},
+    special_types::{is_bytes_n, is_id, is_named_id, is_string, is_uid},
     types::Type,
 };
 
@@ -36,24 +40,30 @@ pub enum Visibility {
 #[derive(Debug)]
 pub struct Function {
     pub(crate) function_type: FunctionType,
-    pub(crate) identifier: String,
+    pub(crate) identifier: Symbol,
     pub(crate) parameters: Vec<NamedType>,
     pub(crate) return_types: Type,
     pub(crate) visibility: Visibility,
-    pub(crate) modifiers: Vec<FunctionModifier>,
+    pub(crate) modifiers: Vec<SolidityFunctionModifier>,
     pub(crate) is_entry: bool,
 }
 
 #[derive(Debug)]
 pub struct Struct_ {
-    pub(crate) identifier: String,
+    pub(crate) identifier: Symbol,
     pub(crate) fields: Vec<NamedType>,
     pub(crate) positional_fields: bool,
 }
 
 #[derive(Debug)]
+pub struct Enum_ {
+    pub(crate) identifier: Symbol,
+    pub(crate) variants: Vec<Symbol>,
+}
+
+#[derive(Debug)]
 pub struct Event {
-    pub(crate) identifier: String,
+    pub(crate) identifier: Symbol,
     pub(crate) fields: Vec<EventField>,
     pub(crate) is_anonymous: bool,
     pub(crate) positional_fields: bool,
@@ -62,7 +72,7 @@ pub struct Event {
 /// A unified struct representing a typed field used in functions, structs, and events.
 #[derive(Debug)]
 pub struct NamedType {
-    pub(crate) identifier: String,
+    pub(crate) identifier: Symbol,
     pub(crate) type_: Type,
 }
 
@@ -74,9 +84,10 @@ pub struct EventField {
 
 #[derive(Debug)]
 pub struct Abi {
-    pub(crate) contract_name: String,
+    pub(crate) contract_name: Symbol,
     pub(crate) functions: Vec<Function>,
     pub(crate) structs: Vec<Struct_>,
+    pub(crate) enums: Vec<Enum_>,
     pub(crate) events: Vec<Event>,
     pub(crate) abi_errors: Vec<Struct_>,
 }
@@ -95,23 +106,31 @@ impl Abi {
         // Create a single HashSet to collect all structs that need to be processed
         // This includes structs from events, errors, and functions
         let mut structs_to_process = HashSet::new();
+        let mut enums_to_process = HashSet::new();
 
         let events = Self::process_events(event_structs, modules_data, &mut structs_to_process);
 
         let abi_errors =
             Self::process_abi_errors(error_structs, modules_data, &mut structs_to_process);
 
-        let functions =
-            Self::process_functions(processing_module, modules_data, &mut structs_to_process);
+        let functions = Self::process_functions(
+            processing_module,
+            modules_data,
+            &mut structs_to_process,
+            &mut enums_to_process,
+        );
 
         let mut processed_structs = HashSet::new();
         let structs =
             Self::process_structs(structs_to_process, modules_data, &mut processed_structs);
 
+        let enums = Self::process_enums(enums_to_process, modules_data);
+
         Abi {
-            contract_name: processing_module.special_attributes.module_name.clone(),
+            contract_name: processing_module.special_attributes.module_name,
             functions,
             structs,
+            enums,
             events,
             abi_errors,
         }
@@ -123,39 +142,31 @@ impl Abi {
         processing_module: &ModuleData,
         modules_data: &HashMap<ModuleId, ModuleData>,
         structs_to_process: &mut HashSet<IntermediateType>,
+        enums_to_process: &mut HashSet<IntermediateType>,
     ) -> Vec<Function> {
         let mut result = Vec::new();
 
         // First we filter the functions we are going to process
-        let mut functions: Vec<_> = processing_module
+        let functions: Vec<_> = processing_module
             .functions
             .information
             .iter()
             .filter(|f| f.is_entry)
             .collect();
 
-        // Add the init function to the functions list, which is not entry
-        if let Some(init) = processing_module.functions.init.as_ref() {
-            let init_information = processing_module
-                .functions
-                .get_information_by_identifier(&init.identifier)
-                .unwrap();
-            functions.push(init_information);
-        }
-
         'functions_loop: for function in functions {
             let parsed_function = processing_module
                 .special_attributes
                 .functions
                 .iter()
-                .find(|f| f.name == function.function_id.identifier)
+                .find(|f| *f.name == *function.function_id.identifier)
                 .expect("function not found");
 
             // Determine the function type based on the function ID
             let function_type = if processing_module.functions.init.as_ref()
                 == Some(&function.function_id)
             {
-                FunctionType::Constructor
+                continue;
             } else if processing_module.functions.receive.as_ref() == Some(&function.function_id) {
                 FunctionType::Receive
             } else if processing_module.functions.fallback.as_ref() == Some(&function.function_id) {
@@ -193,6 +204,11 @@ impl Abi {
                         let struct_module = modules_data.get(module_id).unwrap();
                         let struct_ = struct_module.structs.get_by_index(*index).unwrap();
 
+                        // Skip one-time witness structs
+                        if struct_.type_ == IStructType::OneTimeWitness {
+                            continue;
+                        }
+
                         match (
                             struct_.identifier.as_str(),
                             module_id.address,
@@ -213,17 +229,12 @@ impl Abi {
                                         structs_to_process,
                                     );
                                 } else {
-                                    {
-                                        function_parameters.push(NamedType {
-                                            identifier: param.name.clone(),
-                                            type_: Type::from_intermediate_type(
-                                                itype,
-                                                modules_data,
-                                            ),
-                                        });
-                                        if Self::should_process_struct(itype, modules_data) {
-                                            structs_to_process.insert(itype.clone());
-                                        }
+                                    function_parameters.push(NamedType {
+                                        identifier: param.name,
+                                        type_: Type::from_intermediate_type(itype, modules_data),
+                                    });
+                                    if Self::should_process_struct(itype, modules_data) {
+                                        structs_to_process.insert(itype.clone());
                                     }
                                 }
                             }
@@ -254,7 +265,7 @@ impl Abi {
                         } else {
                             {
                                 function_parameters.push(NamedType {
-                                    identifier: param.name.clone(),
+                                    identifier: param.name,
                                     type_: Type::from_intermediate_type(itype, modules_data),
                                 });
                                 if Self::should_process_struct(itype, modules_data) {
@@ -270,9 +281,11 @@ impl Abi {
                             panic!("found not simple enum in function signature");
                         } else {
                             function_parameters.push(NamedType {
-                                identifier: param.name.clone(),
+                                identifier: param.name,
                                 type_: Type::from_intermediate_type(itype, modules_data),
                             });
+
+                            enums_to_process.insert(itype.clone());
                         }
                     }
                     IntermediateType::IGenericEnumInstance {
@@ -291,14 +304,16 @@ impl Abi {
                             panic!("found not simple enum in function signature");
                         } else {
                             function_parameters.push(NamedType {
-                                identifier: param.name.clone(),
+                                identifier: param.name,
                                 type_: Type::from_intermediate_type(itype, modules_data),
                             });
+
+                            enums_to_process.insert(itype.clone());
                         }
                     }
                     _ => {
                         function_parameters.push(NamedType {
-                            identifier: param.name.clone(),
+                            identifier: param.name,
                             type_: Type::from_intermediate_type(itype, modules_data),
                         });
                     }
@@ -308,9 +323,12 @@ impl Abi {
             let return_type = if function.signature.returns.is_empty() {
                 Type::None
             } else if function.signature.returns.len() == 1 {
-                if Self::should_process_struct(&function.signature.returns[0], modules_data) {
-                    structs_to_process.insert(function.signature.returns[0].clone());
-                }
+                Self::process_return_type(
+                    &function.signature.returns[0],
+                    modules_data,
+                    structs_to_process,
+                    enums_to_process,
+                );
 
                 Type::from_intermediate_type(&function.signature.returns[0], modules_data)
             } else {
@@ -319,9 +337,12 @@ impl Abi {
                     .returns
                     .iter()
                     .inspect(|t| {
-                        if Self::should_process_struct(t, modules_data) {
-                            structs_to_process.insert((*t).clone());
-                        }
+                        Self::process_return_type(
+                            t,
+                            modules_data,
+                            structs_to_process,
+                            enums_to_process,
+                        )
                     })
                     .map(|t| Type::from_intermediate_type(t, modules_data))
                     .collect();
@@ -338,9 +359,9 @@ impl Abi {
 
             // Function name
             let function_name = if function_type == FunctionType::Constructor {
-                "constructor".to_string()
+                Symbol::from("constructor")
             } else {
-                snake_to_camel(&function.function_id.identifier)
+                Symbol::from(snake_to_camel(&function.function_id.identifier))
             };
 
             result.push(Function {
@@ -384,13 +405,13 @@ impl Abi {
                 ) {
                     ("UID", STYLUS_FRAMEWORK_ADDRESS, SF_MODULE_NAME_OBJECT) => {
                         function_parameters.push(NamedType {
-                            identifier: param.name.clone(),
+                            identifier: param.name,
                             type_: Type::Bytes32,
                         });
                     }
                     _ => {
                         function_parameters.push(NamedType {
-                            identifier: param.name.clone(),
+                            identifier: param.name,
                             type_: Type::from_intermediate_type(struct_itype, modules_data),
                         });
                         if Self::should_process_struct(struct_itype, modules_data) {
@@ -420,7 +441,7 @@ impl Abi {
                     ("NamedId", STYLUS_FRAMEWORK_ADDRESS, SF_MODULE_NAME_OBJECT) => {}
                     _ => {
                         function_parameters.push(NamedType {
-                            identifier: param.name.clone(),
+                            identifier: param.name,
                             type_: Type::from_intermediate_type(struct_itype, modules_data),
                         });
                         if Self::should_process_struct(struct_itype, modules_data) {
@@ -431,6 +452,48 @@ impl Abi {
             }
             _ => panic!("processing a storager struct that has no id as first parameter"),
         }
+    }
+
+    pub fn process_enums(
+        enums: HashSet<IntermediateType>,
+        modules_data: &HashMap<ModuleId, ModuleData>,
+    ) -> Vec<Enum_> {
+        let mut result = Vec::new();
+        for enum_itype in enums {
+            let (module_id, index, types) = match &enum_itype {
+                IntermediateType::IEnum {
+                    module_id, index, ..
+                } => (module_id, index, None),
+                IntermediateType::IGenericEnumInstance {
+                    module_id,
+                    index,
+                    types,
+                    ..
+                } => (module_id, index, Some(types)),
+                t => panic!("found {t:?} instead of enum"),
+            };
+
+            let enum_module = modules_data.get(module_id).unwrap();
+            let enum_ = enum_module.enums.get_by_index(*index).unwrap();
+            let enum_ = match types {
+                Some(types) => enum_.instantiate(types),
+                None => enum_.clone(),
+            };
+
+            let parsed_enum = enum_module
+                .special_attributes
+                .enums
+                .iter()
+                .find(|e| *e.name == *enum_.identifier)
+                .unwrap();
+
+            result.push(Enum_ {
+                identifier: enum_.identifier,
+                variants: parsed_enum.variants.iter().map(|v| v.0).collect(),
+            });
+        }
+
+        result
     }
 
     pub fn process_structs(
@@ -468,7 +531,7 @@ impl Abi {
                     .special_attributes
                     .structs
                     .iter()
-                    .find(|s| s.name == struct_.identifier)
+                    .find(|s| *s.name == *struct_.identifier)
                     .unwrap();
 
                 (struct_, parsed_struct)
@@ -484,7 +547,7 @@ impl Abi {
                         child_structs_to_process.insert(field_itype.clone());
                     }
                     NamedType {
-                        identifier: name.clone(),
+                        identifier: *name,
                         type_: Type::from_intermediate_type(field_itype, modules_data),
                     }
                 })
@@ -520,10 +583,10 @@ impl Abi {
 
         for event in events {
             let event_module = modules_data
-                .get(&ModuleId {
-                    address: event.module_id.address().into_bytes().into(),
-                    module_name: event.module_id.name().to_string(),
-                })
+                .get(&ModuleId::new(
+                    event.module_id.address().into_bytes().into(),
+                    event.module_id.name().as_str(),
+                ))
                 .unwrap();
 
             let mut event_struct = event_module
@@ -546,7 +609,7 @@ impl Abi {
                 .special_attributes
                 .structs
                 .iter()
-                .find(|s| s.name.as_str() == event_struct.identifier)
+                .find(|s| *s.name == *event_struct.identifier)
                 .unwrap();
 
             // Collect structs from event fields
@@ -557,7 +620,7 @@ impl Abi {
             }
 
             result.push(Event {
-                identifier: event.identifier.clone(),
+                identifier: event.identifier,
                 fields: event_struct
                     .fields
                     .iter()
@@ -565,7 +628,7 @@ impl Abi {
                     .enumerate()
                     .map(|(index, (f, (identifier, _)))| EventField {
                         named_type: NamedType {
-                            identifier: identifier.clone(),
+                            identifier: *identifier,
                             type_: Type::from_intermediate_type(f, modules_data),
                         },
                         indexed: index < event_special_attributes.indexes as usize,
@@ -588,10 +651,10 @@ impl Abi {
 
         for error_struct in error_structs {
             let error_module = modules_data
-                .get(&ModuleId {
-                    address: error_struct.module_id.address().into_bytes().into(),
-                    module_name: error_struct.module_id.name().to_string(),
-                })
+                .get(&ModuleId::new(
+                    error_struct.module_id.address().into_bytes().into(),
+                    error_struct.module_id.name().as_str(),
+                ))
                 .unwrap();
 
             let error_struct = error_module
@@ -603,7 +666,7 @@ impl Abi {
                 .special_attributes
                 .structs
                 .iter()
-                .find(|s| s.name.as_str() == error_struct.identifier)
+                .find(|s| *s.name == *error_struct.identifier)
                 .unwrap();
 
             // Collect structs from error fields
@@ -616,13 +679,13 @@ impl Abi {
                 });
 
             result.push(Struct_ {
-                identifier: error_struct.identifier.to_string(),
+                identifier: error_struct.identifier,
                 fields: error_struct
                     .fields
                     .iter()
                     .zip(&error_struct_parsed.fields)
                     .map(|(f, (identifier, _))| NamedType {
-                        identifier: identifier.clone(),
+                        identifier: *identifier,
                         type_: Type::from_intermediate_type(f, modules_data),
                     })
                     .collect(),
@@ -652,9 +715,56 @@ impl Abi {
                 // True if the struct is not a named_id, uid or string
                 !is_named_id(&struct_.identifier, module_id)
                     && !is_uid(&struct_.identifier, module_id)
+                    && !is_id(&struct_.identifier, module_id)
                     && !is_string(&struct_.identifier, module_id)
+                    && !is_bytes_n(&struct_.identifier, module_id)
+                    && struct_.type_ != IStructType::OneTimeWitness
             }
+
             _ => false,
+        }
+    }
+
+    fn process_return_type(
+        itype: &IntermediateType,
+        modules_data: &HashMap<ModuleId, ModuleData>,
+        structs_to_process: &mut HashSet<IntermediateType>,
+        enums_to_process: &mut HashSet<IntermediateType>,
+    ) {
+        match itype {
+            IntermediateType::IRef(inner) | IntermediateType::IMutRef(inner) => {
+                Self::process_return_type(
+                    inner.as_ref(),
+                    modules_data,
+                    structs_to_process,
+                    enums_to_process,
+                )
+            }
+            IntermediateType::IEnum { module_id, index } => {
+                let enum_module = modules_data.get(module_id).unwrap();
+                let enum_ = enum_module.enums.get_by_index(*index).unwrap();
+                if enum_.is_simple {
+                    enums_to_process.insert(itype.clone());
+                }
+            }
+            IntermediateType::IGenericEnumInstance {
+                module_id,
+                index,
+                types,
+            } => {
+                let enum_module = modules_data.get(module_id).unwrap();
+                let enum_ = enum_module.enums.get_by_index(*index).unwrap();
+                let enum_ = enum_.instantiate(types);
+                if enum_.is_simple {
+                    enums_to_process.insert(itype.clone());
+                }
+            }
+            IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. }
+                if Self::should_process_struct(itype, modules_data) =>
+            {
+                structs_to_process.insert(itype.clone());
+            }
+            _ => {}
         }
     }
 }

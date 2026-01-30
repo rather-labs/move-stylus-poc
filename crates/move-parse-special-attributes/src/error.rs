@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use std::fmt::{self, Display};
 
 use move_compiler::{
@@ -8,6 +11,7 @@ use move_compiler::{
     },
 };
 use move_ir_types::location::Loc;
+use move_symbol_pool::Symbol;
 
 use crate::{
     abi_error::AbiErrorParseError,
@@ -19,6 +23,8 @@ use crate::{
     function_validation::FunctionValidationError,
     struct_validation::StructValidationError,
 };
+
+pub const DIAGNOSTIC_CATEGORY: &str = "Stylus ";
 
 #[derive(thiserror::Error, Debug)]
 pub enum SpecialAttributeErrorKind {
@@ -52,7 +58,22 @@ pub enum SpecialAttributeErrorKind {
     FrameworkReservedStruct(String, String),
 
     #[error("Named address '{0}' not found in address_alias_instantiation")]
-    NamedAddressNotFound(String),
+    NamedAddressNotFound(Symbol),
+
+    #[error("Unsupported attribute for identifiers: {0}")]
+    UnsupportedAttributeForIdentifiers(Symbol),
+
+    #[error("Unsupported solidity function modifier: {0}")]
+    UnsupportedSolidityFunctionModifier(Symbol),
+
+    #[error("Unsupported attribute for solidity function modifier: {0}")]
+    UnsupportedAttributeForSolidityFunctionModifier(Symbol),
+
+    #[error("Storage object '{0}' is declared multiple times")]
+    RepeatedStorageObject(Symbol),
+
+    #[error("Test function is marked as expected failure but it is not #[test].")]
+    ExpectedFailureWithoutTest,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -78,22 +99,59 @@ impl From<&SpecialAttributeError> for Diagnostic {
             SpecialAttributeErrorKind::AbiError(e) => e.into(),
             SpecialAttributeErrorKind::FunctionValidation(e) => e.into(),
             SpecialAttributeErrorKind::StructValidation(e) => e.into(),
+            SpecialAttributeErrorKind::ExpectedFailureWithoutTest => custom(
+                DIAGNOSTIC_CATEGORY,
+                Severity::BlockingError,
+                3,
+                3,
+                Box::leak(value.to_string().into_boxed_str()),
+            ),
             SpecialAttributeErrorKind::TooManyAttributes => custom(
-                "Special attributes error",
+                DIAGNOSTIC_CATEGORY,
                 Severity::BlockingError,
                 3,
                 3,
                 Box::leak(value.to_string().into_boxed_str()),
             ),
             SpecialAttributeErrorKind::FrameworkReservedStruct(_, _) => custom(
-                "Struct validation error",
+                DIAGNOSTIC_CATEGORY,
                 Severity::BlockingError,
                 3,
                 3,
                 Box::leak(value.to_string().into_boxed_str()),
             ),
             SpecialAttributeErrorKind::NamedAddressNotFound(_) => custom(
-                "Address resolution error",
+                DIAGNOSTIC_CATEGORY,
+                Severity::BlockingError,
+                3,
+                3,
+                Box::leak(value.to_string().into_boxed_str()),
+            ),
+            SpecialAttributeErrorKind::UnsupportedAttributeForIdentifiers(_) => custom(
+                DIAGNOSTIC_CATEGORY,
+                Severity::BlockingError,
+                3,
+                3,
+                Box::leak(value.to_string().into_boxed_str()),
+            ),
+            SpecialAttributeErrorKind::UnsupportedSolidityFunctionModifier(_) => custom(
+                DIAGNOSTIC_CATEGORY,
+                Severity::BlockingError,
+                3,
+                3,
+                Box::leak(value.to_string().into_boxed_str()),
+            ),
+            SpecialAttributeErrorKind::UnsupportedAttributeForSolidityFunctionModifier(_) => {
+                custom(
+                    DIAGNOSTIC_CATEGORY,
+                    Severity::BlockingError,
+                    3,
+                    3,
+                    Box::leak(value.to_string().into_boxed_str()),
+                )
+            }
+            SpecialAttributeErrorKind::RepeatedStorageObject(_) => custom(
+                DIAGNOSTIC_CATEGORY,
                 Severity::BlockingError,
                 3,
                 3,

@@ -1,5 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
+// Copyright (c) 2025 Rather Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+// Portions of this file were modified by Rather Labs, Inc on 2025-2026.
 
 #[allow(unused_const)]
 /// In addition to the fields declared in its type definition, a Sui object can have dynamic fields
@@ -10,8 +12,7 @@
 /// building block for core collection types
 module stylus::dynamic_field;
 
-use stylus::object::UID;
-use stylus::object as object;
+use stylus::object::{Self, UID};
 
 /// The object already has a dynamic field with this name (with the value and type specified)
 const EFieldAlreadyExists: u64 = 0;
@@ -40,7 +41,6 @@ public struct Field<Name: copy + drop + store, Value: store> has key {
 /// Adds a dynamic field to the object `object: &mut UID` at field specified by `name: Name`.
 /// Aborts with `EFieldAlreadyExists` if the object already has that field with that name.
 public fun add<Name: copy + drop + store, Value: store>(
-    // we use &mut UID in several spots for access control
     object: &mut UID,
     name: Name,
     value: Value,
@@ -127,12 +127,15 @@ public fun exists_with_type<Name: copy + drop + store, Value: store>(
     has_child_object(object_addr, hash)
 }
 
-/// May abort with `EBCSSerializationFailure`.
+// --- Internal Native Functions ---
+
+/// Generates a deterministic address hash based on the parent ID and the field name.
 public(package) native fun hash_type_and_key<K: copy + drop + store>(
     parent: address,
     k: K,
 ): address;
 
+/// Attaches a child object to a parent in the dynamic field namespace.
 public(package) native fun add_child_object<Child: key>(parent: address, child: Child);
 
 /// throws `EFieldDoesNotExist` if a child does not exist with that ID
@@ -141,6 +144,7 @@ public(package) native fun add_child_object<Child: key>(parent: address, child: 
 /// we need two versions to return a reference or a mutable reference
 public(package) native fun borrow_child_object<Child: key>(object: &UID, id: address): &Child;
 
+/// Retrieves a mutable reference to a child object. Aborts if ID or Type is invalid.
 public(package) native fun borrow_child_object_mut<Child: key>(
     object: &mut UID,
     id: address,
@@ -151,6 +155,8 @@ public(package) native fun borrow_child_object_mut<Child: key>(
 /// and may also abort with `EBCSSerializationFailure`.
 public(package) native fun remove_child_object<Child: key>(object: &UID, id: address): Child;
 
+/// Verifies existence of a child object without type validation.
 public(package) native fun has_child_object(parent: address, id: address): bool;
 
+/// Verifies existence of a child object with type validation.
 public(package) native fun has_child_object_with_ty<Child: key>(parent: address, id: address): bool;

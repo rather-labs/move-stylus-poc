@@ -1,6 +1,6 @@
 /**
  * This file was automatically generated and represents a Move program.
- * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus-poc).
+ * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus).
  */
 
 // SPDX-License-Identifier: MIT-OR-APACHE-2.0
@@ -24,6 +24,12 @@ interface EventsAnon2 {
     struct NestedStructWithEnum {
         EventEnum a;
         EventEnum[] b;
+    }
+
+    enum EventEnum {
+        EVENT_1,
+        EVENT_2,
+        EVENT_3,
     }
 
     function emitTestAnonEvent1(uint32 a, address b, uint32 c, address d, uint128 e) external;

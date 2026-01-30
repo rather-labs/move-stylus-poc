@@ -1,9 +1,12 @@
 use alloy_primitives::keccak256;
+use alloy_sol_types::{SolType, sol_data::FixedBytes};
 
 use crate::{
     CompilationContext,
     translation::intermediate_types::{IntermediateType, structs::IStruct},
-    vm_handled_types::{VmHandledType, bytes::Bytes, string::String_, tx_context::TxContext},
+    vm_handled_types::{
+        VmHandledType, bytes::Bytes, id::Id, string::String_, tx_context::TxContext,
+    },
 };
 
 use super::error::AbiError;
@@ -71,6 +74,11 @@ fn solidity_name(
         } if Bytes::is_vm_type(module_id, *index, compilation_ctx)? => {
             argument.sol_name(compilation_ctx)?
         }
+        IntermediateType::IStruct {
+            module_id, index, ..
+        } if Id::is_vm_type(module_id, *index, compilation_ctx)? => {
+            Some(FixedBytes::<32>::SOL_NAME.to_string())
+        }
         IntermediateType::IStruct { .. } | IntermediateType::IGenericStructInstance { .. } => {
             let struct_ = compilation_ctx.get_struct_by_intermediate_type(argument)?;
 
@@ -96,7 +104,7 @@ pub fn struct_fields_sol_name(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
     use move_binary_format::file_format::StructDefinitionIndex;
     use rstest::rstest;
@@ -115,21 +123,21 @@ mod tests {
 
     #[test]
     fn test_move_signature_to_event_signature_hash_nested() {
-        let (_, allocator_func, memory_id) = build_module(None);
-        let mut compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let (_, allocator_func, memory_id, ctx_globals) = build_module(None);
+        let mut compilation_ctx = test_compilation_context!(memory_id, allocator_func, ctx_globals);
 
         let struct_1 = IStruct::new(
             StructDefinitionIndex::new(0),
-            "TestStruct".to_string(),
+            "TestStruct",
             vec![
                 (None, IntermediateType::IAddress),
                 (
                     None,
-                    IntermediateType::IVector(Box::new(IntermediateType::IU32)),
+                    IntermediateType::IVector(Arc::new(IntermediateType::IU32)),
                 ),
                 (
                     None,
-                    IntermediateType::IVector(Box::new(IntermediateType::IU128)),
+                    IntermediateType::IVector(Arc::new(IntermediateType::IU128)),
                 ),
                 (None, IntermediateType::IBool),
                 (None, IntermediateType::IU8),
@@ -154,7 +162,7 @@ mod tests {
 
         let struct_2 = IStruct::new(
             StructDefinitionIndex::new(1),
-            "TestStruct2".to_string(),
+            "TestStruct2",
             vec![
                 (None, IntermediateType::IU32),
                 (None, IntermediateType::IU128),
@@ -182,7 +190,7 @@ mod tests {
     #[case(
         &IStruct::new(
             StructDefinitionIndex::new(0),
-            "Approval".to_string(),
+            "Approval",
             vec![
                 (None, IntermediateType::IAddress),
                 (None, IntermediateType::IAddress),
@@ -197,7 +205,7 @@ mod tests {
     #[case(
         &IStruct::new(
             StructDefinitionIndex::new(0),
-            "Transfer".to_string(),
+            "Transfer",
             vec![
                 (None, IntermediateType::IAddress),
                 (None, IntermediateType::IAddress),
@@ -212,7 +220,7 @@ mod tests {
     #[case(
         &IStruct::new(
             StructDefinitionIndex::new(0),
-            "Empty".to_string(),
+            "Empty",
             vec![],
             HashMap::new(),
             false,
@@ -224,8 +232,8 @@ mod tests {
         #[case] event_struct: &IStruct,
         #[case] expected: AbiEventSignatureHash,
     ) {
-        let (_, allocator_func, memory_id) = build_module(None);
-        let mut compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let (_, allocator_func, memory_id, ctx_globals) = build_module(None);
+        let mut compilation_ctx = test_compilation_context!(memory_id, allocator_func, ctx_globals);
 
         let mut module_data = ModuleData::default();
 

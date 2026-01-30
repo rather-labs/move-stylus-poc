@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use clap::*;
 use move_bytecode_to_wasm::package_module_data;
 use move_compiler::diagnostics::{Diagnostics, report_diagnostics};
@@ -34,10 +37,6 @@ impl ExportAbi {
         let install_dir = config.install_dir.clone();
 
         let package = config.compile_package(&rerooted_path, &mut Vec::new())?;
-
-        let package_modules =
-            package_module_data(&package, None, verbose).map_err(print_error_diagnostic)?;
-
         let root_compiled_units: Vec<&CompiledUnitWithSource> =
             if let Some(module_name) = module_name {
                 package
@@ -48,6 +47,9 @@ impl ExportAbi {
             } else {
                 package.root_compiled_units.iter().collect()
             };
+
+        let package_modules = package_module_data(&package, &root_compiled_units, verbose, false)
+            .map_err(print_error_diagnostic)?;
 
         // If neither flag is set, default to generating JSON
         let generate_json = self.json || !self.human_readable;

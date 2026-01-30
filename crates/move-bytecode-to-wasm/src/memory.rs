@@ -1,9 +1,10 @@
+use crate::compilation_context::globals::CompilationContextGlobals;
 use walrus::{
     ConstExpr, FunctionBuilder, FunctionId, MemoryId, Module, ValType,
     ir::{BinaryOp, Value},
 };
 
-const MEMORY_PAGE_SIZE: i32 = 65536;
+pub const MEMORY_PAGE_SIZE: i32 = 65536;
 
 /// Setup the module memory
 /// This function adds the following components to the module:
@@ -22,7 +23,7 @@ const MEMORY_PAGE_SIZE: i32 = 65536;
 pub fn setup_module_memory(
     module: &mut Module,
     initial_offset: Option<i32>,
-) -> (FunctionId, MemoryId) {
+) -> (FunctionId, MemoryId, CompilationContextGlobals) {
     let memory_id = module.memories.add_local(false, false, 1, None, None);
     module.exports.add("memory", memory_id);
 
@@ -53,61 +54,69 @@ pub fn setup_module_memory(
     body.block(None, |block| {
         let block_label = block.id();
 
-        block.local_get(requested_size);
-        block.global_get(global_available_memory);
-        block.binop(BinaryOp::I32Sub);
+        block
+            .local_get(requested_size)
+            .global_get(global_available_memory)
+            .binop(BinaryOp::I32Sub);
+
         // Memory delta (requested_size - available_memory)
         block.local_tee(memory_delta);
+
         // If memory delta is greater than 0, grow the memory
-        block.i32_const(0);
-        block.binop(BinaryOp::I32LeS);
-        block.br_if(block_label);
+        block
+            .i32_const(0)
+            .binop(BinaryOp::I32LeS)
+            .br_if(block_label);
+
         block.block(None, |block| {
             // Calculate grow pages
-            block.local_get(memory_delta);
-            block.i32_const(MEMORY_PAGE_SIZE);
-            block.binop(BinaryOp::I32DivU);
+            block
+                .local_get(memory_delta)
+                .i32_const(MEMORY_PAGE_SIZE)
+                .binop(BinaryOp::I32DivU);
+
             // Round up
-            block.i32_const(1);
-            block.binop(BinaryOp::I32Add);
-            block.local_tee(grow_pages);
+            block
+                .i32_const(1)
+                .binop(BinaryOp::I32Add)
+                .local_tee(grow_pages);
 
             // Grow the memory
             block.memory_grow(memory_id);
+
             // Panic if memory growth failed
-            block.i32_const(0);
-            block.binop(BinaryOp::I32GtS);
-            block.if_else(
+            block.i32_const(0).binop(BinaryOp::I32GtS).if_else(
                 None,
-                |block| {
+                |then_| {
                     // Update the global available memory
-                    block.local_get(grow_pages);
-                    block.i32_const(MEMORY_PAGE_SIZE);
-                    block.binop(BinaryOp::I32Mul);
-                    block.global_get(global_available_memory);
-                    block.binop(BinaryOp::I32Add);
-                    block.global_set(global_available_memory);
+                    then_
+                        .local_get(grow_pages)
+                        .i32_const(MEMORY_PAGE_SIZE)
+                        .binop(BinaryOp::I32Mul)
+                        .global_get(global_available_memory)
+                        .binop(BinaryOp::I32Add)
+                        .global_set(global_available_memory);
                 },
-                |block| {
+                |else_| {
                     // Panic
-                    block.unreachable();
+                    else_.unreachable();
                 },
             );
         });
     });
 
     // Return the pointer to the allocated memory
-    body.global_get(global_next_free_memory_pointer);
-    body.local_tee(memory_pointer);
-    body.local_get(requested_size);
-    body.binop(BinaryOp::I32Add);
-    body.global_set(global_next_free_memory_pointer);
+    body.global_get(global_next_free_memory_pointer)
+        .local_tee(memory_pointer)
+        .local_get(requested_size)
+        .binop(BinaryOp::I32Add)
+        .global_set(global_next_free_memory_pointer);
 
     // Reduce the available memory
-    body.global_get(global_available_memory);
-    body.local_get(requested_size);
-    body.binop(BinaryOp::I32Sub);
-    body.global_set(global_available_memory);
+    body.global_get(global_available_memory)
+        .local_get(requested_size)
+        .binop(BinaryOp::I32Sub)
+        .global_set(global_available_memory);
 
     body.local_get(memory_pointer);
 
@@ -116,6 +125,29 @@ pub fn setup_module_memory(
 
     // export globals only for testing
     if cfg!(test) {
+        // Function that resets memory
+        let mut func_builder = FunctionBuilder::new(&mut module.types, &[], &[]);
+
+        let mut builder = func_builder.name("reset_memory".to_owned()).func_body();
+
+        // Wipe memory
+        builder
+            .i32_const(initial_offset.unwrap_or(0))
+            .i32_const(0)
+            .i32_const(MEMORY_PAGE_SIZE)
+            .i32_const(initial_offset.unwrap_or(0))
+            .binop(BinaryOp::I32Sub)
+            .memory_fill(memory_id);
+
+        // Reset globals
+        builder
+            .i32_const(initial_offset.unwrap_or(0))
+            .global_set(global_next_free_memory_pointer);
+
+        let reset_memoryn_func = func_builder.finish(vec![], &mut module.funcs);
+
+        module.exports.add("reset_memory", reset_memoryn_func);
+
         module
             .exports
             .add("available_memory", global_available_memory);
@@ -127,12 +159,23 @@ pub fn setup_module_memory(
         );
     }
 
-    (func, memory_id)
+    let calldata_reader_pointer =
+        module
+            .globals
+            .add_local(ValType::I32, true, false, ConstExpr::Value(Value::I32(0)));
+
+    let compilation_context_globals = CompilationContextGlobals::new(
+        calldata_reader_pointer,
+        global_next_free_memory_pointer,
+        global_available_memory,
+    );
+
+    (func, memory_id, compilation_context_globals)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::test_tools::build_module;
+    use crate::test_tools::{INITIAL_MEMORY_OFFSET, build_module};
 
     use super::*;
 
@@ -140,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_memory_allocator() {
-        let (mut raw_module, _, _) = build_module(None);
+        let (mut raw_module, _, _, _) = build_module(None);
 
         let engine = Engine::default();
         let module = WasmModule::from_binary(&engine, &raw_module.emit_wasm()).unwrap();
@@ -155,7 +198,7 @@ mod tests {
         let available_memory = instance.get_global(&mut store, "available_memory").unwrap();
 
         let result = allocator.call(&mut store, 2).unwrap();
-        assert_eq!(result, 0);
+        assert_eq!(result, INITIAL_MEMORY_OFFSET);
         assert_eq!(memory_size.size(&mut store), 1);
         assert_eq!(
             available_memory.get(&mut store).i32().unwrap(),
@@ -163,7 +206,7 @@ mod tests {
         );
 
         let result = allocator.call(&mut store, 2).unwrap();
-        assert_eq!(result, 2);
+        assert_eq!(result, INITIAL_MEMORY_OFFSET + 2);
         assert_eq!(memory_size.size(&mut store), 1);
         assert_eq!(
             available_memory.get(&mut store).i32().unwrap(),
@@ -171,12 +214,12 @@ mod tests {
         );
 
         let result = allocator.call(&mut store, MEMORY_PAGE_SIZE - 4).unwrap();
-        assert_eq!(result, 4);
+        assert_eq!(result, INITIAL_MEMORY_OFFSET + 4);
         assert_eq!(memory_size.size(&mut store), 1);
         assert_eq!(available_memory.get(&mut store).i32().unwrap(), 0);
 
         let result = allocator.call(&mut store, 2).unwrap();
-        assert_eq!(result, 65536);
+        assert_eq!(result, INITIAL_MEMORY_OFFSET + 65536);
         assert_eq!(memory_size.size(&mut store), 2);
         assert_eq!(
             available_memory.get(&mut store).i32().unwrap(),

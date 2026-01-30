@@ -1,5 +1,7 @@
 // Copyright (c) The Move Contributors
+// Copyright (c) 2025 Rather Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+// Portions of this file were modified by Rather Labs, Inc on 2025-2026.
 
 use anyhow::{self, Context, ensure};
 use clap::*;
@@ -49,6 +51,7 @@ impl New {
         create_dir_all(path.join(SourcePackageLayout::Sources.path()))?;
 
         self.write_move_toml(path, deps, addrs, custom)?;
+        self.write_default_module(path)?;
         self.write_gitignore(path)?;
         Ok(())
     }
@@ -90,7 +93,7 @@ impl New {
             w,
             r#"[package]
 name = "{name}"
-edition = "2024.beta" # edition = "legacy" to use legacy (pre-2024) Move
+edition = "2024"
 # license = ""           # e.g., "MIT", "GPL", "Apache 2.0"
 # authors = ["..."]      # e.g., ["Joe Smith (joesmith@noemail.com)", "John Snow (johnsnow@noemail.com)"]
 
@@ -116,6 +119,10 @@ edition = "2024.beta" # edition = "legacy" to use legacy (pre-2024) Move
 
 [addresses]"#
         )?;
+
+        // Ensure the package's named address exists by default so `module <name>::<name>;`
+        // compiles without requiring extra compiler flags.
+        writeln!(w, "{name} = \"0x0\"")?;
 
         // write named addresses
         for (addr_name, addr_val) in addrs {
@@ -145,6 +152,30 @@ edition = "2024.beta" # edition = "legacy" to use legacy (pre-2024) Move
         if !custom.is_empty() {
             writeln!(w, "{custom}")?;
         }
+
+        Ok(())
+    }
+
+    /// create a default `<name>.move` file under `sources/`
+    fn write_default_module(&self, path: &Path) -> anyhow::Result<()> {
+        let sources_dir = path.join(SourcePackageLayout::Sources.path());
+        let source_file_path = sources_dir.join(format!("{}.move", self.name));
+
+        let mut w = std::fs::File::create(source_file_path)?;
+        writeln!(
+            w,
+            r#"module {name}::{name};
+
+entry fun hello_world(): vector<u8> {{
+    b"hello world"
+}}
+
+#[test]
+fun test_hello() {{
+    assert!(hello_world() == b"hello world", 1);
+}}"#,
+            name = self.name
+        )?;
 
         Ok(())
     }

@@ -1,13 +1,14 @@
+// Copyright (c) 2025 Rather Labs, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 module hello_world::hello_world_2;
 
-use stylus::tx_context::TxContext;
-use stylus::object as object;
-use stylus::object::UID;
-use stylus::event::emit;
-use stylus::fallback;
-use hello_world::stack::Stack;
-use hello_world::stack;
-
+use stylus::{
+    tx_context::TxContext, 
+    object::{Self, UID}, 
+    event::emit
+};
+use hello_world::stack::{Self, Stack};
 use hello_world::other_mod::{generic_identity, generic_identity_two_types};
 
 // Usage of generic functions
@@ -44,12 +45,12 @@ entry fun get_unique_id(ctx: &mut TxContext): UID {
 }
 
 // Events
-#[ext(event, indexes = 1)]
+#[ext(event(indexes = 1))]
 public struct TestEvent1 has copy, drop {
     n: u32
 }
 
-#[ext(event, indexes = 2)]
+#[ext(event(indexes = 2))]
 public struct TestEvent2 has copy, drop {
     a: u32,
     b: vector<u8>,
@@ -66,13 +67,13 @@ public struct NestedStruct2 has copy, drop {
     c: u128,
 }
 
-#[ext(event, indexes = 1)]
+#[ext(event(indexes = 1))]
 public struct TestEvent3 has copy, drop {
     a: NestedStruct1,
     b: NestedStruct2,
 }
 
-#[ext(event, indexes = 1)]
+#[ext(event(indexes = 1))]
 public struct TestEvent4 has copy, drop {
     a: u32,
     b: vector<u16>,
@@ -119,23 +120,24 @@ entry fun test_stack_3(): (Stack<u32>, u64){
     (s, s.size())
 }
 
-#[ext(event, indexes = 1)]
+#[ext(event(indexes = 1))]
 public struct ReceiveEvent has copy, drop {
     sender: address,
     data_length: u32,
     data: vector<u8>,
 }
 
-#[ext(payable)]
+#[ext(abi(payable))]
 entry fun receive(ctx: &TxContext) {
     emit(ReceiveEvent { sender: ctx.sender(), data_length: 0, data: vector[] });
 }
 
-#[ext(payable)]
-entry fun fallback(data: &fallback::Calldata, ctx: &TxContext) {
+#[ext(abi(payable))]
+entry fun fallback(ctx: &TxContext) {
+    let v = ctx.data();
     emit(ReceiveEvent { 
         sender: ctx.sender(), 
-        data_length: data.len(), 
-        data: data.as_vec() 
+        data_length: vector::length(&v) as u32, 
+        data: v
     });
 }

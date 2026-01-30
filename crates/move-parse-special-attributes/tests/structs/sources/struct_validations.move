@@ -1,8 +1,9 @@
 module test::struct_validations;
 
-use stylus::tx_context::TxContext;
-use stylus::object as object;
-use stylus::object::{UID, NamedId};
+use stylus::{
+    tx_context::TxContext, 
+    object::{Self, UID, NamedId}
+};
 
 public struct StructWithKeyNoUid has key {
     owner: address,
@@ -37,7 +38,7 @@ public struct StructWithoutKeyHasUidField {
     value: u64
 }
 
-#[ext(event, indexes = 1)]
+#[ext(event(indexes = 1))]
 public struct NestedEvent {
     data: vector<u8>,
 }
@@ -55,7 +56,6 @@ public struct StructWithNestedError {
     error: NestedError,
 }
 
-public struct Calldata {}
 public struct CrossContractCall {}
 public struct ContractCallResult {}
 public struct ContractCallEmptyResult {}

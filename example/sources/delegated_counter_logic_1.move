@@ -1,9 +1,14 @@
+// Copyright (c) 2025 Rather Labs, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 module hello_world::delegated_counter_logic_1;
 
-use stylus::tx_context::TxContext;
-use stylus::object::UID;
+use stylus::{
+    tx_context::TxContext, 
+    object::UID
+};
 
-#[ext(external_struct, module_name = b"delegated_counter", address = @0x0)]
+#[ext(external_struct(module_name = b"delegated_counter", address = @0x0))]
 public struct Counter has key {
     id: UID,
     owner: address,
@@ -11,7 +16,7 @@ public struct Counter has key {
     contract_address: address,
 }
 
-/// Increment a counter by 1.
+/// Increment a counter by 2.
 entry fun increment(counter: &mut Counter) {
     counter.value = counter.value + 1;
 }

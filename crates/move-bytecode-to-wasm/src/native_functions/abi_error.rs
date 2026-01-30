@@ -1,14 +1,15 @@
-use walrus::{
-    FunctionBuilder, FunctionId, Module, ValType,
-    ir::{MemArg, StoreKind},
-};
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
+use walrus::{FunctionBuilder, FunctionId, Module, ValType};
 
 use crate::{
     CompilationContext,
     abi_types::error_encoding::build_custom_error_message,
     compilation_context::ModuleId,
-    data::DATA_ABORT_MESSAGE_PTR_OFFSET,
+    data::RuntimeErrorData,
     translation::intermediate_types::{IntermediateType, structs::IStructType},
+    wasm_builder_extensions::WasmBuilderExtension,
 };
 
 use super::{NativeFunction, error::NativeFunctionError};
@@ -19,6 +20,7 @@ use super::{NativeFunction, error::NativeFunctionError};
 pub fn add_revert_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     error_itype: &IntermediateType,
     module_id: &ModuleId,
 ) -> Result<FunctionId, NativeFunctionError> {
@@ -37,7 +39,7 @@ pub fn add_revert_fn(
 
     let IStructType::AbiError = error_struct.type_ else {
         return Err(NativeFunctionError::RevertFunctionNoError(
-            error_struct.identifier.clone(),
+            error_struct.identifier,
         ));
     };
 
@@ -51,26 +53,14 @@ pub fn add_revert_fn(
         &mut builder,
         module,
         compilation_ctx,
+        runtime_error_data,
         &error_struct,
         error_struct_ptr,
     )?;
 
-    // Store the ptr at DATA_ABORT_MESSAGE_PTR_OFFSET
     builder
-        .i32_const(DATA_ABORT_MESSAGE_PTR_OFFSET)
         .local_get(encoded_error_ptr)
-        .store(
-            compilation_ctx.memory_id,
-            StoreKind::I32 { atomic: false },
-            MemArg {
-                align: 0,
-                offset: 0,
-            },
-        );
-
-    // Return 1 to indicate an error occurred
-    builder.i32_const(1);
-    builder.return_();
+        .add_handle_error_instructions(module, compilation_ctx, None);
 
     Ok(function.finish(vec![error_struct_ptr], &mut module.funcs))
 }

@@ -1,7 +1,12 @@
+// Copyright (c) 2025 Rather Labs, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 module hello_world::delegated_counter_interface;
 
-use stylus::contract_calls::{ContractCallEmptyResult, CrossContractCall};
-use stylus::object::UID;
+use stylus::{
+    contract_calls::{ContractCallEmptyResult, CrossContractCall}, 
+    object::UID
+};
 
 #[ext(external_call)]
 public struct CounterCall(CrossContractCall) has drop;

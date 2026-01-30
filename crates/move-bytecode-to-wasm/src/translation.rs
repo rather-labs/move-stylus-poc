@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use bytecodes::dynamic_fields::add_field_borrow_mut_global_var_instructions;
 pub use error::TranslationError;
 
@@ -14,7 +17,9 @@ pub mod table;
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     rc::Rc,
+    sync::Arc,
 };
 
 use walrus::{
@@ -30,11 +35,14 @@ use move_binary_format::{
     internals::ModuleIndex,
 };
 
+#[cfg(debug_assertions)]
+use crate::hasher::get_hasher;
+
 use crate::{
-    CompilationContext, GlobalFunctionTable,
+    CompilationContext,
     abi_types::error_encoding::build_abort_error_message,
     compilation_context::{ModuleData, ModuleId},
-    data::DATA_ABORT_MESSAGE_PTR_OFFSET,
+    data::{DATA_ABORT_MESSAGE_PTR_OFFSET, RuntimeErrorData},
     generics::{replace_type_parameters, type_contains_generics},
     hostio::host_functions::storage_flush_cache,
     native_functions::NativeFunction,
@@ -166,7 +174,8 @@ struct StorageIdParentInformation {
 /// This is used to pass around the context of the translation process. Also clippy complains about too many arguments in translate_instruction.
 struct TranslateFlowContext<'a> {
     compilation_ctx: &'a CompilationContext<'a>,
-    module_data: &'a ModuleData,
+    runtime_error_data: &'a mut RuntimeErrorData,
+    module_data: &'a ModuleData<'a>,
     types_stack: &'a mut TypesStack,
     function_information: &'a MappedFunction,
     function_table: &'a mut FunctionTable,
@@ -184,9 +193,11 @@ struct TranslateFlowContext<'a> {
 /// The return values are:
 /// 1. The translated WASM FunctionId
 /// 2. A list of function ids from other modules to be translated and linked.
+#[allow(clippy::too_many_arguments)]
 pub fn translate_function(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     module_data: &ModuleData,
     function_table: &mut FunctionTable,
     function_information: &MappedFunction,
@@ -198,7 +209,15 @@ pub fn translate_function(
     let mut function = FunctionBuilder::new(&mut module.types, &params, &results);
 
     #[cfg(debug_assertions)]
-    function.name(function_information.function_id.identifier.clone());
+    {
+        let mut hasher = get_hasher();
+        function_information.function_id.hash(&mut hasher);
+        function.name(format!(
+            "{}_{:x}",
+            function_information.function_id.identifier,
+            hasher.finish()
+        ));
+    }
 
     let mut builder = function.func_body();
 
@@ -236,6 +255,7 @@ pub fn translate_function(
         // Create the context for the translation of the flow
         let mut ctx = TranslateFlowContext {
             compilation_ctx,
+            runtime_error_data,
             module_data,
             function_table,
             function_information,
@@ -274,7 +294,7 @@ pub fn translate_function(
         .special_attributes
         .test_functions
         .iter()
-        .any(|f| f.name == function_information.function_id.identifier)
+        .any(|f| *f.name == *function_information.function_id.identifier)
     {
         module
             .exports
@@ -454,6 +474,8 @@ fn translate_flow(
                     builder.block(ty, |trap| {
                         trap.br_table(targets.into_boxed_slice(), trap.id());
                     });
+
+                    // If no case matches, trap.
                     builder.unreachable();
                     return Ok(());
                 }
@@ -515,6 +537,7 @@ fn translate_instruction(
     let mut functions_calls_to_link = Vec::new();
 
     let compilation_ctx = &translate_flow_ctx.compilation_ctx;
+    let runtime_error_data = &mut translate_flow_ctx.runtime_error_data;
     let module_data = &translate_flow_ctx.module_data;
     let mapped_function = &translate_flow_ctx.function_information;
     let function_table = &mut translate_flow_ctx.function_table;
@@ -524,26 +547,24 @@ fn translate_instruction(
     let control_targets = &translate_flow_ctx.control_targets;
     let jump_table = &mut translate_flow_ctx.jump_table;
     let dynamic_fields_global_variables = &mut translate_flow_ctx.dynamic_fields_global_variables;
+    let return_type = translate_flow_ctx
+        .function_information
+        .signature
+        .get_return_wasm_types()
+        .first()
+        .copied();
 
     match instruction {
         // Load a fixed constant
         Bytecode::LdConst(global_index) => {
-            let constant = &module_data.constants[global_index.0 as usize];
-            let mut data = constant.data.clone().into_iter();
-            let constant_type = &constant.type_;
-            let constant_type: IntermediateType = IntermediateType::try_from_signature_token(
-                constant_type,
-                &module_data.datatype_handles_map,
-            )?;
+            let constant = &module_data.constants[global_index.into_index()];
 
-            constant_type.load_constant_instructions(
-                module,
-                builder,
-                &mut data,
-                compilation_ctx,
-            )?;
+            let data = &mut constant.data.iter();
+            constant
+                .type_
+                .load_constant_instructions(module, builder, data, compilation_ctx)?;
 
-            types_stack.push(constant_type);
+            types_stack.push(constant.type_.clone());
             if data.next().is_some() {
                 return Err(TranslationError::ConstantDataNotConsumed);
             }
@@ -643,6 +664,7 @@ fn translate_instruction(
                 let delete_fn = RuntimeFunction::DeleteFromStorage.get_generic(
                     module,
                     compilation_ctx,
+                    Some(runtime_error_data),
                     &[&parent_struct],
                 )?;
 
@@ -658,7 +680,12 @@ fn translate_instruction(
                     },
                 );
 
-                builder.call(delete_fn);
+                builder.call_runtime_function(
+                    compilation_ctx,
+                    delete_fn,
+                    &RuntimeFunction::DeleteFromStorage,
+                    return_type,
+                );
             } else {
                 let type_instantiations = function_id
                     .type_instantiations
@@ -765,11 +792,18 @@ fn translate_instruction(
                         &function_id.identifier,
                         module,
                         compilation_ctx,
+                        Some(runtime_error_data),
                         &function_id.module_id,
                         type_instantiations,
                     )?;
 
-                    builder.call(native_function_id);
+                    builder.call_native_function(
+                        compilation_ctx,
+                        &function_id.identifier,
+                        &function_id.module_id,
+                        native_function_id,
+                        return_type,
+                    );
                 } else {
                     let table_id = function_table.get_table_id();
 
@@ -791,6 +825,7 @@ fn translate_instruction(
                         builder,
                         module,
                         compilation_ctx,
+                        return_type,
                     )?;
 
                     // Every time `dynamic_fields::borrow_mut` or
@@ -816,10 +851,18 @@ fn translate_instruction(
                     // After the call, check if any argument is a mutable reference to a vector
                     // and update it if needed.
                     if !mut_ref_vec_locals.is_empty() {
-                        let update_mut_ref_fn =
-                            RuntimeFunction::VecUpdateMutRef.get(module, Some(compilation_ctx))?;
+                        let update_mut_ref_fn = RuntimeFunction::VecUpdateMutRef.get(
+                            module,
+                            Some(compilation_ctx),
+                            None,
+                        )?;
                         for &local in mut_ref_vec_locals.iter() {
-                            builder.local_get(local).call(update_mut_ref_fn);
+                            builder.local_get(local).call_runtime_function(
+                                compilation_ctx,
+                                update_mut_ref_fn,
+                                &RuntimeFunction::VecUpdateMutRef,
+                                return_type,
+                            );
                         }
                     }
                 };
@@ -886,6 +929,7 @@ fn translate_instruction(
                 let delete_fn = RuntimeFunction::DeleteFromStorage.get_generic(
                     module,
                     compilation_ctx,
+                    Some(runtime_error_data),
                     &[&parent_struct],
                 )?;
 
@@ -901,7 +945,12 @@ fn translate_instruction(
                     },
                 );
 
-                builder.call(delete_fn);
+                builder.call_runtime_function(
+                    compilation_ctx,
+                    delete_fn,
+                    &RuntimeFunction::DeleteFromStorage,
+                    return_type,
+                );
             } else {
                 let (argument_types, mut_ref_vec_locals) = prepare_function_arguments(
                     module,
@@ -944,8 +993,10 @@ fn translate_instruction(
                                 module,
                                 builder,
                                 compilation_ctx,
+                                runtime_error_data,
                                 &mapped_function.signature.arguments,
                                 function_locals,
+                                return_type,
                             )?;
                             let (flush_cache_fn, _) = storage_flush_cache(module);
                             builder.i32_const(1).call(flush_cache_fn);
@@ -954,6 +1005,7 @@ fn translate_instruction(
                                 &function_id.identifier,
                                 module,
                                 compilation_ctx,
+                                runtime_error_data,
                                 &function_information.function_id.module_id,
                                 &argument_types,
                                 &named_ids_types,
@@ -994,7 +1046,13 @@ fn translate_instruction(
                             )?
                         };
 
-                    builder.call(native_function_id);
+                    builder.call_native_function(
+                        compilation_ctx,
+                        &function_information.function_id.identifier,
+                        &function_information.function_id.module_id,
+                        native_function_id,
+                        return_type,
+                    );
                 } else {
                     let table_id = function_table.get_table_id();
 
@@ -1016,16 +1074,25 @@ fn translate_instruction(
                         builder,
                         module,
                         compilation_ctx,
+                        return_type,
                     )?;
                 };
 
                 // After the call, check if any argument is a mutable reference to a vector
                 // and update it if needed.
                 if !mut_ref_vec_locals.is_empty() {
-                    let update_mut_ref_fn =
-                        RuntimeFunction::VecUpdateMutRef.get(module, Some(compilation_ctx))?;
+                    let update_mut_ref_fn = RuntimeFunction::VecUpdateMutRef.get(
+                        module,
+                        Some(compilation_ctx),
+                        None,
+                    )?;
                     for &local in mut_ref_vec_locals.iter() {
-                        builder.local_get(local).call(update_mut_ref_fn);
+                        builder.local_get(local).call_runtime_function(
+                            compilation_ctx,
+                            update_mut_ref_fn,
+                            &RuntimeFunction::VecUpdateMutRef,
+                            return_type,
+                        );
                     }
                 }
             }
@@ -1073,7 +1140,7 @@ fn translate_instruction(
                         uid_locals.insert(
                             *local_id,
                             StorageIdParentInformation {
-                                module_id: parent_module_id.clone(),
+                                module_id: *parent_module_id,
                                 index: *parent_index,
                                 instance_types: instance_types.clone(),
                             },
@@ -1099,7 +1166,7 @@ fn translate_instruction(
                         uid_locals.insert(
                             *local_id,
                             StorageIdParentInformation {
-                                module_id: parent_module_id.clone(),
+                                module_id: *parent_module_id,
                                 index: *parent_index,
                                 instance_types: instance_types.clone(),
                             },
@@ -1136,10 +1203,10 @@ fn translate_instruction(
                     }) = uid_locals.get(local_id)
                     {
                         types_stack.push(IntermediateType::IStruct {
-                            module_id: module_id.clone(),
+                            module_id: *module_id,
                             index: *index,
                             vm_handled_struct: VmHandledStruct::StorageId {
-                                parent_module_id: parent_module_id.clone(),
+                                parent_module_id: *parent_module_id,
                                 parent_index: *parent_index,
                                 instance_types: instance_types.clone(),
                             },
@@ -1161,11 +1228,11 @@ fn translate_instruction(
                     }) = uid_locals.get(local_id)
                     {
                         types_stack.push(IntermediateType::IGenericStructInstance {
-                            module_id: module_id.clone(),
+                            module_id: *module_id,
                             index: *index,
                             types: types.clone(),
                             vm_handled_struct: VmHandledStruct::StorageId {
-                                parent_module_id: parent_module_id.clone(),
+                                parent_module_id: *parent_module_id,
                                 parent_index: *parent_index,
                                 instance_types: instance_types.clone(),
                             },
@@ -1184,7 +1251,7 @@ fn translate_instruction(
                 module,
                 builder,
                 compilation_ctx,
-                module_data,
+                runtime_error_data,
                 local,
             )?;
             types_stack.push(local_type);
@@ -1193,13 +1260,13 @@ fn translate_instruction(
             let local = function_locals[*local_id as usize];
             let local_type = mapped_function.get_local_ir(*local_id as usize).clone();
             builder.local_get(local);
-            types_stack.push(IntermediateType::IRef(Box::new(local_type.clone())));
+            types_stack.push(IntermediateType::IRef(Arc::new(local_type.clone())));
         }
         Bytecode::MutBorrowLoc(local_id) => {
             let local = function_locals[*local_id as usize];
             let local_type = mapped_function.get_local_ir(*local_id as usize).clone();
             builder.local_get(local);
-            types_stack.push(IntermediateType::IMutRef(Box::new(local_type.clone())));
+            types_stack.push(IntermediateType::IMutRef(Arc::new(local_type.clone())));
         }
         Bytecode::ImmBorrowField(field_id) => {
             let struct_ = module_data.structs.get_by_field_handle_idx(field_id)?;
@@ -1218,21 +1285,22 @@ fn translate_instruction(
                 (
                     IntermediateType::IStruct { ref module_id, index, vm_handled_struct },
                     "struct",
-                    *ref_inner
+                    (*ref_inner).clone()
+
                 )
             );
 
             if module_id != &module_data.id || index != struct_.index() {
                 return Err(TypesStackError::TypeMismatch {
                     expected: IntermediateType::IStruct {
-                        module_id: module_data.id.clone(),
+                        module_id: module_data.id,
                         index: struct_.index(),
                         vm_handled_struct: VmHandledStruct::None,
                     },
                     found: IntermediateType::IStruct {
-                        module_id: module_id.clone(),
+                        module_id: *module_id,
                         index,
-                        vm_handled_struct,
+                        vm_handled_struct: vm_handled_struct.clone(),
                     },
                 }
                 .into());
@@ -1247,7 +1315,7 @@ fn translate_instruction(
                 module_data,
             )?;
 
-            types_stack.push(IntermediateType::IRef(Box::new(field_type)));
+            types_stack.push(IntermediateType::IRef(Arc::new(field_type)));
         }
         Bytecode::ImmBorrowFieldGeneric(field_id) => {
             let (struct_field_id, instantiation_types) = module_data
@@ -1298,19 +1366,19 @@ fn translate_instruction(
                 (
                     IntermediateType::IGenericStructInstance { ref module_id, index, ref types, vm_handled_struct },
                     "generic struct",
-                    *ref_inner
+                    (*ref_inner).clone()
                 )
             );
             if module_id != &module_data.id || index != struct_.index() {
                 return Err(TypesStackError::TypeMismatch {
                     expected: IntermediateType::IGenericStructInstance {
-                        module_id: module_data.id.clone(),
+                        module_id: module_data.id,
                         index: struct_.index(),
                         types: instantiation_types.clone(),
                         vm_handled_struct: VmHandledStruct::None,
                     },
                     found: IntermediateType::IGenericStructInstance {
-                        module_id: module_id.clone(),
+                        module_id: *module_id,
                         index,
                         types: types.clone(),
                         vm_handled_struct,
@@ -1333,15 +1401,15 @@ fn translate_instruction(
                 module_data,
             )?;
 
-            types_stack.push(IntermediateType::IRef(Box::new(field_type)));
+            types_stack.push(IntermediateType::IRef(Arc::new(field_type)));
         }
         Bytecode::MutBorrowField(field_id) => {
             let struct_ = module_data.structs.get_by_field_handle_idx(field_id)?;
 
             // Check if in the types stack we have the correct type
-            types_stack.pop_expecting(&IntermediateType::IMutRef(Box::new(
+            types_stack.pop_expecting(&IntermediateType::IMutRef(Arc::new(
                 IntermediateType::IStruct {
-                    module_id: module_data.id.clone(),
+                    module_id: module_data.id,
                     index: struct_.index(),
                     vm_handled_struct: VmHandledStruct::None,
                 },
@@ -1356,7 +1424,7 @@ fn translate_instruction(
                 module_data,
             )?;
 
-            types_stack.push(IntermediateType::IMutRef(Box::new(field_type)));
+            types_stack.push(IntermediateType::IMutRef(Arc::new(field_type)));
         }
         Bytecode::MutBorrowFieldGeneric(field_id) => {
             let (struct_field_id, instantiation_types) = module_data
@@ -1394,9 +1462,9 @@ fn translate_instruction(
             };
 
             // Check if in the types stack we have the correct type
-            types_stack.pop_expecting(&IntermediateType::IMutRef(Box::new(
+            types_stack.pop_expecting(&IntermediateType::IMutRef(Arc::new(
                 IntermediateType::IGenericStructInstance {
-                    module_id: module_data.id.clone(),
+                    module_id: module_data.id,
                     index: struct_.index(),
                     types: instantiation_types.to_vec(),
                     vm_handled_struct: VmHandledStruct::None,
@@ -1418,7 +1486,7 @@ fn translate_instruction(
                 module_data,
             )?;
 
-            types_stack.push(IntermediateType::IMutRef(Box::new(field_type)));
+            types_stack.push(IntermediateType::IMutRef(Arc::new(field_type)));
         }
         Bytecode::VecUnpack(signature_index, length) => {
             let expected_vec_inner =
@@ -1426,7 +1494,7 @@ fn translate_instruction(
 
             let expected_vec_inner = get_expected_vec_inner(expected_vec_inner, mapped_function)?;
 
-            types_stack.pop_expecting(&IntermediateType::IVector(Box::new(
+            types_stack.pop_expecting(&IntermediateType::IVector(Arc::new(
                 expected_vec_inner.clone(),
             )))?;
 
@@ -1449,7 +1517,11 @@ fn translate_instruction(
             types_stack::match_types!(
                 (IntermediateType::IU64, "u64", t1),
                 (IntermediateType::IRef(ref_inner), "vector reference", t2),
-                (IntermediateType::IVector(vec_inner), "vector", *ref_inner)
+                (
+                    IntermediateType::IVector(vec_inner),
+                    "vector",
+                    (*ref_inner).clone()
+                )
             );
 
             let expected_vec_inner =
@@ -1460,13 +1532,20 @@ fn translate_instruction(
             if *vec_inner != expected_vec_inner {
                 return Err(TranslationError::TypeMismatch {
                     expected: expected_vec_inner,
-                    found: *vec_inner,
+                    found: (*vec_inner).clone(),
                 });
             }
 
-            IVector::vec_borrow_instructions(&vec_inner, module, builder, compilation_ctx)?;
+            IVector::vec_borrow_instructions(
+                &vec_inner,
+                module,
+                builder,
+                compilation_ctx,
+                runtime_error_data,
+                return_type,
+            )?;
 
-            types_stack.push(IntermediateType::IRef(Box::new(*vec_inner)));
+            types_stack.push(IntermediateType::IRef(vec_inner.clone()));
         }
         Bytecode::VecMutBorrow(signature_index) => {
             let [t1, t2] = types_stack.pop_n_from_stack()?;
@@ -1478,7 +1557,11 @@ fn translate_instruction(
                     "mutable vector reference",
                     t2
                 ),
-                (IntermediateType::IVector(vec_inner), "vector", *ref_inner)
+                (
+                    IntermediateType::IVector(vec_inner),
+                    "vector",
+                    (*ref_inner).clone()
+                )
             );
 
             let expected_vec_inner =
@@ -1489,13 +1572,20 @@ fn translate_instruction(
             if *vec_inner != expected_vec_inner {
                 return Err(TranslationError::TypeMismatch {
                     expected: expected_vec_inner,
-                    found: *vec_inner,
+                    found: (*vec_inner).clone(),
                 });
             }
 
-            IVector::vec_borrow_instructions(&vec_inner, module, builder, compilation_ctx)?;
+            IVector::vec_borrow_instructions(
+                &vec_inner,
+                module,
+                builder,
+                compilation_ctx,
+                runtime_error_data,
+                return_type,
+            )?;
 
-            types_stack.push(IntermediateType::IMutRef(Box::new(*vec_inner)));
+            types_stack.push(IntermediateType::IMutRef(vec_inner.clone()));
         }
         Bytecode::VecPack(signature_index, num_elements) => {
             // If the inner type is a type parameter, replace it with the last type in the types stack.
@@ -1540,7 +1630,7 @@ fn translate_instruction(
                 n -= 1;
             }
 
-            types_stack.push(IntermediateType::IVector(Box::new(expected_vec_inner)));
+            types_stack.push(IntermediateType::IVector(Arc::new(expected_vec_inner)));
         }
         Bytecode::VecPopBack(signature_index) => {
             let ty = types_stack.pop()?;
@@ -1551,7 +1641,11 @@ fn translate_instruction(
                     "mutable vector reference",
                     ty
                 ),
-                (IntermediateType::IVector(vec_inner), "vector", *ref_inner)
+                (
+                    IntermediateType::IVector(vec_inner),
+                    "vector",
+                    (*ref_inner).clone()
+                )
             );
 
             let expected_vec_inner =
@@ -1562,7 +1656,7 @@ fn translate_instruction(
             if *vec_inner != expected_vec_inner {
                 return Err(TranslationError::TypeMismatch {
                     expected: expected_vec_inner.clone(),
-                    found: *vec_inner,
+                    found: (*vec_inner).clone(),
                 });
             }
 
@@ -1571,6 +1665,7 @@ fn translate_instruction(
                 | IntermediateType::IU8
                 | IntermediateType::IU16
                 | IntermediateType::IU32
+                | IntermediateType::IU64
                 | IntermediateType::IU128
                 | IntermediateType::IU256
                 | IntermediateType::IAddress
@@ -1580,26 +1675,30 @@ fn translate_instruction(
                 | IntermediateType::IVector(_)
                 | IntermediateType::IEnum { .. }
                 | IntermediateType::IGenericEnumInstance { .. } => {
-                    let pop_back_f =
-                        RuntimeFunction::VecPopBack32.get(module, Some(compilation_ctx))?;
-                    builder.call(pop_back_f);
-                }
-                IntermediateType::IU64 => {
-                    let pop_back_f =
-                        RuntimeFunction::VecPopBack64.get(module, Some(compilation_ctx))?;
-                    builder.call(pop_back_f);
+                    let pop_back_f = RuntimeFunction::VecPopBack.get_generic(
+                        module,
+                        compilation_ctx,
+                        Some(runtime_error_data),
+                        &[&*vec_inner],
+                    )?;
+                    builder.call_runtime_function(
+                        compilation_ctx,
+                        pop_back_f,
+                        &RuntimeFunction::VecPopBack,
+                        return_type,
+                    );
                 }
                 IntermediateType::ITypeParameter(_)
                 | IntermediateType::IRef(_)
                 | IntermediateType::IMutRef(_) => {
                     return Err(TranslationError::InvalidOperation {
                         operation: instruction.clone(),
-                        operand_type: *vec_inner,
+                        operand_type: (*vec_inner).clone(),
                     });
                 }
             }
 
-            types_stack.push(*vec_inner);
+            types_stack.push((*vec_inner).clone());
         }
         Bytecode::VecPushBack(signature_index) => {
             let [elem_ty, ref_ty] = types_stack.pop_n_from_stack()?;
@@ -1610,12 +1709,16 @@ fn translate_instruction(
                     "mutable vector reference",
                     ref_ty
                 ),
-                (IntermediateType::IVector(vec_inner), "vector", *mut_inner)
+                (
+                    IntermediateType::IVector(vec_inner),
+                    "vector",
+                    (*mut_inner).clone()
+                )
             );
 
             if elem_ty != *vec_inner {
                 return Err(TranslationError::TypeMismatch {
-                    expected: *vec_inner,
+                    expected: (*vec_inner).clone(),
                     found: elem_ty,
                 });
             }
@@ -1628,17 +1731,22 @@ fn translate_instruction(
             if *vec_inner != expected_vec_inner {
                 return Err(TranslationError::TypeMismatch {
                     expected: expected_vec_inner.clone(),
-                    found: *vec_inner,
+                    found: (*vec_inner).clone(),
                 });
             }
 
-            IVector::vec_push_back_instructions(
-                &elem_ty,
+            let push_back_f = RuntimeFunction::VecPushBack.get_generic(
                 module,
-                builder,
                 compilation_ctx,
-                module_data,
+                Some(runtime_error_data),
+                &[&elem_ty],
             )?;
+            builder.call_runtime_function(
+                compilation_ctx,
+                push_back_f,
+                &RuntimeFunction::VecPushBack,
+                return_type,
+            );
         }
         Bytecode::VecSwap(signature_index) => {
             let [id2_ty, id1_ty, ref_ty] = types_stack.pop_n_from_stack()?;
@@ -1651,7 +1759,11 @@ fn translate_instruction(
                     "mutable vector reference",
                     ref_ty
                 ),
-                (IntermediateType::IVector(vec_inner), "vector", *mut_inner)
+                (
+                    IntermediateType::IVector(vec_inner),
+                    "vector",
+                    (*mut_inner).clone()
+                )
             );
 
             let expected_vec_inner =
@@ -1662,20 +1774,22 @@ fn translate_instruction(
             if *vec_inner != expected_vec_inner {
                 return Err(TranslationError::TypeMismatch {
                     expected: expected_vec_inner,
-                    found: *vec_inner,
+                    found: (*vec_inner).clone(),
                 });
             }
 
-            match *vec_inner {
-                IntermediateType::IU64 => {
-                    let swap_f = RuntimeFunction::VecSwap64.get(module, Some(compilation_ctx))?;
-                    builder.call(swap_f);
-                }
-                _ => {
-                    let swap_f = RuntimeFunction::VecSwap32.get(module, Some(compilation_ctx))?;
-                    builder.call(swap_f);
-                }
-            }
+            let swap_f = RuntimeFunction::VecSwap.get_generic(
+                module,
+                compilation_ctx,
+                Some(runtime_error_data),
+                &[&*vec_inner],
+            )?;
+            builder.call_runtime_function(
+                compilation_ctx,
+                swap_f,
+                &RuntimeFunction::VecSwap,
+                return_type,
+            );
         }
         Bytecode::VecLen(signature_index) => {
             let elem_ir_type =
@@ -1685,11 +1799,15 @@ fn translate_instruction(
                 let ref_ty = types_stack.pop()?;
                 types_stack::match_types!(
                     (IntermediateType::IRef(inner), "vector reference", ref_ty),
-                    (IntermediateType::IVector(_vec_inner), "vector", *inner)
+                    (
+                        IntermediateType::IVector(_vec_inner),
+                        "vector",
+                        (*inner).clone()
+                    )
                 );
             } else {
-                types_stack.pop_expecting(&IntermediateType::IRef(Box::new(
-                    IntermediateType::IVector(Box::new(elem_ir_type)),
+                types_stack.pop_expecting(&IntermediateType::IRef(Arc::new(
+                    IntermediateType::IVector(Arc::new(elem_ir_type)),
                 )))?;
             };
 
@@ -1723,8 +1841,13 @@ fn translate_instruction(
                 ref_type
             ));
 
-            inner.add_read_ref_instructions(builder, module, compilation_ctx, module_data)?;
-            types_stack.push(*inner);
+            inner.add_read_ref_instructions(
+                builder,
+                module,
+                compilation_ctx,
+                runtime_error_data,
+            )?;
+            types_stack.push((*inner).clone());
         }
         Bytecode::WriteRef => {
             let [iref, value_type] = types_stack.pop_n_from_stack()?;
@@ -1735,7 +1858,7 @@ fn translate_instruction(
                 inner.add_write_ref_instructions(module, builder, compilation_ctx)?;
             } else {
                 Err(TranslationError::TypeMismatch {
-                    expected: *inner,
+                    expected: (*inner).clone(),
                     found: value_type,
                 })?;
             }
@@ -1766,8 +1889,10 @@ fn translate_instruction(
                     module,
                     builder,
                     compilation_ctx,
+                    runtime_error_data,
                     &mapped_function.signature.arguments,
                     function_locals,
+                    return_type,
                 )?;
             }
 
@@ -1790,27 +1915,61 @@ fn translate_instruction(
         }
         Bytecode::CastU8 => {
             let original_type = types_stack.pop()?;
-            IU8::cast_from(builder, module, original_type, compilation_ctx)?;
+            IU8::cast_from(
+                builder,
+                module,
+                original_type,
+                compilation_ctx,
+                runtime_error_data,
+                return_type,
+            )?;
             types_stack.push(IntermediateType::IU8);
         }
         Bytecode::CastU16 => {
             let original_type = types_stack.pop()?;
-            IU16::cast_from(builder, module, original_type, compilation_ctx)?;
+            IU16::cast_from(
+                builder,
+                module,
+                original_type,
+                compilation_ctx,
+                runtime_error_data,
+                return_type,
+            )?;
             types_stack.push(IntermediateType::IU16);
         }
         Bytecode::CastU32 => {
             let original_type = types_stack.pop()?;
-            IU32::cast_from(builder, module, original_type, compilation_ctx)?;
+            IU32::cast_from(
+                builder,
+                module,
+                original_type,
+                compilation_ctx,
+                runtime_error_data,
+                return_type,
+            )?;
             types_stack.push(IntermediateType::IU32);
         }
         Bytecode::CastU64 => {
             let original_type = types_stack.pop()?;
-            IU64::cast_from(builder, module, original_type, compilation_ctx)?;
+            IU64::cast_from(
+                builder,
+                module,
+                original_type,
+                compilation_ctx,
+                runtime_error_data,
+                return_type,
+            )?;
             types_stack.push(IntermediateType::IU64);
         }
         Bytecode::CastU128 => {
             let original_type = types_stack.pop()?;
-            IU128::cast_from(builder, module, original_type, compilation_ctx)?;
+            IU128::cast_from(
+                builder,
+                module,
+                original_type,
+                compilation_ctx,
+                runtime_error_data,
+            )?;
             types_stack.push(IntermediateType::IU128);
         }
         Bytecode::CastU256 => {
@@ -1829,12 +1988,48 @@ fn translate_instruction(
             }
 
             match t1 {
-                IntermediateType::IU8 => IU8::add(builder, module)?,
-                IntermediateType::IU16 => IU16::add(builder, module)?,
-                IntermediateType::IU32 => IU32::add(builder, module)?,
-                IntermediateType::IU64 => IU64::add(builder, module)?,
-                IntermediateType::IU128 => IU128::add(builder, module, compilation_ctx)?,
-                IntermediateType::IU256 => IU256::add(builder, module, compilation_ctx)?,
+                IntermediateType::IU8 => IU8::add(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU16 => IU16::add(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU32 => IU32::add(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU64 => IU64::add(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU128 => IU128::add(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU256 => IU256::add(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
                 _ => Err(TranslationError::InvalidBinaryOperation {
                     operation: Bytecode::Add,
                     operands_types: t1,
@@ -1854,12 +2049,48 @@ fn translate_instruction(
             }
 
             match t1 {
-                IntermediateType::IU8 => IU8::sub(builder, module)?,
-                IntermediateType::IU16 => IU16::sub(builder, module)?,
-                IntermediateType::IU32 => IU32::sub(builder, module)?,
-                IntermediateType::IU64 => IU64::sub(builder, module)?,
-                IntermediateType::IU128 => IU128::sub(builder, module, compilation_ctx)?,
-                IntermediateType::IU256 => IU256::sub(builder, module, compilation_ctx)?,
+                IntermediateType::IU8 => IU8::sub(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU16 => IU16::sub(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU32 => IU32::sub(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU64 => IU64::sub(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU128 => IU128::sub(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU256 => IU256::sub(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
                 _ => Err(TranslationError::InvalidBinaryOperation {
                     operation: Bytecode::Sub,
                     operands_types: t1,
@@ -1879,12 +2110,48 @@ fn translate_instruction(
             }
 
             match t1 {
-                IntermediateType::IU8 => IU8::mul(builder, module)?,
-                IntermediateType::IU16 => IU16::mul(builder, module)?,
-                IntermediateType::IU32 => IU32::mul(builder, module)?,
-                IntermediateType::IU64 => IU64::mul(builder, module)?,
-                IntermediateType::IU128 => IU128::mul(builder, module, compilation_ctx)?,
-                IntermediateType::IU256 => IU256::mul(builder, module, compilation_ctx)?,
+                IntermediateType::IU8 => IU8::mul(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU16 => IU16::mul(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU32 => IU32::mul(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU64 => IU64::mul(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU128 => IU128::mul(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU256 => IU256::mul(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
                 _ => Err(TranslationError::InvalidBinaryOperation {
                     operation: Bytecode::Mul,
                     operands_types: t1,
@@ -1908,8 +2175,20 @@ fn translate_instruction(
                 IntermediateType::IU16 => IU16::div(builder),
                 IntermediateType::IU32 => IU32::div(builder),
                 IntermediateType::IU64 => IU64::div(builder),
-                IntermediateType::IU128 => IU128::div(builder, module, compilation_ctx)?,
-                IntermediateType::IU256 => IU256::div(builder, module, compilation_ctx)?,
+                IntermediateType::IU128 => IU128::div(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU256 => IU256::div(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
                 _ => Err(TranslationError::InvalidBinaryOperation {
                     operation: Bytecode::Div,
                     operands_types: t1,
@@ -1937,15 +2216,25 @@ fn translate_instruction(
                 }
                 IntermediateType::IU128 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
-                    builder.i32_const(IU128::HEAP_SIZE).call(less_than_f);
+                    builder.i32_const(IU128::HEAP_SIZE).call_runtime_function(
+                        compilation_ctx,
+                        less_than_f,
+                        &RuntimeFunction::LessThan,
+                        return_type,
+                    );
                 }
                 IntermediateType::IU256 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
-                    builder.i32_const(IU256::HEAP_SIZE).call(less_than_f);
+                    builder.i32_const(IU256::HEAP_SIZE).call_runtime_function(
+                        compilation_ctx,
+                        less_than_f,
+                        &RuntimeFunction::LessThan,
+                        return_type,
+                    );
                 }
                 _ => Err(TranslationError::InvalidBinaryOperation {
                     operation: Bytecode::Lt,
@@ -1976,7 +2265,7 @@ fn translate_instruction(
                 // we can reuse the LessThan function
                 IntermediateType::IU128 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
                     // Temp variables to perform the swap
                     let a = module.locals.add(ValType::I32);
@@ -1985,12 +2274,17 @@ fn translate_instruction(
                     builder
                         .swap(a, b)
                         .i32_const(IU128::HEAP_SIZE)
-                        .call(less_than_f)
+                        .call_runtime_function(
+                            compilation_ctx,
+                            less_than_f,
+                            &RuntimeFunction::LessThan,
+                            return_type,
+                        )
                         .negate();
                 }
                 IntermediateType::IU256 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
                     // Temp variables to perform the swap
                     let a = module.locals.add(ValType::I32);
@@ -1999,7 +2293,12 @@ fn translate_instruction(
                     builder
                         .swap(a, b)
                         .i32_const(IU256::HEAP_SIZE)
-                        .call(less_than_f)
+                        .call_runtime_function(
+                            compilation_ctx,
+                            less_than_f,
+                            &RuntimeFunction::LessThan,
+                            return_type,
+                        )
                         .negate();
                 }
                 _ => Err(TranslationError::InvalidBinaryOperation {
@@ -2031,7 +2330,7 @@ fn translate_instruction(
                 // LessThan function
                 IntermediateType::IU128 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
                     let a = module.locals.add(ValType::I32);
                     let b = module.locals.add(ValType::I32);
@@ -2039,11 +2338,16 @@ fn translate_instruction(
                     builder
                         .swap(a, b)
                         .i32_const(IU128::HEAP_SIZE)
-                        .call(less_than_f);
+                        .call_runtime_function(
+                            compilation_ctx,
+                            less_than_f,
+                            &RuntimeFunction::LessThan,
+                            return_type,
+                        );
                 }
                 IntermediateType::IU256 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
                     let a = module.locals.add(ValType::I32);
                     let b = module.locals.add(ValType::I32);
@@ -2051,7 +2355,12 @@ fn translate_instruction(
                     builder
                         .swap(a, b)
                         .i32_const(IU256::HEAP_SIZE)
-                        .call(less_than_f);
+                        .call_runtime_function(
+                            compilation_ctx,
+                            less_than_f,
+                            &RuntimeFunction::LessThan,
+                            return_type,
+                        );
                 }
                 _ => Err(TranslationError::InvalidBinaryOperation {
                     operation: Bytecode::Gt,
@@ -2082,21 +2391,31 @@ fn translate_instruction(
                 // LessThan function
                 IntermediateType::IU128 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
                     // Compare
                     builder
                         .i32_const(IU128::HEAP_SIZE)
-                        .call(less_than_f)
+                        .call_runtime_function(
+                            compilation_ctx,
+                            less_than_f,
+                            &RuntimeFunction::LessThan,
+                            return_type,
+                        )
                         .negate();
                 }
                 IntermediateType::IU256 => {
                     let less_than_f =
-                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx))?;
+                        RuntimeFunction::LessThan.get(module, Some(compilation_ctx), None)?;
 
                     builder
                         .i32_const(IU256::HEAP_SIZE)
-                        .call(less_than_f)
+                        .call_runtime_function(
+                            compilation_ctx,
+                            less_than_f,
+                            &RuntimeFunction::LessThan,
+                            return_type,
+                        )
                         .negate();
                 }
                 _ => Err(TranslationError::InvalidBinaryOperation {
@@ -2122,8 +2441,20 @@ fn translate_instruction(
                 IntermediateType::IU16 => IU16::remainder(builder),
                 IntermediateType::IU32 => IU32::remainder(builder),
                 IntermediateType::IU64 => IU64::remainder(builder),
-                IntermediateType::IU128 => IU128::remainder(builder, module, compilation_ctx)?,
-                IntermediateType::IU256 => IU256::remainder(builder, module, compilation_ctx)?,
+                IntermediateType::IU128 => IU128::remainder(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU256 => IU256::remainder(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
                 _ => Err(TranslationError::InvalidBinaryOperation {
                     operation: Bytecode::Mod,
                     operands_types: t1,
@@ -2142,7 +2473,7 @@ fn translate_instruction(
                 });
             }
 
-            t1.load_equality_instructions(module, builder, compilation_ctx, module_data)?;
+            t1.load_equality_instructions(module, builder, compilation_ctx, runtime_error_data)?;
 
             types_stack.push(IntermediateType::IBool);
         }
@@ -2156,7 +2487,12 @@ fn translate_instruction(
                 });
             }
 
-            t1.load_not_equality_instructions(module, builder, compilation_ctx, module_data)?;
+            t1.load_not_equality_instructions(
+                module,
+                builder,
+                compilation_ctx,
+                runtime_error_data,
+            )?;
 
             types_stack.push(IntermediateType::IBool);
         }
@@ -2297,12 +2633,48 @@ fn translate_instruction(
             types_stack.pop_expecting(&IntermediateType::IU8)?;
             let t = types_stack.pop()?;
             match t {
-                IntermediateType::IU8 => IU8::bit_shift_left(builder, module)?,
-                IntermediateType::IU16 => IU16::bit_shift_left(builder, module)?,
-                IntermediateType::IU32 => IU32::bit_shift_left(builder, module)?,
-                IntermediateType::IU64 => IU64::bit_shift_left(builder, module)?,
-                IntermediateType::IU128 => IU128::bit_shift_left(builder, module, compilation_ctx)?,
-                IntermediateType::IU256 => IU256::bit_shift_left(builder, module, compilation_ctx)?,
+                IntermediateType::IU8 => IU8::bit_shift_left(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU16 => IU16::bit_shift_left(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU32 => IU32::bit_shift_left(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU64 => IU64::bit_shift_left(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU128 => IU128::bit_shift_left(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU256 => IU256::bit_shift_left(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
                 _ => Err(TranslationError::InvalidOperation {
                     operation: Bytecode::Shl,
                     operand_type: t.clone(),
@@ -2314,16 +2686,48 @@ fn translate_instruction(
             types_stack.pop_expecting(&IntermediateType::IU8)?;
             let t = types_stack.pop()?;
             match t {
-                IntermediateType::IU8 => IU8::bit_shift_right(builder, module)?,
-                IntermediateType::IU16 => IU16::bit_shift_right(builder, module)?,
-                IntermediateType::IU32 => IU32::bit_shift_right(builder, module)?,
-                IntermediateType::IU64 => IU64::bit_shift_right(builder, module)?,
-                IntermediateType::IU128 => {
-                    IU128::bit_shift_right(builder, module, compilation_ctx)?
-                }
-                IntermediateType::IU256 => {
-                    IU256::bit_shift_right(builder, module, compilation_ctx)?
-                }
+                IntermediateType::IU8 => IU8::bit_shift_right(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU16 => IU16::bit_shift_right(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU32 => IU32::bit_shift_right(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU64 => IU64::bit_shift_right(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU128 => IU128::bit_shift_right(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
+                IntermediateType::IU256 => IU256::bit_shift_right(
+                    builder,
+                    module,
+                    compilation_ctx,
+                    runtime_error_data,
+                    return_type,
+                )?,
                 _ => Err(TranslationError::InvalidOperation {
                     operation: Bytecode::Shr,
                     operand_type: t.clone(),
@@ -2346,7 +2750,7 @@ fn translate_instruction(
             bytecodes::structs::pack(struct_, module, builder, compilation_ctx, types_stack)?;
 
             types_stack.push(IntermediateType::IStruct {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: struct_definition_index.0,
                 vm_handled_struct: VmHandledStruct::None,
             });
@@ -2435,7 +2839,7 @@ fn translate_instruction(
                 .get_generic_struct_idx_by_struct_definition_idx(struct_definition_index);
 
             types_stack.push(IntermediateType::IGenericStructInstance {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: idx,
                 types,
                 vm_handled_struct: VmHandledStruct::None,
@@ -2443,7 +2847,7 @@ fn translate_instruction(
         }
         Bytecode::Unpack(struct_definition_index) => {
             let itype = types_stack.pop_expecting(&IntermediateType::IStruct {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: struct_definition_index.0,
                 vm_handled_struct: VmHandledStruct::None,
             })?;
@@ -2493,7 +2897,7 @@ fn translate_instruction(
             };
 
             let itype = types_stack.pop_expecting(&IntermediateType::IGenericStructInstance {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: idx,
                 types,
                 vm_handled_struct: VmHandledStruct::None,
@@ -2559,7 +2963,7 @@ fn translate_instruction(
             )?;
 
             types_stack.push(IntermediateType::IEnum {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: enum_.index,
             });
         }
@@ -2619,7 +3023,7 @@ fn translate_instruction(
             )?;
 
             types_stack.push(IntermediateType::IGenericEnumInstance {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: enum_.index,
                 types,
             });
@@ -2631,7 +3035,7 @@ fn translate_instruction(
                 .get_variant_position_by_variant_handle_idx(index)?;
 
             let itype = types_stack.pop_expecting(&IntermediateType::IEnum {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: enum_.index,
             })?;
 
@@ -2674,7 +3078,7 @@ fn translate_instruction(
             };
 
             let itype = types_stack.pop_expecting(&IntermediateType::IGenericEnumInstance {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: enum_.index,
                 types,
             })?;
@@ -2697,13 +3101,13 @@ fn translate_instruction(
 
             let is_mut_ref = matches!(instruction, Bytecode::UnpackVariantMutRef(_));
             let enum_type = IntermediateType::IEnum {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: enum_.index,
             };
             let expected_type = if is_mut_ref {
-                IntermediateType::IMutRef(Box::new(enum_type))
+                IntermediateType::IMutRef(Arc::new(enum_type))
             } else {
-                IntermediateType::IRef(Box::new(enum_type))
+                IntermediateType::IRef(Arc::new(enum_type))
             };
             types_stack.pop_expecting(&expected_type)?;
 
@@ -2749,14 +3153,14 @@ fn translate_instruction(
 
             let is_mut_ref = matches!(instruction, Bytecode::UnpackVariantGenericMutRef(_));
             let generic_enum_type = IntermediateType::IGenericEnumInstance {
-                module_id: module_data.id.clone(),
+                module_id: module_data.id,
                 index: enum_.index,
                 types,
             };
             let expected_type = if is_mut_ref {
-                IntermediateType::IMutRef(Box::new(generic_enum_type))
+                IntermediateType::IMutRef(Arc::new(generic_enum_type))
             } else {
-                IntermediateType::IRef(Box::new(generic_enum_type))
+                IntermediateType::IRef(Arc::new(generic_enum_type))
             };
             types_stack.pop_expecting(&expected_type)?;
 
@@ -2810,10 +3214,13 @@ fn call_indirect(
     builder: &mut InstrSeqBuilder,
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    caller_return_type: Option<ValType>,
 ) -> Result<(), TranslationError> {
     builder
         .i32_const(function_entry.index)
         .call_indirect(function_entry.type_id, wasm_table_id);
+
+    builder.add_propagate_error_instructions(compilation_ctx, None, caller_return_type);
 
     add_unpack_function_return_values_instructions(
         builder,
@@ -2916,8 +3323,10 @@ fn add_cache_storage_object_instructions(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     function_argumets: &[IntermediateType],
     function_locals: &[LocalId],
+    function_return_type: Option<ValType>,
 ) -> Result<(), TranslationError> {
     let object_to_cache = function_argumets
         .iter()
@@ -2944,11 +3353,14 @@ fn add_cache_storage_object_instructions(
 
     for (itype, wasm_local_var) in object_to_cache {
         let cache_storage_object_changes_fn = RuntimeFunction::CacheStorageObjectChanges
-            .get_generic(module, compilation_ctx, &[itype])?;
+            .get_generic(module, compilation_ctx, Some(runtime_error_data), &[itype])?;
 
-        builder
-            .local_get(wasm_local_var)
-            .call(cache_storage_object_changes_fn);
+        builder.local_get(wasm_local_var).call_runtime_function(
+            compilation_ctx,
+            cache_storage_object_changes_fn,
+            &RuntimeFunction::CacheStorageObjectChanges,
+            function_return_type,
+        );
     }
 
     Ok(())
@@ -2973,10 +3385,10 @@ fn struct_field_borrow_add_storage_id_parent_information(
             vm_handled_struct: VmHandledStruct::None,
         } if Uid::is_vm_type(module_id, *index, compilation_ctx)? => {
             Ok(IntermediateType::IStruct {
-                module_id: module_id.clone(),
+                module_id: *module_id,
                 index: *index,
                 vm_handled_struct: VmHandledStruct::StorageId {
-                    parent_module_id: module_data.id.clone(),
+                    parent_module_id: module_data.id,
                     parent_index: struct_.index(),
                     instance_types: None,
                 },
@@ -2989,11 +3401,11 @@ fn struct_field_borrow_add_storage_id_parent_information(
             vm_handled_struct: VmHandledStruct::None,
         } if NamedId::is_vm_type(module_id, *index, compilation_ctx)? => {
             Ok(IntermediateType::IGenericStructInstance {
-                module_id: module_id.clone(),
+                module_id: *module_id,
                 index: *index,
                 types: types.clone(),
                 vm_handled_struct: VmHandledStruct::StorageId {
-                    parent_module_id: module_data.id.clone(),
+                    parent_module_id: module_data.id,
                     parent_index: struct_.index(),
                     instance_types: Some(types.clone()),
                 },
@@ -3086,11 +3498,11 @@ fn get_storage_structs_with_named_ids(
                 }) if NamedId::is_vm_type(module_id, *index, compilation_ctx)? => {
                     result.push((
                         IntermediateType::IGenericStructInstance {
-                            module_id: module_id.clone(),
+                            module_id: *module_id,
                             index: *index,
                             types: types.clone(),
                             vm_handled_struct: VmHandledStruct::StorageId {
-                                parent_module_id: parent_module_id.clone(),
+                                parent_module_id: *parent_module_id,
                                 parent_index: struct_.index(),
                                 instance_types,
                             },
@@ -3114,9 +3526,10 @@ fn get_storage_structs_with_named_ids(
 pub(crate) fn translate_and_link_functions(
     function_id: &FunctionId,
     function_table: &mut FunctionTable,
-    function_definitions: &GlobalFunctionTable,
+    modules_data: &HashMap<ModuleId, ModuleData>,
     module: &mut walrus::Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     dynamic_fields_global_variables: &mut Vec<(GlobalId, IntermediateType)>,
 ) -> Result<(), TranslationError> {
     // Obtain the function information and module's data
@@ -3144,8 +3557,8 @@ pub(crate) fn translate_and_link_functions(
     let function_information = if function_information.is_generic {
         &function_information.instantiate(function_id.type_instantiations.as_ref().ok_or(
             TranslationError::GenericFunctionNoTypeInstantiations(
-                function_id.module_id.clone(),
-                function_id.identifier.clone(),
+                function_id.module_id,
+                function_id.identifier,
             ),
         )?)
     } else {
@@ -3167,9 +3580,11 @@ pub(crate) fn translate_and_link_functions(
         function_table.add(module, function_id.clone(), function_information)?;
     }
 
-    let function_definition = function_definitions
-        .get(&function_id.get_generic_fn_id())
-        .ok_or_else(|| TranslationError::FunctionDefinitionNotFound(function_id.clone()))?;
+    let function_definition = modules_data
+        .get(&function_id.module_id)
+        .unwrap_or(compilation_ctx.root_module_data)
+        .functions
+        .get_move_definition_by_id(&function_id.get_generic_fn_id())?;
 
     // If the function contains code we translate it
     // If it does not it means is a native function, we do nothing, it is linked and called
@@ -3178,6 +3593,7 @@ pub(crate) fn translate_and_link_functions(
         let (wasm_function_id, functions_to_link) = translate_function(
             module,
             compilation_ctx,
+            runtime_error_data,
             module_data,
             function_table,
             function_information,
@@ -3192,9 +3608,10 @@ pub(crate) fn translate_and_link_functions(
             translate_and_link_functions(
                 function_id,
                 function_table,
-                function_definitions,
+                modules_data,
                 module,
                 compilation_ctx,
+                runtime_error_data,
                 dynamic_fields_global_variables,
             )?;
         }
