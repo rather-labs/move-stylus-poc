@@ -1,21 +1,26 @@
-use std::collections::HashMap;
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
+use std::{collections::HashMap, sync::Arc};
 
 use move_binary_format::file_format::FieldHandleIndex;
 use walrus::{
     FunctionBuilder, FunctionId, InstrSeqBuilder, LocalId, Module, ValType,
-    ir::{BinaryOp, LoadKind, MemArg, StoreKind},
+    ir::{BinaryOp, ExtendedLoad, LoadKind, MemArg, StoreKind},
 };
 
 use crate::{
     CompilationContext,
     abi_types::{event_encoding::move_signature_to_event_signature_hash, packing::Packable},
     compilation_context::ModuleId,
+    data::RuntimeErrorData,
     hostio::host_functions::{emit_log, native_keccak256},
+    runtime::RuntimeFunction,
     translation::intermediate_types::{
         IntermediateType,
         structs::{IStruct, IStructType},
     },
-    vm_handled_types::{VmHandledType, string::String_},
+    vm_handled_types::{VmHandledType, id::Id, string::String_},
     wasm_builder_extensions::WasmBuilderExtension,
 };
 
@@ -33,6 +38,7 @@ use super::{NativeFunction, error::NativeFunctionError};
 pub fn add_emit_log_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     itype: &IntermediateType,
     module_id: &ModuleId,
 ) -> Result<FunctionId, NativeFunctionError> {
@@ -53,9 +59,7 @@ pub fn add_emit_log_fn(
         is_anonymous,
     } = struct_.type_
     else {
-        return Err(NativeFunctionError::EmitFunctionNoEvent(
-            struct_.identifier.clone(),
-        ));
+        return Err(NativeFunctionError::EmitFunctionNoEvent(struct_.identifier));
     };
 
     let mut function = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[]);
@@ -75,7 +79,7 @@ pub fn add_emit_log_fn(
     let local_64 = module.locals.add(ValType::I64);
     let abi_encoded_data_length = module.locals.add(ValType::I32);
 
-    // Before encoding the event, abi encode complex fields such as structs, vectors and strings,
+    // Before encoding the event, encode complex fields such as structs, vectors and strings,
     // then, if those fields are dynamic, we just put the keccak256 in the corresponding topic,
     // otherwise, we copy the whole encoding
     let mut event_fields_encoded_data = Vec::new();
@@ -119,6 +123,7 @@ pub fn add_emit_log_fn(
                     module,
                     &mut builder,
                     compilation_ctx,
+                    runtime_error_data,
                     inner,
                     local,
                 )?;
@@ -199,6 +204,7 @@ pub fn add_emit_log_fn(
                     module,
                     &mut builder,
                     compilation_ctx,
+                    runtime_error_data,
                     struct_,
                     local,
                 )?;
@@ -271,16 +277,15 @@ pub fn add_emit_log_fn(
 
         // If it is a stack type, we need to perform another load
         let local = if field.is_stack_type()? {
-            let (local, load_kind) = if field.stack_data_size()? == 8 {
-                (local_64, LoadKind::I64 { atomic: false })
-            } else {
-                (local, LoadKind::I32 { atomic: false })
+            let local = match ValType::try_from(field)? {
+                ValType::I64 => local_64,
+                _ => local,
             };
 
             builder
                 .load(
                     compilation_ctx.memory_id,
-                    load_kind,
+                    field.load_kind()?,
                     MemArg {
                         offset: 0,
                         align: 0,
@@ -317,6 +322,44 @@ pub fn add_emit_log_fn(
                     writer_pointer,
                     calldata_reference_pointer,
                     compilation_ctx,
+                    Some(runtime_error_data),
+                    None,
+                    None,
+                )?;
+            }
+
+            IntermediateType::IStruct {
+                module_id, index, ..
+            } if Id::is_vm_type(module_id, *index, compilation_ctx)? => {
+                builder
+                    .i32_const(32)
+                    .call(compilation_ctx.allocator)
+                    .local_tee(writer_pointer)
+                    .local_set(calldata_reference_pointer);
+
+                // Load the pointer to the address
+                builder
+                    .local_get(local)
+                    .load(
+                        compilation_ctx.memory_id,
+                        field.load_kind()?,
+                        MemArg {
+                            offset: 0,
+                            align: 0,
+                        },
+                    )
+                    .local_set(local);
+
+                IntermediateType::IAddress.add_pack_instructions(
+                    &mut builder,
+                    module,
+                    local,
+                    writer_pointer,
+                    calldata_reference_pointer,
+                    compilation_ctx,
+                    Some(runtime_error_data),
+                    None,
+                    None,
                 )?;
             }
             IntermediateType::IVector(_)
@@ -363,7 +406,7 @@ pub fn add_emit_log_fn(
 
         let data_struct = IStruct::new(
             move_binary_format::file_format::StructDefinitionIndex(0),
-            format!("{}Data", struct_.identifier),
+            &format!("{}Data", struct_.identifier),
             fields,
             HashMap::new(),
             false,
@@ -392,18 +435,19 @@ pub fn add_emit_log_fn(
             .local_tee(writer_pointer)
             .local_set(abi_encoded_data_calldata_reference_pointer);
 
-        // Use the allocator to get a pointer to the end of the calldata
-
+        let pack_struct_function = RuntimeFunction::PackStruct.get_generic(
+            module,
+            compilation_ctx,
+            Some(runtime_error_data),
+            &[itype],
+        )?;
         if data_struct.solidity_abi_encode_is_dynamic(compilation_ctx)? {
-            data_struct.add_pack_instructions(
-                &mut builder,
-                module,
-                data_struct_ptr,
-                writer_pointer,
-                abi_encoded_data_calldata_reference_pointer,
-                compilation_ctx,
-                Some(abi_encoded_data_calldata_reference_pointer),
-            )?;
+            builder
+                .local_get(data_struct_ptr)
+                .local_get(writer_pointer)
+                .local_get(abi_encoded_data_calldata_reference_pointer)
+                .i32_const(1) // is_nested = true
+                .call(pack_struct_function);
 
             // Move 32 bytes back the encoded
 
@@ -427,15 +471,12 @@ pub fn add_emit_log_fn(
 
             builder.memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
         } else {
-            data_struct.add_pack_instructions(
-                &mut builder,
-                module,
-                data_struct_ptr,
-                writer_pointer,
-                abi_encoded_data_calldata_reference_pointer,
-                compilation_ctx,
-                None,
-            )?;
+            builder
+                .local_get(data_struct_ptr)
+                .local_get(writer_pointer)
+                .local_get(abi_encoded_data_calldata_reference_pointer)
+                .i32_const(0) // is_nested = false
+                .call(pack_struct_function);
 
             builder
                 .i32_const(0)
@@ -470,6 +511,7 @@ fn add_encode_indexed_vector_instructions(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     inner: &IntermediateType,
     vector_ptr: LocalId,
 ) -> Result<(), NativeFunctionError> {
@@ -499,25 +541,14 @@ fn add_encode_indexed_vector_instructions(
         | IntermediateType::IU256
         | IntermediateType::IAddress => {
             let writer_pointer = module.locals.add(ValType::I32);
-            let (value, load_kind) = if inner == &IntermediateType::IU64 {
-                (
-                    module.locals.add(ValType::I64),
-                    LoadKind::I64 { atomic: false },
-                )
-            } else {
-                (
-                    module.locals.add(ValType::I32),
-                    LoadKind::I32 { atomic: false },
-                )
-            };
-
+            let value = module.locals.add(ValType::try_from(inner)?);
             builder.loop_(None, |loop_| {
                 inner_result = (|| {
                     loop_
                         .local_get(vector_ptr)
                         .load(
                             compilation_ctx.memory_id,
-                            load_kind,
+                            inner.load_kind()?,
                             MemArg {
                                 align: 0,
                                 offset: 0,
@@ -540,11 +571,14 @@ fn add_encode_indexed_vector_instructions(
                         writer_pointer,
                         writer_pointer,
                         compilation_ctx,
+                        Some(runtime_error_data),
+                        None,
+                        None,
                     )?;
 
                     loop_
                         .local_get(vector_ptr)
-                        .i32_const(inner.stack_data_size()? as i32)
+                        .i32_const(inner.wasm_memory_data_size()?)
                         .binop(BinaryOp::I32Add)
                         .local_set(vector_ptr);
 
@@ -561,7 +595,7 @@ fn add_encode_indexed_vector_instructions(
                 })();
             });
         }
-        IntermediateType::IVector(inner) => {
+        IntermediateType::IVector(nested_inner) => {
             let value = module.locals.add(ValType::I32);
             builder.i32_const(0).local_set(i);
 
@@ -573,7 +607,7 @@ fn add_encode_indexed_vector_instructions(
                         .local_get(vector_ptr)
                         .load(
                             compilation_ctx.memory_id,
-                            LoadKind::I32 { atomic: false },
+                            inner.load_kind()?,
                             MemArg {
                                 align: 0,
                                 offset: 0,
@@ -585,13 +619,14 @@ fn add_encode_indexed_vector_instructions(
                         module,
                         loop_,
                         compilation_ctx,
-                        inner,
+                        runtime_error_data,
+                        nested_inner,
                         value,
                     )?;
 
                     loop_
                         .local_get(vector_ptr)
-                        .i32_const(inner.stack_data_size()? as i32)
+                        .i32_const(inner.wasm_memory_data_size()?)
                         .binop(BinaryOp::I32Add)
                         .local_set(vector_ptr);
 
@@ -659,7 +694,7 @@ fn add_encode_indexed_vector_instructions(
 
             if !enum_.is_simple {
                 return Err(NativeFunctionError::EmitFunctionInvalidEventField(
-                    IntermediateType::IVector(Box::new(inner.clone())),
+                    IntermediateType::IVector(Arc::new(inner.clone())),
                 ));
             }
 
@@ -704,6 +739,9 @@ fn add_encode_indexed_vector_instructions(
                         writer_pointer,
                         writer_pointer,
                         compilation_ctx,
+                        None,
+                        None,
+                        None,
                     )?;
 
                     loop_
@@ -727,7 +765,7 @@ fn add_encode_indexed_vector_instructions(
         }
         _ => {
             return Err(NativeFunctionError::EmitFunctionInvalidEventField(
-                IntermediateType::IVector(Box::new(inner.clone())),
+                IntermediateType::IVector(Arc::new(inner.clone())),
             ));
         }
     }
@@ -744,6 +782,7 @@ fn add_encode_indexed_struct_instructions(
     module: &mut Module,
     builder: &mut InstrSeqBuilder,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     struct_: &IStruct,
     struct_ptr: LocalId,
 ) -> Result<(), NativeFunctionError> {
@@ -759,17 +798,7 @@ fn add_encode_indexed_struct_instructions(
             | IntermediateType::IU256
             | IntermediateType::IAddress => {
                 let writer_pointer = module.locals.add(ValType::I32);
-                let (value, load_kind) = if *field == IntermediateType::IU64 {
-                    (
-                        module.locals.add(ValType::I64),
-                        LoadKind::I64 { atomic: false },
-                    )
-                } else {
-                    (
-                        module.locals.add(ValType::I32),
-                        LoadKind::I32 { atomic: false },
-                    )
-                };
+                let value = module.locals.add(ValType::try_from(field)?);
 
                 builder.local_get(struct_ptr).load(
                     compilation_ctx.memory_id,
@@ -784,7 +813,7 @@ fn add_encode_indexed_struct_instructions(
                     builder
                         .load(
                             compilation_ctx.memory_id,
-                            load_kind,
+                            field.load_kind()?,
                             MemArg {
                                 align: 0,
                                 offset: 0,
@@ -808,6 +837,9 @@ fn add_encode_indexed_struct_instructions(
                     writer_pointer,
                     writer_pointer,
                     compilation_ctx,
+                    None,
+                    None,
+                    None,
                 )?;
             }
             IntermediateType::IVector(inner) => {
@@ -829,6 +861,7 @@ fn add_encode_indexed_struct_instructions(
                     module,
                     builder,
                     compilation_ctx,
+                    runtime_error_data,
                     inner,
                     value,
                 )?;
@@ -897,6 +930,7 @@ fn add_encode_indexed_struct_instructions(
                     module,
                     builder,
                     compilation_ctx,
+                    runtime_error_data,
                     child_struct,
                     value,
                 )?;
@@ -927,7 +961,9 @@ fn add_encode_indexed_struct_instructions(
                     )
                     .load(
                         compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
+                        LoadKind::I32_8 {
+                            kind: ExtendedLoad::ZeroExtend,
+                        },
                         MemArg {
                             align: 0,
                             offset: 0,
@@ -948,6 +984,9 @@ fn add_encode_indexed_struct_instructions(
                     writer_pointer,
                     writer_pointer,
                     compilation_ctx,
+                    None,
+                    None,
+                    None,
                 )?;
             }
             _ => {
@@ -1043,21 +1082,21 @@ fn add_encode_indexed_string(
                 },
             );
 
-        // increment the local to point to next first value
+        // Increment the string pointer by 1 byte to point to the next u8 element
         loop_block
             .local_get(string_ptr)
-            .i32_const(4)
+            .i32_const(1)
             .binop(BinaryOp::I32Add)
             .local_set(string_ptr);
 
-        // increment data pointer
+        // Increment the writer pointer by 1 byte to point to the next u8 element
         loop_block
             .local_get(writer_pointer)
             .i32_const(1)
             .binop(BinaryOp::I32Add)
             .local_set(writer_pointer);
 
-        // increment i
+        // Increment i
         loop_block
             .local_get(i)
             .i32_const(1)

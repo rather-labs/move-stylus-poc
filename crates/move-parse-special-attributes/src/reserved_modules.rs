@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 // Standard Library Address
 pub const STDLIB_ADDRESS: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
@@ -26,7 +29,6 @@ pub const SF_MODULE_NAME_EVENT: &str = "event";
 pub const SF_MODULE_NAME_TYPES: &str = "types";
 pub const SF_MODULE_NAME_TABLE: &str = "table";
 pub const SF_MODULE_NAME_ERROR: &str = "error";
-pub const SF_MODULE_NAME_FALLBACK: &str = "fallback";
 pub const SF_MODULE_NAME_SOL_TYPES: &str = "sol_types";
 
 /// All reserved struct names in the Stylus Framework
@@ -40,5 +42,7 @@ pub const SF_RESERVED_STRUCTS: &[&str] = &[
     "UID",
     "NamedId",
     "Table",
-    "Calldata",
+    "FrozenStorageObject",
+    "OwnedStorageObject",
+    "SharedStorageObject",
 ];

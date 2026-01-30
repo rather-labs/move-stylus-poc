@@ -1,7 +1,10 @@
-use move_parse_special_attributes::function_modifiers::FunctionModifier;
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
+use move_parse_special_attributes::function_modifiers::SolidityFunctionModifier;
 use walrus::{
     FunctionBuilder, FunctionId, LocalId, Module, ValType,
-    ir::{BinaryOp, LoadKind, MemArg, StoreKind},
+    ir::{BinaryOp, ExtendedLoad, LoadKind, MemArg, StoreKind},
 };
 
 use crate::{
@@ -10,7 +13,7 @@ use crate::{
         function_encoding::move_signature_to_abi_selector, packing::Packable, unpacking::Unpackable,
     },
     compilation_context::ModuleId,
-    data::DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET,
+    data::{DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET, RuntimeErrorData},
     hostio::host_functions::{
         call_contract, delegate_call_contract, read_return_data, static_call_contract,
     },
@@ -24,6 +27,7 @@ use crate::{
         contract_call_result::{ContractCallEmptyResult, ContractCallResult},
         uid::Uid,
     },
+    wasm_builder_extensions::WasmBuilderExtension,
 };
 
 use super::error::NativeFunctionError;
@@ -37,12 +41,14 @@ use super::error::NativeFunctionError;
 /// the `value` argument as the first argument. Additionally, if the function is declared with the
 /// `gas` argument, it will be passed to the `call_contract` functions, otherwise, the maximum gas
 /// (u64::MAX) will be used.
+#[allow(clippy::too_many_arguments)]
 pub fn add_external_contract_call_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     module_id: &ModuleId,
     function_information: &MappedFunction,
-    function_modifiers: &[FunctionModifier],
+    function_modifiers: &[SolidityFunctionModifier],
     arguments_types: &[IntermediateType],
     named_ids: &[IntermediateType],
 ) -> Result<FunctionId, NativeFunctionError> {
@@ -61,8 +67,8 @@ pub fn add_external_contract_call_fn(
     let (call_contract, _) = call_contract(module);
     let (delegate_call_contract, _) = delegate_call_contract(module);
     let (static_call_contract, _) = static_call_contract(module);
-    let swap_i32 = RuntimeFunction::SwapI32Bytes.get(module, None)?;
-    let swap = RuntimeFunction::SwapI256Bytes.get(module, Some(compilation_ctx))?;
+    let swap_i32 = RuntimeFunction::SwapI32Bytes.get(module, None, None)?;
+    let swap = RuntimeFunction::SwapI256Bytes.get(module, Some(compilation_ctx), None)?;
 
     let mut arguments = function_information.signature.get_argument_wasm_types()?;
 
@@ -78,8 +84,7 @@ pub fn add_external_contract_call_fn(
     let self_ = function_args
         .first()
         .ok_or(NativeFunctionError::ContractCallFunctionNoArgs(
-            module_id.clone(),
-            name,
+            *module_id, name,
         ))?;
 
     // Locals
@@ -127,7 +132,9 @@ pub fn add_external_contract_call_fn(
         )
         .load(
             compilation_ctx.memory_id,
-            LoadKind::I32 { atomic: false },
+            LoadKind::I32_8 {
+                kind: ExtendedLoad::ZeroExtend,
+            },
             MemArg {
                 align: 0,
                 offset: 0,
@@ -157,7 +164,7 @@ pub fn add_external_contract_call_fn(
         .local_set(gas);
 
     // Load value (if the function is payable) otherwise we load zeroes
-    if function_modifiers.contains(&FunctionModifier::Payable) {
+    if function_modifiers.contains(&SolidityFunctionModifier::Payable) {
         builder
             .local_get(*self_)
             .load(
@@ -247,6 +254,9 @@ pub fn add_external_contract_call_fn(
                     writer_pointer,
                     calldata_reference_pointer,
                     compilation_ctx,
+                    Some(runtime_error_data),
+                    None,
+                    Some(ValType::I32),
                 )?;
 
                 builder
@@ -262,6 +272,9 @@ pub fn add_external_contract_call_fn(
                     writer_pointer,
                     calldata_reference_pointer,
                     compilation_ctx,
+                    Some(runtime_error_data),
+                    None,
+                    Some(ValType::I32),
                 )?;
 
                 builder
@@ -290,8 +303,8 @@ pub fn add_external_contract_call_fn(
 
     // If the function is pure or view, we use static_call_contract since no state modification is
     // allowed
-    if function_modifiers.contains(&FunctionModifier::Pure)
-        || function_modifiers.contains(&FunctionModifier::View)
+    if function_modifiers.contains(&SolidityFunctionModifier::Pure)
+        || function_modifiers.contains(&SolidityFunctionModifier::View)
     {
         builder
             .local_get(address_ptr)
@@ -459,11 +472,15 @@ pub fn add_external_contract_call_fn(
 
                         // Unpack the value
                         result_type.add_unpack_instructions(
+                            None,
                             block,
                             module,
+                            None,
+                            Some(ValType::I32),
                             return_data_abi_encoded_ptr,
                             calldata_reader_pointer,
                             compilation_ctx,
+                            Some(runtime_error_data),
                         )?;
 
                         let abi_decoded_call_result = if result_type == &IntermediateType::IU64 {
@@ -553,7 +570,7 @@ pub fn add_external_contract_call_fn(
                 let (parent_struct_itype, parent_struct) =
                     if let Some(instance_types) = instance_types {
                         let itype = IntermediateType::IGenericStructInstance {
-                            module_id: parent_module_id.clone(),
+                            module_id: *parent_module_id,
                             index: *parent_index,
                             types: instance_types.clone(),
                             vm_handled_struct: VmHandledStruct::None,
@@ -566,7 +583,7 @@ pub fn add_external_contract_call_fn(
                         (itype, struct_)
                     } else {
                         let itype = IntermediateType::IStruct {
-                            module_id: parent_module_id.clone(),
+                            module_id: *parent_module_id,
                             index: *parent_index,
                             vm_handled_struct: VmHandledStruct::None,
                         };
@@ -601,7 +618,7 @@ pub fn add_external_contract_call_fn(
                 let (parent_struct_itype, parent_struct) =
                     if let Some(instance_types) = instance_types {
                         let itype = IntermediateType::IGenericStructInstance {
-                            module_id: parent_module_id.clone(),
+                            module_id: *parent_module_id,
                             index: *parent_index,
                             types: instance_types.clone(),
                             vm_handled_struct: VmHandledStruct::None,
@@ -614,7 +631,7 @@ pub fn add_external_contract_call_fn(
                         (itype, struct_)
                     } else {
                         let itype = IntermediateType::IStruct {
-                            module_id: parent_module_id.clone(),
+                            module_id: *parent_module_id,
                             index: *parent_index,
                             vm_handled_struct: VmHandledStruct::None,
                         };
@@ -642,14 +659,18 @@ pub fn add_external_contract_call_fn(
     storage_objects.extend(named_ids_storage_objects);
 
     if !storage_objects.is_empty() {
-        let locate_storage_data_fn =
-            RuntimeFunction::LocateStorageData.get(module, Some(compilation_ctx))?;
+        let locate_storage_data_fn = RuntimeFunction::LocateStorageData.get(
+            module,
+            Some(compilation_ctx),
+            Some(runtime_error_data),
+        )?;
 
         let mut inner_result = Ok(());
         builder.block(None, |block| {
             let block_id = block.id();
 
             let uid_ptr = module.locals.add(ValType::I32);
+            let owner_ptr = module.locals.add(ValType::I32);
             let original_struct_ptr = module.locals.add(ValType::I32);
             let new_struct_ptr = module.locals.add(ValType::I32);
 
@@ -697,11 +718,22 @@ pub fn add_external_contract_call_fn(
                     )
                     .local_tee(uid_ptr)
                     .i32_const(0)
-                    .call(locate_storage_data_fn);
+                    .call_runtime_function(
+                        compilation_ctx,
+                        locate_storage_data_fn,
+                        &RuntimeFunction::LocateStorageData,
+                        Some(ValType::I32),
+                    )
+                    .local_set(owner_ptr);
 
                 // The slot for this struct written in DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET
                 let read_and_decode_from_storage_fn = RuntimeFunction::ReadAndDecodeFromStorage
-                    .get_generic(module, compilation_ctx, &[&storage_obj_itype]);
+                    .get_generic(
+                        module,
+                        compilation_ctx,
+                        Some(runtime_error_data),
+                        &[&storage_obj_itype],
+                    );
 
                 match read_and_decode_from_storage_fn {
                     Err(e) => {
@@ -711,7 +743,13 @@ pub fn add_external_contract_call_fn(
                         block
                             .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
                             .local_get(uid_ptr)
-                            .call(read_and_decode_from_storage_fn)
+                            .local_get(owner_ptr)
+                            .call_runtime_function(
+                                compilation_ctx,
+                                read_and_decode_from_storage_fn,
+                                &RuntimeFunction::ReadAndDecodeFromStorage,
+                                Some(ValType::I32),
+                            )
                             .local_set(new_struct_ptr);
 
                         // Once we return from the reading the allegedly modified object from storage, we

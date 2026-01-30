@@ -1,6 +1,6 @@
 /**
  * This file was automatically generated and represents a Move program.
- * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus-poc).
+ * For more information, please see [The Move to Stylus compiler](https://github.com/rather-labs/move-stylus).
  */
 
 // SPDX-License-Identifier: MIT-OR-APACHE-2.0
@@ -19,6 +19,12 @@ interface AbiError3 {
     struct NestedStruct2 {
         string a;
         uint64 b;
+    }
+
+    enum ErrorEnum {
+        ERROR_1,
+        ERROR_2,
+        ERROR_3,
     }
 
     function revertErrorWithEnum(ErrorEnum a, ErrorEnum[] b) external;

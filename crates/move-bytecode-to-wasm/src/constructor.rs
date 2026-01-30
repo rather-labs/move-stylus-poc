@@ -9,14 +9,9 @@ use crate::{
     error::{CompilationError, ICEError, ICEErrorKind},
     hostio::host_functions,
     runtime::{RuntimeFunction, error::RuntimeFunctionError},
-    translation::{intermediate_types::ISignature, table::FunctionTable},
+    translation::table::FunctionTable,
     utils::keccak_string_to_memory,
-    vm_handled_types::{VmHandledType, tx_context::TxContext},
-};
-
-static EMPTY_SIGNATURE: ISignature = ISignature {
-    arguments: Vec::new(),
-    returns: Vec::new(),
+    vm_handled_types::{VmHandledType, error::VmHandledTypeError, tx_context::TxContext},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +27,9 @@ pub enum ConstructorError {
 
     #[error("init function WASM id not found in table")]
     InitFunctionWasmIdNotFound,
+
+    #[error("an error ocurred while injecting a vm handled type")]
+    VmHandledType(#[from] VmHandledTypeError),
 }
 
 impl From<ConstructorError> for CompilationError {
@@ -41,11 +39,11 @@ impl From<ConstructorError> for CompilationError {
 }
 
 /// Injects the constructor as a public function in the module, which will be accesible via the entrypoint router.
-pub fn inject_constructor(
+pub fn inject_constructor<'a>(
     function_table: &mut FunctionTable,
     module: &mut Module,
-    compilation_ctx: &CompilationContext,
-    public_functions: &mut Vec<PublicFunction>,
+    compilation_ctx: &'a CompilationContext,
+    public_functions: &mut Vec<PublicFunction<'a>>,
 ) -> Result<(), ConstructorError> {
     if let Some(ref init_id) = compilation_ctx.root_module_data.functions.init {
         let wasm_init_fn = function_table
@@ -59,7 +57,7 @@ pub fn inject_constructor(
         public_functions.push(PublicFunction::new(
             constructor_fn_id,
             "constructor",
-            &EMPTY_SIGNATURE,
+            &compilation_ctx.empty_signature,
             compilation_ctx,
         )?);
     };
@@ -85,7 +83,7 @@ pub fn build_constructor(
     const FLAG: i32 = 1;
 
     // Host function for checking if all bytes are zero
-    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx))?;
+    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx), None)?;
 
     // Host functions for storage operations
     let (storage_load_fn, _) = host_functions::storage_load_bytes32(module);
@@ -125,6 +123,7 @@ pub fn build_constructor(
     builder.local_get(value_ptr).i32_const(32).call(is_zero_fn);
 
     // If storage has not been initialized, proceed with initialization
+    let mut inner_result: Result<(), VmHandledTypeError> = Ok(());
     builder.if_else(
         None,
         |then| {
@@ -141,7 +140,7 @@ pub fn build_constructor(
             }
 
             // Inject TxContext as last argument
-            TxContext::inject(then, module, compilation_ctx);
+            inner_result = TxContext::inject(then, module, compilation_ctx);
 
             // Call the `init` function
             then.call(init);
@@ -168,6 +167,8 @@ pub fn build_constructor(
             // Constructor already called → do nothing
         },
     );
+
+    inner_result?;
 
     // Finalize and insert the function into the module
     Ok(function.finish(vec![], &mut module.funcs))

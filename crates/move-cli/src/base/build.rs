@@ -1,5 +1,7 @@
 // Copyright (c) The Move Contributors
+// Copyright (c) 2025 Rather Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+// Portions of this file were modified by Rather Labs, Inc on 2025-2026.
 
 use crate::error::print_error_diagnostic;
 
@@ -43,12 +45,13 @@ impl Build {
         )?;
 
         if let Err(compilation_error) = translate_package_cli(
-            compiled,
+            &compiled,
             &rerooted_path,
             config.install_dir,
             emit_wat,
             verbose,
             !config.dev_mode,
+            false,
         ) {
             print_error_diagnostic(*compilation_error)
         }

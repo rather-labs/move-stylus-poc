@@ -1,4 +1,7 @@
-pub use crate::translation::intermediate_types::{IntermediateType, structs::IStruct};
+pub use crate::translation::intermediate_types::{
+    IntermediateType,
+    structs::{IStruct, IStructType},
+};
 use move_binary_format::{
     file_format::{
         FieldHandleIndex, FieldInstantiationIndex, StructDefInstantiationIndex,
@@ -55,7 +58,7 @@ impl StructData {
     pub fn get_by_identifier(&self, identifier: &str) -> Result<&IStruct> {
         self.structs
             .iter()
-            .find(|s| s.identifier == identifier)
+            .find(|s| *s.identifier == *identifier)
             .ok_or(CompilationContextError::StructByIdentifierNotFound(
                 identifier.to_owned(),
             ))

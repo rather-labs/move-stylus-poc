@@ -1,10 +1,13 @@
 // Copyright (c) The Move Contributors
+// Copyright (c) 2025 Rather Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
+// Portions of this file were modified by Rather Labs, Inc on 2025-2026.
 
 pub mod activate;
 pub mod build;
 pub mod deploy;
 pub mod disassemble;
+pub mod docgen;
 pub mod export_abi;
 pub mod info;
 pub mod new;
@@ -18,6 +21,7 @@ use move_package::{
     compilation::compiled_package::CompiledPackage, source_package::layout::SourcePackageLayout,
 };
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -34,20 +38,23 @@ pub fn reroot_path(path: Option<&Path>) -> anyhow::Result<PathBuf> {
 }
 
 pub fn translate_package_cli(
-    package: CompiledPackage,
+    package: &CompiledPackage,
     rerooted_path: &Path,
     install_dir: Option<PathBuf>,
     emit_wat: bool,
     verbose: bool,
     optimize: bool,
+    test_mode: bool,
 ) -> Result<(), Box<CompilationError>> {
-    let build_directory = get_build_directory(rerooted_path, &package, &install_dir);
+    let build_directory = get_build_directory(rerooted_path, package, &install_dir);
 
     // Create the build directory if it doesn't exist
     std::fs::create_dir_all(&build_directory)
         .map_err(|e| ICEError::new(ICEErrorKind::Unexpected(e.into())))?;
 
-    let mut modules = translate_package(package, None, verbose)?;
+    let mut modules_data = HashMap::new();
+
+    let mut modules = translate_package(package, None, &mut modules_data, verbose, test_mode)?;
 
     for (module_name, module) in modules.iter_mut() {
         let wasm_file_path = build_directory.join(format!("{module_name}.wasm"));
@@ -56,12 +63,25 @@ pub fn translate_package_cli(
             .map_err(|e| ICEError::new(ICEErrorKind::Unexpected(e.into())))?;
 
         if optimize {
-            wasm_opt::OptimizationOptions::new_optimize_for_size_aggressively()
+            let mut optimizations =
+                wasm_opt::OptimizationOptions::new_optimize_for_size_aggressively();
+            optimizations
+                .optimize_level(wasm_opt::OptimizeLevel::Level3)
+                .add_pass(wasm_opt::Pass::StripDebug)
+                .add_pass(wasm_opt::Pass::StripDwarf)
+                .add_pass(wasm_opt::Pass::InliningOptimizing)
+                .add_pass(wasm_opt::Pass::Inlining)
+                .add_pass(wasm_opt::Pass::CoalesceLocals)
+                .add_pass(wasm_opt::Pass::CodeFolding)
+                .add_pass(wasm_opt::Pass::Directize)
+                .add_pass(wasm_opt::Pass::Dce)
+                .add_pass(wasm_opt::Pass::Vacuum)
+                .shrink_level(wasm_opt::ShrinkLevel::Level2)
                 .enable_feature(wasm_opt::Feature::BulkMemory)
                 .disable_feature(wasm_opt::Feature::Simd)
-                .disable_feature(wasm_opt::Feature::Multivalue)
-                .run(&wasm_file_path, &wasm_file_path)
-                .unwrap();
+                .disable_feature(wasm_opt::Feature::Multivalue);
+
+            optimizations.run(&wasm_file_path, &wasm_file_path).unwrap();
         }
 
         if emit_wat {

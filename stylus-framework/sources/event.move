@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 /// Events module.
 ///
 /// Defines the functions to publicly log data in the blockchain.
@@ -9,5 +12,5 @@ module stylus::event;
 
 /// Emits an event in the topic 0.
 ///
-/// This function It ensures that an event will be logged in a Solidity ABI-compatible format.
+/// This function ensures that an event will be logged in a Solidity ABI-compatible format.
 public native fun emit<T: copy + drop>(event: T);

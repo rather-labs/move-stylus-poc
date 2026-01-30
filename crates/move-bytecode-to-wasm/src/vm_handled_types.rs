@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 //! This module is in charge of injecting the datatypes that can only be created or are
 //! automatically injected by the VM, such as the primitive type Signer or the TxContext struct
 //! from the stylus framework.
@@ -5,7 +8,7 @@ pub mod bytes;
 pub mod contract_call_result;
 pub mod dynamic_fields;
 pub mod error;
-pub mod fallback;
+pub mod id;
 pub mod named_id;
 pub mod signer;
 pub mod string;
@@ -29,7 +32,7 @@ pub trait VmHandledType {
         block: &mut InstrSeqBuilder,
         module: &mut Module,
         compilation_ctx: &CompilationContext,
-    );
+    ) -> Result<(), VmHandledTypeError>;
 
     /// Checks if the type is the reserved one or one declared by the user with the same name.
     ///

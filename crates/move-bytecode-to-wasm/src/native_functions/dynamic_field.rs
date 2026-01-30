@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use super::{NativeFunction, error::NativeFunctionError};
 use crate::{
     CompilationContext,
@@ -5,12 +8,10 @@ use crate::{
         ModuleId,
         reserved_modules::{SF_MODULE_NAME_DYNAMIC_FIELD, STYLUS_FRAMEWORK_ADDRESS},
     },
-    data::{
-        DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET, DATA_SLOT_DATA_PTR_OFFSET,
-        DATA_STORAGE_OBJECT_OWNER_OFFSET,
-    },
+    data::{DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET, DATA_SLOT_DATA_PTR_OFFSET, RuntimeErrorData},
     hostio::host_functions::{native_keccak256, storage_load_bytes32},
     runtime::RuntimeFunction,
+    translation::intermediate_types::error::IntermediateTypeError,
     translation::intermediate_types::{
         IntermediateType,
         address::IAddress,
@@ -32,6 +33,7 @@ use walrus::{
 pub fn add_child_object_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     itype: &IntermediateType,
     module_id: &ModuleId,
 ) -> Result<FunctionId, NativeFunctionError> {
@@ -45,11 +47,16 @@ pub fn add_child_object_fn(
         return Ok(function);
     };
 
-    let get_id_bytes_ptr_fn = RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx))?;
+    let get_id_bytes_ptr_fn =
+        RuntimeFunction::GetIdBytesPtr.get(module, Some(compilation_ctx), None)?;
     let write_object_slot_fn =
-        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx))?;
-    let save_struct_into_storage_fn =
-        RuntimeFunction::EncodeAndSaveInStorage.get_generic(module, compilation_ctx, &[itype])?;
+        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx), None)?;
+    let save_struct_into_storage_fn = RuntimeFunction::EncodeAndSaveInStorage.get_generic(
+        module,
+        compilation_ctx,
+        Some(runtime_error_data),
+        &[itype],
+    )?;
 
     let mut function = FunctionBuilder::new(&mut module.types, &[ValType::I32, ValType::I32], &[]);
 
@@ -60,27 +67,29 @@ pub fn add_child_object_fn(
     let child_ptr = module.locals.add(ValType::I32);
 
     let slot_ptr = module.locals.add(ValType::I32);
+    builder
+        .i32_const(32)
+        .call(compilation_ctx.allocator)
+        .local_set(slot_ptr);
 
     // Calculate the destiny slot
     builder
         .local_get(parent_address)
         .local_get(child_ptr)
         .call(get_id_bytes_ptr_fn)
+        .local_get(slot_ptr)
         .call(write_object_slot_fn);
-
-    builder
-        .i32_const(32)
-        .call(compilation_ctx.allocator)
-        .local_tee(slot_ptr)
-        .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
-        .i32_const(32)
-        .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
 
     // Save the field into storage
     builder
         .local_get(child_ptr)
         .local_get(slot_ptr)
-        .call(save_struct_into_storage_fn);
+        .call_runtime_function(
+            compilation_ctx,
+            save_struct_into_storage_fn,
+            &RuntimeFunction::EncodeAndSaveInStorage,
+            None,
+        );
 
     Ok(function.finish(vec![parent_address, child_ptr], &mut module.funcs))
 }
@@ -102,6 +111,7 @@ pub fn add_child_object_fn(
 pub fn add_borrow_object_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     itype: &IntermediateType,
     module_id: &ModuleId,
 ) -> Result<FunctionId, NativeFunctionError> {
@@ -115,9 +125,13 @@ pub fn add_borrow_object_fn(
         return Ok(function);
     };
     let write_object_slot_fn =
-        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx))?;
-    let read_and_decode_from_storage_fn =
-        RuntimeFunction::ReadAndDecodeFromStorage.get_generic(module, compilation_ctx, &[itype])?;
+        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx), None)?;
+    let read_and_decode_from_storage_fn = RuntimeFunction::ReadAndDecodeFromStorage.get_generic(
+        module,
+        compilation_ctx,
+        Some(runtime_error_data),
+        &[itype],
+    )?;
 
     let mut function = FunctionBuilder::new(
         &mut module.types,
@@ -130,6 +144,12 @@ pub fn add_borrow_object_fn(
     // Arguments
     let parent_uid = module.locals.add(ValType::I32);
     let child_id = module.locals.add(ValType::I32);
+
+    let slot_ptr = module.locals.add(ValType::I32);
+    builder
+        .i32_const(32)
+        .call(compilation_ctx.allocator)
+        .local_set(slot_ptr);
 
     // Calculate the destiny slot
     builder
@@ -152,31 +172,22 @@ pub fn add_borrow_object_fn(
         )
         .local_tee(parent_uid)
         .local_get(child_id)
+        .local_get(slot_ptr)
         .call(write_object_slot_fn);
 
-    // Write the owner
-    builder
-        .i32_const(DATA_STORAGE_OBJECT_OWNER_OFFSET)
-        .local_get(parent_uid)
-        .i32_const(32)
-        .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
-
     let result_struct = module.locals.add(ValType::I32);
-
-    let slot_ptr = module.locals.add(ValType::I32);
-    builder
-        .i32_const(32)
-        .call(compilation_ctx.allocator)
-        .local_tee(slot_ptr)
-        .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
-        .i32_const(32)
-        .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
 
     // Read from storage
     builder
         .local_get(slot_ptr)
         .local_get(child_id)
-        .call(read_and_decode_from_storage_fn)
+        .local_get(parent_uid)
+        .call_runtime_function(
+            compilation_ctx,
+            read_and_decode_from_storage_fn,
+            &RuntimeFunction::ReadAndDecodeFromStorage,
+            Some(ValType::I32),
+        )
         .local_set(result_struct);
 
     let result = module.locals.add(ValType::I32);
@@ -202,6 +213,7 @@ pub fn add_borrow_object_fn(
 pub fn add_remove_child_object_fn(
     module: &mut Module,
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     itype: &IntermediateType,
     module_id: &ModuleId,
 ) -> Result<FunctionId, NativeFunctionError> {
@@ -226,10 +238,8 @@ pub fn add_remove_child_object_fn(
         NativeFunction::NATIVE_BORROW_CHILD_OBJECT,
         module,
         compilation_ctx,
-        &ModuleId {
-            address: STYLUS_FRAMEWORK_ADDRESS,
-            module_name: SF_MODULE_NAME_DYNAMIC_FIELD.to_owned(),
-        },
+        Some(runtime_error_data),
+        &ModuleId::new(STYLUS_FRAMEWORK_ADDRESS, SF_MODULE_NAME_DYNAMIC_FIELD),
         &[itype.clone()],
     )?;
 
@@ -284,8 +294,8 @@ pub fn add_has_child_object_fn(
 
     let (storage_load, _) = storage_load_bytes32(module);
     let write_object_slot_fn =
-        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx))?;
-    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx))?;
+        RuntimeFunction::WriteObjectSlot.get(module, Some(compilation_ctx), None)?;
+    let is_zero_fn = RuntimeFunction::IsZero.get(module, Some(compilation_ctx), None)?;
 
     // Arguments
     let parent_uid = module.locals.add(ValType::I32);
@@ -295,6 +305,7 @@ pub fn add_has_child_object_fn(
     builder
         .local_get(parent_uid)
         .local_get(child_id)
+        .i32_const(DATA_OBJECTS_MAPPING_SLOT_NUMBER_OFFSET)
         .call(write_object_slot_fn);
 
     builder
@@ -342,11 +353,8 @@ pub fn add_hash_type_and_key_fn(
 
     // Arguments
     let parent_address = module.locals.add(ValType::I32);
-    let (key, valtype) = if itype == &IntermediateType::IU64 {
-        (module.locals.add(ValType::I64), ValType::I64)
-    } else {
-        (module.locals.add(ValType::I32), ValType::I32)
-    };
+    let valtype = ValType::try_from(itype)?;
+    let key = module.locals.add(valtype);
 
     let mut function =
         FunctionBuilder::new(&mut module.types, &[ValType::I32, valtype], &[ValType::I32]);
@@ -414,31 +422,17 @@ fn copy_data_to_memory(
     data: LocalId,
 ) -> Result<(), NativeFunctionError> {
     let load_value_to_stack = |field: &IntermediateType, builder: &mut InstrSeqBuilder<'_>| {
-        match field.stack_data_size() {
-            Ok(8) => {
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I64 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-            }
-            Err(e) => return Err(e),
-            _ => {
-                builder.load(
-                    compilation_ctx.memory_id,
-                    LoadKind::I32 { atomic: false },
-                    MemArg {
-                        align: 0,
-                        offset: 0,
-                    },
-                );
-            }
-        }
+        let load_kind = field.load_kind()?;
+        builder.load(
+            compilation_ctx.memory_id,
+            load_kind,
+            MemArg {
+                align: 0,
+                offset: 0,
+            },
+        );
 
-        Ok(())
+        Ok::<(), IntermediateTypeError>(())
     };
 
     // Copy the data after the parent addresss
@@ -454,48 +448,18 @@ fn copy_data_to_memory(
                 .memory_copy(compilation_ctx.memory_id, compilation_ctx.memory_id);
         }
         // 4 bytes numbers should be in the stack
-        IntermediateType::IBool | IntermediateType::IU8 => {
-            builder.i32_const(1).call(compilation_ctx.allocator);
+        IntermediateType::IBool
+        | IntermediateType::IU8
+        | IntermediateType::IU16
+        | IntermediateType::IU32
+        | IntermediateType::IU64 => {
+            builder
+                .i32_const(itype.wasm_memory_data_size()?)
+                .call(compilation_ctx.allocator);
 
             builder.local_get(data).store(
                 compilation_ctx.memory_id,
-                StoreKind::I32_8 { atomic: false },
-                MemArg {
-                    align: 0,
-                    offset: 0,
-                },
-            );
-        }
-        IntermediateType::IU16 => {
-            builder.i32_const(2).call(compilation_ctx.allocator);
-
-            builder.local_get(data).store(
-                compilation_ctx.memory_id,
-                StoreKind::I32_16 { atomic: false },
-                MemArg {
-                    align: 0,
-                    offset: 0,
-                },
-            );
-        }
-        IntermediateType::IU32 => {
-            builder.i32_const(4).call(compilation_ctx.allocator);
-
-            builder.local_get(data).store(
-                compilation_ctx.memory_id,
-                StoreKind::I32 { atomic: false },
-                MemArg {
-                    align: 0,
-                    offset: 0,
-                },
-            );
-        }
-        IntermediateType::IU64 => {
-            builder.i32_const(8).call(compilation_ctx.allocator);
-
-            builder.local_get(data).store(
-                compilation_ctx.memory_id,
-                StoreKind::I64 { atomic: false },
+                itype.store_kind()?,
                 MemArg {
                     align: 0,
                     offset: 0,
@@ -580,19 +544,9 @@ fn copy_data_to_memory(
                 )
                 .local_set(len);
 
-            let (field_data, load_kind, element_multiplier) = if **inner == IntermediateType::IU64 {
-                (
-                    module.locals.add(ValType::I64),
-                    LoadKind::I64 { atomic: false },
-                    8,
-                )
-            } else {
-                (
-                    module.locals.add(ValType::I32),
-                    LoadKind::I32 { atomic: false },
-                    4,
-                )
-            };
+            let load_kind = inner.load_kind()?;
+            let field_data = module.locals.add(ValType::try_from(&**inner)?);
+            let element_multiplier = inner.wasm_memory_data_size()?;
 
             builder.i32_const(0).local_set(i);
             builder.skip_vec_header(data).local_set(data);

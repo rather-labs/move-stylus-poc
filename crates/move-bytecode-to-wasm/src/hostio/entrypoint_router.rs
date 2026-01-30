@@ -1,12 +1,13 @@
 use walrus::{
-    FunctionBuilder, FunctionId, GlobalId, Module, ValType,
-    ir::{BinaryOp, LoadKind, MemArg, StoreKind, UnaryOp},
+    ConstExpr, FunctionBuilder, FunctionId, GlobalId, GlobalKind, Module, ValType,
+    ir::{BinaryOp, LoadKind, MemArg, StoreKind, UnaryOp, Value},
 };
 
 use crate::{
     CompilationContext,
     abi_types::{error_encoding::build_abort_error_message, public_function::PublicFunction},
-    data::DATA_CALLDATA_OFFSET,
+    data::{DATA_ABORT_MESSAGE_PTR_OFFSET, DATA_CALLDATA_OFFSET, RuntimeErrorData},
+    memory::MEMORY_PAGE_SIZE,
     runtime::RuntimeFunction,
     translation::intermediate_types::IntermediateType,
 };
@@ -23,34 +24,37 @@ pub fn build_entrypoint_router(
     module: &mut Module,
     functions: &[PublicFunction],
     compilation_ctx: &CompilationContext,
+    runtime_error_data: &mut RuntimeErrorData,
     dynamic_fields_global_variables: &Vec<(GlobalId, IntermediateType)>,
 ) -> Result<(), HostIOError> {
     let (read_args_function, _) = host_functions::read_args(module);
     let (write_return_data_function, _) = host_functions::write_result(module);
 
-    let args_len = module.locals.add(ValType::I32);
-    let selector_variable = module.locals.add(ValType::I32);
-    let args_pointer = module.locals.add(ValType::I32);
-
     let mut router = FunctionBuilder::new(&mut module.types, &[ValType::I32], &[ValType::I32]);
-
     let mut router_builder = router.func_body();
 
-    // Find receive and fallback functions if they exist
-    let receive_function = functions.iter().find(|f| f.function_name == "receive");
-    let fallback_function = functions.iter().find(|f| f.function_name == "fallback");
+    // Arguments
+    let data_len = module.locals.add(ValType::I32); // Length of the calldata
 
-    // Load function args to memory
+    // Locals
+    let data_pointer = module.locals.add(ValType::I32); // Pointer to the calldata
+    let function_selector = module.locals.add(ValType::I32); // Selector of the function to call
+    let status = module.locals.add(ValType::I32); // Status of the function call
+
+    // Read the calldata from the host and store it in the memory
     router_builder
-        .local_get(args_len)
+        .local_get(data_len)
         .call(compilation_ctx.allocator)
-        .local_tee(args_pointer)
+        .local_tee(data_pointer)
         .call(read_args_function);
 
-    // Store the calldata length and pointer to the data segment
+    // Set status to 0 (success) as default
+    router_builder.i32_const(0).local_set(status);
+
+    // Save the calldata length and pointer into the data section
     router_builder
         .i32_const(DATA_CALLDATA_OFFSET)
-        .local_get(args_len)
+        .local_get(data_len)
         .store(
             compilation_ctx.memory_id,
             StoreKind::I32 { atomic: false },
@@ -62,7 +66,7 @@ pub fn build_entrypoint_router(
 
     router_builder
         .i32_const(DATA_CALLDATA_OFFSET)
-        .local_get(args_pointer)
+        .local_get(data_pointer)
         .store(
             compilation_ctx.memory_id,
             StoreKind::I32 { atomic: false },
@@ -72,139 +76,248 @@ pub fn build_entrypoint_router(
             },
         );
 
-    // If args_len == 0, try receive, injecting the selector in the args data
-    // If args_len != 0: load selector from args (normal case)
+    // Define the return block - all routing logic happens inside this block
+    let mut inner_result = Ok(());
+    router_builder.block(None, |return_block| {
+        inner_result = (|| {
+            let return_block_id = return_block.id();
+
+            // If data_len == 0, there isn't even a function selector present in the calldata, so we attempt to default to "receive" by injecting its selector into the argument data.
+            // Otherwise (data_len != 0), read selector directly from the args (the standard case).
+            return_block
+                .local_get(data_len)
+                .unop(UnaryOp::I32Eqz)
+                .if_else(
+                    None,
+                    |then| {
+                        // data_len == 0: try receive
+                        // If no receive function, the selector_variable remains uninitialized and will not match any function
+                        if let Some(receive_fn) = functions
+                            .iter()
+                            .find(|f| f.function_name.as_str() == "receive")
+                        {
+                            then.i32_const(i32::from_le_bytes(receive_fn.function_selector))
+                                .local_set(function_selector);
+                        }
+
+                        // Set data_len to 4
+                        then.i32_const(4).local_set(data_len);
+
+                        // Allocate memory for the receive function selector, which is the only calldata needed.
+                        then.local_get(data_len)
+                            .call(compilation_ctx.allocator)
+                            .local_tee(data_pointer)
+                            .local_get(function_selector)
+                            .store(
+                                compilation_ctx.memory_id,
+                                StoreKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            );
+                    },
+                    |else_| {
+                        // Load selector from memory
+                        else_
+                            .local_get(data_pointer)
+                            .load(
+                                compilation_ctx.memory_id,
+                                LoadKind::I32 { atomic: false },
+                                MemArg {
+                                    align: 0,
+                                    offset: 0,
+                                },
+                            )
+                            .local_set(function_selector);
+                    },
+                );
+
+            // Offset args pointer by 4 bytes to exclude selector
+            return_block
+                .local_get(data_pointer)
+                .i32_const(4)
+                .binop(BinaryOp::I32Add)
+                .local_set(data_pointer);
+
+            // Try to route call based on selector for all public functions. Any successful match
+            // will set data_pointer, data_len and break to exit_label.
+            for function in functions {
+                inner_result = function.build_router_block(
+                    return_block,
+                    module,
+                    function_selector,
+                    data_pointer,
+                    data_len,
+                    return_block_id,
+                    compilation_ctx,
+                    runtime_error_data,
+                );
+            }
+            // If no function matched we might be in the fallback case:
+            if let Some(fallback_fn) = functions
+                .iter()
+                .find(|f| f.function_name.as_str() == "fallback")
+            {
+                // Restore the data pointer to the start of the calldata, as the fallback function has no selector
+                return_block
+                    .local_get(data_pointer)
+                    .i32_const(4)
+                    .binop(BinaryOp::I32Sub)
+                    .local_set(data_pointer);
+
+                // Wrap function to unpack/pack arguments
+                inner_result = fallback_fn.wrap_public_function(
+                    module,
+                    return_block,
+                    return_block_id,
+                    data_pointer,
+                    compilation_ctx,
+                    runtime_error_data,
+                );
+
+                // Stack: [data_pointer] [data_len]
+                // Set final locals and break to exit
+                return_block
+                    .local_set(data_len)
+                    .local_set(data_pointer)
+                    .br(return_block_id);
+            }
+
+            // --- NO MATCH CASE ---
+            // If execution reaches here, no function matched.
+            // We set up the error message and fall through to the common return.
+            return_block.i64_const(ERROR_NO_FUNCTION_MATCH);
+            let ptr = build_abort_error_message(return_block, module, compilation_ctx)?;
+
+            // Set data_pointer to skip header (ptr + 4)
+            return_block
+                .local_get(ptr)
+                .i32_const(4)
+                .binop(BinaryOp::I32Add)
+                .local_set(data_pointer);
+
+            // Set data_len from the error message length
+            return_block
+                .local_get(ptr)
+                .load(
+                    compilation_ctx.memory_id,
+                    LoadKind::I32 { atomic: false },
+                    MemArg {
+                        align: 0,
+                        offset: 0,
+                    },
+                )
+                .local_set(data_len);
+
+            // Set status to 1 (error)
+            return_block.i32_const(1).local_set(status);
+            // Fall through to end of block...
+            Ok(())
+        })();
+    });
+
+    inner_result?;
+    // --- SHARED EXIT LOGIC ---
+
+    // 1. Check for Global Abort
+    router_builder.block(None, |abort_block| {
+        // Load the abort message pointer from DATA_ABORT_MESSAGE_PTR_OFFSET
+        // If not null, an abort occurred and we need to return the error message
+
+        let abort_block_id = abort_block.id();
+
+        // Load the ptr
+        let ptr = module.locals.add(ValType::I32);
+        abort_block
+            .i32_const(DATA_ABORT_MESSAGE_PTR_OFFSET)
+            .load(
+                compilation_ctx.memory_id,
+                LoadKind::I32 { atomic: false },
+                MemArg {
+                    align: 0,
+                    offset: 0,
+                },
+            )
+            .local_tee(ptr);
+
+        // Check if the ptr is null
+        abort_block.unop(UnaryOp::I32Eqz);
+
+        // If the ptr is null, jump to the end of the block, skipping the error message loading
+        abort_block.br_if(abort_block_id);
+
+        // Load the abort message length from the ptr and set return data length
+        abort_block
+            .local_get(ptr)
+            .load(
+                compilation_ctx.memory_id,
+                LoadKind::I32 { atomic: false },
+                MemArg {
+                    align: 0,
+                    offset: 0,
+                },
+            )
+            .local_set(data_len);
+
+        // Load the abort message pointer and set data_ptr
+        abort_block
+            .local_get(ptr)
+            .i32_const(4)
+            .binop(BinaryOp::I32Add)
+            .local_set(data_pointer);
+
+        // Set status to 1 (error)
+        abort_block.i32_const(1).local_set(status);
+    });
+
+    // 2. Write return data
     router_builder
-        .local_get(args_len)
+        .local_get(data_pointer)
+        .local_get(data_len)
+        .call(write_return_data_function);
+
+    // 3. Conditionally commit changes to storage (iff status == 0)
+    let commit_changes_to_storage_function = RuntimeFunction::get_commit_changes_to_storage_fn(
+        module,
+        compilation_ctx,
+        runtime_error_data,
+        dynamic_fields_global_variables,
+    )?;
+
+    router_builder
+        .local_get(status)
         .unop(UnaryOp::I32Eqz)
         .if_else(
             None,
             |then| {
-                // args_len == 0: try receive
-                // If no receive function, the selector_variable remains uninitialized and will not match any function
-                if let Some(receive_fn) = receive_function {
-                    then.i32_const(i32::from_le_bytes(receive_fn.function_selector))
-                        .local_set(selector_variable);
-                }
-
-                // Update args_len to 4
-                then.i32_const(4).local_set(args_len);
-
-                // Store the new args_len to memory
-                then.i32_const(4)
-                    .call(compilation_ctx.allocator)
-                    .local_get(args_len)
-                    .store(
-                        compilation_ctx.memory_id,
-                        StoreKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
-
-                // Allocate buffer with selector prefix
-                then.local_get(args_len)
-                    .call(compilation_ctx.allocator)
-                    .local_tee(args_pointer)
-                    .local_get(selector_variable)
-                    .store(
-                        compilation_ctx.memory_id,
-                        StoreKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
+                then.call(commit_changes_to_storage_function);
             },
-            |else_| {
-                // Load selector from memory
-                else_
-                    .local_get(args_pointer)
-                    .load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    )
-                    .local_set(selector_variable);
-            },
+            |_| {},
         );
 
-    // Try to route call based on selector for all public functions. Any successful match
-    // will execute the target function and return from the router.
-    for function in functions {
-        function.build_router_block(
-            &mut router_builder,
-            module,
-            selector_variable,
-            args_pointer,
-            args_len,
-            write_return_data_function,
-            compilation_ctx,
-            dynamic_fields_global_variables,
-        )?;
-    }
+    // Update the next_free_memory_pointer global to the current next_offset from runtime_error_data
+    let next_free_memory_pointer = module
+        .globals
+        .get_mut(compilation_ctx.globals.next_free_memory_pointer);
 
-    // If no function matched we might be in the fallback case:
-    if let Some(fallback_fn) = fallback_function {
-        let commit_changes_to_storage_function = RuntimeFunction::get_commit_changes_to_storage_fn(
-            module,
-            compilation_ctx,
-            dynamic_fields_global_variables,
-        )?;
+    next_free_memory_pointer.kind = GlobalKind::Local(ConstExpr::Value(Value::I32(
+        runtime_error_data.get_next_offset(),
+    )));
 
-        // Wrap function to pack/unpack parameters
-        fallback_fn.wrap_public_function(
-            module,
-            &mut router_builder,
-            args_pointer,
-            compilation_ctx,
-        )?;
+    // Update the available_memory global to account for the memory used by error data
+    let available_memory = module
+        .globals
+        .get_mut(compilation_ctx.globals.available_memory);
 
-        // Stack: [return_data_pointer] [return_data_length] [status]
-        let status = module.locals.add(ValType::I32);
-        router_builder.local_set(status);
+    available_memory.kind = GlobalKind::Local(ConstExpr::Value(Value::I32(
+        MEMORY_PAGE_SIZE - runtime_error_data.get_next_offset(),
+    )));
 
-        // Write return data to memory
-        router_builder.call(write_return_data_function);
+    // 4. Return
+    router_builder.local_get(status).return_();
 
-        router_builder.call(commit_changes_to_storage_function);
-
-        // Return status
-        router_builder.local_get(status);
-        router_builder.return_();
-    }
-
-    // Build no function match error message
-    router_builder.i64_const(ERROR_NO_FUNCTION_MATCH);
-    let ptr = build_abort_error_message(&mut router_builder, module, compilation_ctx)?;
-
-    // Write error data to memory
-    router_builder
-        // Skip header
-        .local_get(ptr)
-        .i32_const(4)
-        .binop(BinaryOp::I32Add)
-        // Load msg length
-        .local_get(ptr)
-        .load(
-            compilation_ctx.memory_id,
-            LoadKind::I32 { atomic: false },
-            MemArg {
-                align: 0,
-                offset: 0,
-            },
-        )
-        // Write
-        .call(write_return_data_function);
-
-    // Push the error code and return
-    router_builder.i32_const(1).return_();
-
-    let router = router.finish(vec![args_len], &mut module.funcs);
+    let router = router.finish(vec![data_len], &mut module.funcs);
     add_entrypoint(module, router);
 
     Ok(())
@@ -387,8 +500,10 @@ mod tests {
 
     #[test]
     fn test_build_entrypoint_router_noop() {
-        let (mut raw_module, allocator_func, memory_id) = build_module(None);
-        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let (mut raw_module, allocator_func, memory_id, compilation_context_globals) =
+            build_module(None);
+        let compilation_ctx =
+            test_compilation_context!(memory_id, allocator_func, compilation_context_globals);
         let signature = ISignature {
             arguments: vec![],
             returns: vec![],
@@ -399,8 +514,15 @@ mod tests {
         let noop_selector_data = noop.get_selector().to_vec();
         let noop_2_selector_data = noop_2.get_selector().to_vec();
 
-        build_entrypoint_router(&mut raw_module, &[noop, noop_2], &compilation_ctx, &vec![])
-            .unwrap();
+        let mut runtime_error_data = RuntimeErrorData::new();
+        build_entrypoint_router(
+            &mut raw_module,
+            &[noop, noop_2],
+            &compilation_ctx,
+            &mut runtime_error_data,
+            &vec![],
+        )
+        .unwrap();
         display_module(&mut raw_module);
 
         let data = ReadArgsData {
@@ -425,10 +547,11 @@ mod tests {
     }
 
     #[test]
-    // #[should_panic(expected = "unreachable")]
     fn test_build_entrypoint_router_no_data() {
-        let (mut raw_module, allocator_func, memory_id) = build_module(None);
-        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let (mut raw_module, allocator_func, memory_id, compilation_context_globals) =
+            build_module(None);
+        let compilation_ctx =
+            test_compilation_context!(memory_id, allocator_func, compilation_context_globals);
         let signature = ISignature {
             arguments: vec![],
             returns: vec![],
@@ -436,8 +559,15 @@ mod tests {
         let noop = add_noop_function(&mut raw_module, &signature, &compilation_ctx);
         let noop_2 = add_noop_2_function(&mut raw_module, &signature, &compilation_ctx);
 
-        build_entrypoint_router(&mut raw_module, &[noop, noop_2], &compilation_ctx, &vec![])
-            .unwrap();
+        let mut runtime_error_data = RuntimeErrorData::new();
+        build_entrypoint_router(
+            &mut raw_module,
+            &[noop, noop_2],
+            &compilation_ctx,
+            &mut runtime_error_data,
+            &vec![],
+        )
+        .unwrap();
         display_module(&mut raw_module);
 
         // Invalid selector
@@ -451,8 +581,10 @@ mod tests {
 
     #[test]
     fn test_build_entrypoint_router_no_match() {
-        let (mut raw_module, allocator_func, memory_id) = build_module(None);
-        let compilation_ctx = test_compilation_context!(memory_id, allocator_func);
+        let (mut raw_module, allocator_func, memory_id, compilation_context_globals) =
+            build_module(None);
+        let compilation_ctx =
+            test_compilation_context!(memory_id, allocator_func, compilation_context_globals);
         let signature = ISignature {
             arguments: vec![],
             returns: vec![],
@@ -460,8 +592,15 @@ mod tests {
         let noop = add_noop_function(&mut raw_module, &signature, &compilation_ctx);
         let noop_2 = add_noop_2_function(&mut raw_module, &signature, &compilation_ctx);
 
-        build_entrypoint_router(&mut raw_module, &[noop, noop_2], &compilation_ctx, &vec![])
-            .unwrap();
+        let mut runtime_error_data = RuntimeErrorData::new();
+        build_entrypoint_router(
+            &mut raw_module,
+            &[noop, noop_2],
+            &compilation_ctx,
+            &mut runtime_error_data,
+            &vec![],
+        )
+        .unwrap();
         display_module(&mut raw_module);
 
         // Invalid selector

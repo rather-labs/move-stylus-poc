@@ -1,18 +1,18 @@
+use move_symbol_pool::Symbol;
+
 use crate::{
     compilation_context::CompilationContextError,
     error::{CompilationError, ICEError, ICEErrorKind},
+    native_functions::error::NativeFunctionError,
     runtime::error::RuntimeFunctionError,
     translation::intermediate_types::error::IntermediateTypeError,
     vm_handled_types::error::VmHandledTypeError,
 };
 
-use super::{
-    packing::error::AbiPackError, public_function::PublicFunctionValidationError,
-    unpacking::error::AbiUnpackError,
-};
+use super::public_function::PublicFunctionValidationError;
 
 #[derive(Debug, thiserror::Error)]
-pub enum AbiEncodingError {
+pub enum AbiOperationError {
     #[error("found a reference inside a reference")]
     RefInsideRef,
 
@@ -27,21 +27,43 @@ pub enum AbiEncodingError {
 
     #[error("cannot check if generic type parameter is dynamic at compile time")]
     GenericTypeParameterIsDynamic,
+
+    #[error(
+        "expected stylus::object::UID or stylus::object::NamedId as first field in {0} struct (it has key ability)"
+    )]
+    StorageObjectHasNoId(Symbol),
+
+    #[error(r#"cannot abi unpack/pack enum "{0}", it contains at least one variant with fields"#)]
+    EnumIsNotSimple(Symbol),
+
+    #[error("cannot unpack generic type parameter")]
+    UnpackingGenericTypeParameter,
+
+    #[error("cannot pack generic type parameter")]
+    PackingGenericTypeParameter,
+
+    #[error(
+        "found heap type unpacking a reference. this should be handled in the add_unpack_instructions function"
+    )]
+    UnhandledHeapTypeReference,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum AbiError {
     #[error("there was an error performing abi unpack operation")]
-    Unpack(#[from] AbiUnpackError),
+    Unpack(#[source] AbiOperationError),
 
     #[error("there was an error performing abi pack operation")]
-    Pack(#[from] AbiPackError),
+    Pack(#[source] AbiOperationError),
 
     #[error("abi encoding error")]
-    AbiEncoding(#[from] AbiEncodingError),
+    AbiEncoding(#[source] AbiOperationError),
 
     #[error("there was an error validating a public function")]
     PublicFunction(#[from] PublicFunctionValidationError),
+
+    #[error("an error ocurred while generating a native funciton's code")]
+    NativeFunction(#[from] NativeFunctionError),
 
     #[error("an error ocurred while generating a runtime function's code")]
     RuntimeFunction(#[from] RuntimeFunctionError),
@@ -58,13 +80,18 @@ pub enum AbiError {
     #[error(
         "expected stylus::object::UID or stylus::object::NamedId as first field in {0} struct (it has key ability)"
     )]
-    ExpectedUIDOrNamedId(String),
+    ExpectedUIDOrNamedId(Symbol),
 
     #[error("unable to get type ABI size")]
     UnableToGetTypeAbiSize,
 
     #[error("invalid selector size")]
     InvalidSelectorSize,
+
+    #[error(
+        "storage object (FrozenStorageObject, OwnedStorageObject, SharedStorageObject) has invalid type paramter"
+    )]
+    StorageObjectHasInvalidType,
 }
 
 impl From<AbiError> for CompilationError {

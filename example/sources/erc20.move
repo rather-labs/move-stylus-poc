@@ -1,15 +1,17 @@
+// Copyright (c) 2025 Rather Labs, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 module hello_world::erc20;
 
-use stylus::event::emit;
-use std::ascii::String;
-use std::ascii as ascii;
-use stylus::tx_context::TxContext;
-use stylus::transfer as transfer;
-use stylus::object as object;
-use stylus::object::NamedId;
-use stylus::dynamic_field_named_id as field;
-use stylus::table::Table;
-use stylus::table as table;
+use stylus::{
+    event::emit, 
+    tx_context::TxContext, 
+    transfer::{Self}, 
+    object::{Self, NamedId}, 
+    dynamic_field_named_id as field, 
+    table::{Self, Table}
+};
+use std::ascii::{Self, String};
 
 const EInssuficientFunds: u64 = 1;
 const ENotAllowed: u64 = 2;
@@ -31,14 +33,14 @@ public struct Info has key {
     decimals: u8,
 }
 
-#[ext(event, indexes = 2)]
+#[ext(event(indexes = 2))]
 public struct Transfer has copy, drop {
     from: address,
     to: address,
     value: u256
 }
 
-#[ext(event, indexes = 2)]
+#[ext(event(indexes = 2))]
 public struct Approval has copy, drop {
     owner: address,
     spender: address,

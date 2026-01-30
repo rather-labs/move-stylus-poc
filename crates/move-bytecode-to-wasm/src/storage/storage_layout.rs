@@ -233,19 +233,22 @@ pub fn field_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        compilation_context::{ModuleData, ModuleId},
+        data::RuntimeErrorData,
+        runtime::RuntimeFunction,
+        test_tools::build_module,
+        translation::intermediate_types::{
+            VmHandledStruct,
+            enums::IEnumVariant,
+            structs::{IStruct, IStructType},
+        },
+    };
     use alloy_primitives::U256;
     use move_binary_format::file_format::StructDefinitionIndex;
     use rstest::rstest;
     use std::collections::HashMap;
-
-    use crate::compilation_context::{ModuleData, ModuleId};
-    use crate::runtime::RuntimeFunction;
-    use crate::test_tools::build_module;
-    use crate::translation::intermediate_types::{
-        VmHandledStruct,
-        enums::IEnumVariant,
-        structs::{IStruct, IStructType},
-    };
+    use std::sync::Arc;
     use walrus::{
         Module, ValType,
         ir::{LoadKind, MemArg},
@@ -274,8 +277,14 @@ mod tests {
         let root = Box::leak(Box::new(module_data));
         let deps = Box::leak(Box::new(HashMap::new()));
         // Create module with memory_id and allocator that will be shared
-        let (module, allocator, memory_id) = build_module(None);
-        let ctx = CompilationContext::new(root, deps, memory_id, allocator);
+        let (module, allocator, memory_id, calldata_reader_pointer_global) = build_module(None);
+        let ctx = CompilationContext::new(
+            root,
+            deps,
+            memory_id,
+            allocator,
+            calldata_reader_pointer_global,
+        );
         (ctx, module)
     }
 
@@ -283,13 +292,14 @@ mod tests {
     fn execute_compute_enum_storage_tail_position(
         module: &mut Module,
         compilation_ctx: &CompilationContext,
+        runtime_error_data: &mut RuntimeErrorData,
         itype: &IntermediateType,
         head_slot_ptr_data: [u8; 32],
         head_slot_offset_data: u32,
     ) -> Result<([u8; 32], u32), Box<dyn std::error::Error>> {
         // Get the runtime function that will be used by compute_enum_storage_tail_position
         let compute_enum_storage_tail_position_fn = RuntimeFunction::ComputeEnumStorageTailPosition
-            .get_generic(module, compilation_ctx, &[itype])
+            .get_generic(module, compilation_ctx, Some(runtime_error_data), &[itype])
             .unwrap();
 
         // Test function setup
@@ -338,7 +348,13 @@ mod tests {
             );
 
         let (tail_slot_ptr, tail_slot_offset) = entrypoint
-            .call(&mut store, (0_i32, head_slot_offset_data as i32))
+            .call(
+                &mut store,
+                (
+                    crate::test_tools::INITIAL_MEMORY_OFFSET,
+                    head_slot_offset_data as i32,
+                ),
+            )
             .map_err(|e| format!("WASM execution error: {e:?}"))?;
 
         // Read end_slot from the returned pointer
@@ -404,7 +420,7 @@ mod tests {
         #[case] expected_end_written_bytes: u32,
     ) {
         let enum_ = IEnum::new(
-            "TestEnum".to_string(),
+            "TestEnum",
             0,
             vec![
                 IEnumVariant::new(0, 0, vec![IntermediateType::IU8, IntermediateType::IU16]),
@@ -414,6 +430,7 @@ mod tests {
         .unwrap();
 
         let (ctx, mut module) = create_test_ctx(vec![], vec![enum_.clone()]);
+        let mut runtime_error_data = RuntimeErrorData::new();
         let compilation_ctx = &ctx;
 
         let result = compute_enum_storage_size(&enum_, head_offset, compilation_ctx).unwrap();
@@ -433,6 +450,7 @@ mod tests {
         let (tail_slot_bytes, tail_offset) = execute_compute_enum_storage_tail_position(
             &mut module,
             compilation_ctx,
+            &mut runtime_error_data,
             &itype,
             head_slot,
             head_offset,
@@ -508,7 +526,7 @@ mod tests {
         #[case] expected_tail_offset: u32,
     ) {
         let enum_ = IEnum::new(
-            "TestEnum".to_string(),
+            "TestEnum",
             0,
             vec![
                 IEnumVariant::new(
@@ -516,7 +534,7 @@ mod tests {
                     0,
                     vec![
                         IntermediateType::IAddress,
-                        IntermediateType::IVector(Box::new(IntermediateType::IU8)),
+                        IntermediateType::IVector(Arc::new(IntermediateType::IU8)),
                         IntermediateType::IU64,
                     ],
                 ),
@@ -524,7 +542,7 @@ mod tests {
                     1,
                     0,
                     vec![
-                        IntermediateType::IVector(Box::new(IntermediateType::IU8)),
+                        IntermediateType::IVector(Arc::new(IntermediateType::IU8)),
                         IntermediateType::IU64,
                         IntermediateType::IAddress,
                     ],
@@ -535,7 +553,7 @@ mod tests {
 
         let (ctx, mut module) = create_test_ctx(vec![], vec![enum_.clone()]);
         let compilation_ctx = &ctx;
-
+        let mut runtime_error_data = RuntimeErrorData::new();
         let head_offset_plus_variant = (head_offset + 1) % SLOT_SIZE;
 
         // Test each variant size
@@ -575,6 +593,7 @@ mod tests {
         let (tail_slot, tail_offset) = execute_compute_enum_storage_tail_position(
             &mut module,
             compilation_ctx,
+            &mut runtime_error_data,
             &itype,
             head_slot,
             head_offset,
@@ -611,7 +630,7 @@ mod tests {
 
         // Create a simple enum (no fields)
         let nested_enum_1 = IEnum::new(
-            "TestEnum".to_string(),
+            "TestEnum",
             0,
             vec![
                 IEnumVariant::new(0, 0, vec![]),
@@ -623,7 +642,7 @@ mod tests {
 
         // More complex enum
         let nested_enum_2 = IEnum::new(
-            "TestEnum2".to_string(),
+            "TestEnum2",
             0,
             vec![
                 IEnumVariant::new(
@@ -631,7 +650,7 @@ mod tests {
                     0,
                     vec![
                         IntermediateType::IAddress,
-                        IntermediateType::IVector(Box::new(IntermediateType::IU8)),
+                        IntermediateType::IVector(Arc::new(IntermediateType::IU8)),
                         IntermediateType::IU64,
                     ],
                 ),
@@ -639,7 +658,7 @@ mod tests {
                     1,
                     0,
                     vec![
-                        IntermediateType::IVector(Box::new(IntermediateType::IU8)),
+                        IntermediateType::IVector(Arc::new(IntermediateType::IU8)),
                         IntermediateType::IU64,
                         IntermediateType::IAddress,
                     ],
@@ -650,14 +669,14 @@ mod tests {
 
         // Create enum that contains the simple enum
         let enum_ = IEnum::new(
-            "TestEnum3".to_string(),
+            "TestEnum3",
             2,
             vec![
                 IEnumVariant::new(
                     0,
                     2,
                     vec![IntermediateType::IEnum {
-                        module_id: module_id.clone(),
+                        module_id,
                         index: 0,
                     }],
                 ),
@@ -665,7 +684,7 @@ mod tests {
                     1,
                     2,
                     vec![IntermediateType::IEnum {
-                        module_id: module_id.clone(),
+                        module_id,
                         index: 1,
                     }],
                 ),
@@ -678,7 +697,7 @@ mod tests {
             vec![nested_enum_1.clone(), nested_enum_2.clone(), enum_.clone()],
         );
         let compilation_ctx = &ctx;
-
+        let mut runtime_error_data = RuntimeErrorData::new();
         let head_offset_plus_variant = (head_offset + 1) % SLOT_SIZE;
 
         // Test each variant size
@@ -718,6 +737,7 @@ mod tests {
         let (tail_slot, tail_offset) = execute_compute_enum_storage_tail_position(
             &mut module,
             compilation_ctx,
+            &mut runtime_error_data,
             &itype,
             head_slot,
             head_offset,
@@ -757,13 +777,13 @@ mod tests {
         // Create a struct without key
         let child_struct_1 = IStruct::new(
             StructDefinitionIndex::new(0),
-            "ChildStruct1".to_string(),
+            "ChildStruct1",
             vec![
                 (None, IntermediateType::IU32), // 4
                 (None, IntermediateType::IU64), // 8
                 (
                     None,
-                    IntermediateType::IVector(Box::new(IntermediateType::IU8)),
+                    IntermediateType::IVector(Arc::new(IntermediateType::IU8)),
                 ), // 32
             ],
             HashMap::new(),
@@ -773,7 +793,7 @@ mod tests {
 
         let child_struct_2 = IStruct::new(
             StructDefinitionIndex::new(1),
-            "ChildStruct2".to_string(),
+            "ChildStruct2",
             vec![
                 (None, IntermediateType::IU32), // 4
                 (None, IntermediateType::IU64), // 8
@@ -786,19 +806,19 @@ mod tests {
         // Struct with key
         let child_struct_3 = IStruct::new(
             StructDefinitionIndex::new(2),
-            "ChildStruct3".to_string(),
+            "ChildStruct3",
             vec![
                 (
                     None,
                     IntermediateType::IStruct {
-                        module_id: module_id.clone(),
+                        module_id,
                         index: 0,
                         vm_handled_struct: VmHandledStruct::None,
                     },
                 ), // 8
                 (
                     None,
-                    IntermediateType::IVector(Box::new(IntermediateType::IU8)),
+                    IntermediateType::IVector(Arc::new(IntermediateType::IU8)),
                 ), // 32
             ],
             HashMap::new(),
@@ -807,14 +827,14 @@ mod tests {
         );
 
         let enum_ = IEnum::new(
-            "TestEnum".to_string(),
+            "TestEnum",
             0,
             vec![
                 IEnumVariant::new(
                     0,
                     0,
                     vec![IntermediateType::IStruct {
-                        module_id: module_id.clone(),
+                        module_id,
                         index: 0,
                         vm_handled_struct: VmHandledStruct::None,
                     }],
@@ -823,7 +843,7 @@ mod tests {
                     1,
                     0,
                     vec![IntermediateType::IStruct {
-                        module_id: module_id.clone(),
+                        module_id,
                         index: 1,
                         vm_handled_struct: VmHandledStruct::None,
                     }],
@@ -832,7 +852,7 @@ mod tests {
                     2,
                     0,
                     vec![IntermediateType::IStruct {
-                        module_id: module_id.clone(),
+                        module_id,
                         index: 2,
                         vm_handled_struct: VmHandledStruct::None,
                     }],
@@ -846,7 +866,7 @@ mod tests {
             vec![enum_.clone()],
         );
         let compilation_ctx = &ctx;
-
+        let mut runtime_error_data = RuntimeErrorData::new();
         let head_offset_plus_variant = (head_offset + 1) % SLOT_SIZE;
 
         // Test each variant size
@@ -886,6 +906,7 @@ mod tests {
         let (tail_slot, tail_offset) = execute_compute_enum_storage_tail_position(
             &mut module,
             compilation_ctx,
+            &mut runtime_error_data,
             &itype,
             head_slot,
             head_offset,

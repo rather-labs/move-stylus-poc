@@ -1,9 +1,13 @@
+// Copyright (c) 2025 Rather Labs, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 module erc721Utils::utils;
 
-use stylus::account as account;
-use stylus::contract_calls as ccc;
-use stylus::contract_calls::CrossContractCall;
-use stylus::contract_calls::ContractCallResult;
+use stylus::{
+    account as account, 
+    contract_calls as ccc, 
+    contract_calls::{CrossContractCall, ContractCallResult}
+};
 
 const EInvalidReceiver: u64 = 1;
 
@@ -23,7 +27,7 @@ public fun new(configuration: CrossContractCall): ERC721Receiver {
     ERC721Receiver(configuration)
 }
 
-#[ext(external_call, view)]
+#[ext(external_call(view))]
 public native fun on_erc721_received(
     self: &ERC721Receiver,
     operator: address,

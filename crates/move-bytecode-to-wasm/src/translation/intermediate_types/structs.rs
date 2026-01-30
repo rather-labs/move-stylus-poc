@@ -48,10 +48,10 @@ use std::collections::HashMap;
 use crate::{
     CompilationContext,
     abi_types::{
-        error::{AbiEncodingError, AbiError},
+        error::{AbiError, AbiOperationError},
         packing::Packable,
     },
-    compilation_context::ModuleData,
+    data::RuntimeErrorData,
     generics::replace_type_parameters,
     vm_handled_types::{VmHandledType, string::String_},
 };
@@ -65,6 +65,7 @@ use move_binary_format::{
     file_format::{FieldHandleIndex, StructDefinitionIndex},
     internals::ModuleIndex,
 };
+use move_symbol_pool::Symbol;
 use walrus::{InstrSeqBuilder, Module, ValType, ir::BinaryOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +79,7 @@ pub enum IStructType {
 #[derive(Debug, Clone)]
 pub struct IStruct {
     /// Struct identifier
-    pub identifier: String,
+    pub identifier: Symbol,
 
     /// Field's types ordered by index
     pub fields: Vec<IntermediateType>,
@@ -110,7 +111,7 @@ pub struct IStruct {
 impl IStruct {
     pub fn new(
         index: StructDefinitionIndex,
-        identifier: String,
+        identifier: &str,
         fields: Vec<(Option<FieldHandleIndex>, IntermediateType)>,
         fields_types: HashMap<FieldHandleIndex, IntermediateType>,
         has_key: bool,
@@ -129,7 +130,7 @@ impl IStruct {
 
         Self {
             struct_definition_index: index,
-            identifier,
+            identifier: Symbol::from(identifier),
             heap_size,
             field_offsets,
             fields_types,
@@ -144,7 +145,7 @@ impl IStruct {
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
     ) -> Result<(), IntermediateTypeError> {
         let s1_ptr = module.locals.add(ValType::I32);
         let s2_ptr = module.locals.add(ValType::I32);
@@ -156,7 +157,7 @@ impl IStruct {
             builder,
             module,
             compilation_ctx,
-            module_data,
+            runtime_error_data,
             s1_ptr,
             s2_ptr,
         )?;
@@ -169,7 +170,7 @@ impl IStruct {
         module: &mut Module,
         builder: &mut InstrSeqBuilder,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
     ) -> Result<(), IntermediateTypeError> {
         let src_ptr = module.locals.add(ValType::I32);
         let ptr = module.locals.add(ValType::I32);
@@ -200,7 +201,7 @@ impl IStruct {
             builder,
             module,
             compilation_ctx,
-            module_data,
+            runtime_error_data,
             src_ptr,
             ptr,
             0,
@@ -261,12 +262,16 @@ impl IStruct {
                         return Ok(true);
                     }
                 }
-                IntermediateType::ISigner => return Err(AbiEncodingError::FoundSignerType)?,
+                IntermediateType::ISigner => {
+                    return Err(AbiError::AbiEncoding(AbiOperationError::FoundSignerType))?;
+                }
                 IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
-                    return Err(AbiEncodingError::RefInsideRef)?;
+                    return Err(AbiError::AbiEncoding(AbiOperationError::RefInsideRef))?;
                 }
                 IntermediateType::ITypeParameter(_) => {
-                    return Err(AbiEncodingError::GenericTypeParameterIsDynamic)?;
+                    return Err(AbiError::AbiEncoding(
+                        AbiOperationError::GenericTypeParameterIsDynamic,
+                    ))?;
                 }
             }
         }
@@ -305,12 +310,16 @@ impl IStruct {
                         size += field.encoded_size(compilation_ctx)?;
                     }
                 }
-                IntermediateType::ISigner => return Err(AbiEncodingError::FoundSignerType)?,
+                IntermediateType::ISigner => {
+                    return Err(AbiError::AbiEncoding(AbiOperationError::FoundSignerType))?;
+                }
                 IntermediateType::IRef(_) | IntermediateType::IMutRef(_) => {
-                    return Err(AbiEncodingError::RefInsideRef)?;
+                    return Err(AbiError::AbiEncoding(AbiOperationError::RefInsideRef))?;
                 }
                 IntermediateType::ITypeParameter(_) => {
-                    return Err(AbiEncodingError::FoundGenericTypeParameter)?;
+                    return Err(AbiError::AbiEncoding(
+                        AbiOperationError::FoundGenericTypeParameter,
+                    ))?;
                 }
             }
         }
@@ -344,7 +353,7 @@ impl IStruct {
 
         Self {
             fields,
-            identifier: self.identifier.clone(),
+            identifier: self.identifier,
             fields_types,
             field_offsets,
             struct_definition_index: StructDefinitionIndex::new(

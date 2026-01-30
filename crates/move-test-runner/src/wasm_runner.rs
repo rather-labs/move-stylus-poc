@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use std::{
     collections::HashMap,
     path::Path,
@@ -582,6 +585,100 @@ impl RuntimeSandbox {
         link_test_fn_write_u64_constant!(linker, "set_block_timestamp", current_timestamp);
         link_test_fn_write_u64_constant!(linker, "set_chain_id", current_chain_id);
 
+        linker
+            .func_wrap("", "print_i64", |param: i64| {
+                println!("--- i64 ---> {param}");
+            })
+            .unwrap();
+
+        linker
+            .func_wrap("", "print_i32", |param: i32| {
+                println!("--- i32 ---> Dec: {param} Hex: {param:#x} Bin: {param:#b}");
+            })
+            .unwrap();
+
+        linker
+            .func_wrap("", "print_separator", || {
+                println!("-----------------------------------------------");
+            })
+            .unwrap();
+
+        linker
+            .func_wrap(
+                "",
+                "print_u128",
+                |mut caller: Caller<'_, ModuleData>, ptr: i32| {
+                    println!("--- u128 ---\nPointer {ptr}");
+
+                    let memory = match caller.get_export("memory") {
+                        Some(wasmtime::Extern::Memory(mem)) => mem,
+                        _ => panic!("failed to find host memory"),
+                    };
+
+                    let mut result = [0; 16];
+                    memory.read(&caller, ptr as usize, &mut result).unwrap();
+                    println!("Data {result:?}");
+                    println!("Decimal data {}", u128::from_le_bytes(result));
+                    println!("--- end u128 ---\n");
+                },
+            )
+            .unwrap();
+
+        linker
+            .func_wrap(
+                "",
+                "print_memory_from",
+                |mut caller: Caller<'_, ModuleData>, ptr: i32, len: i32| {
+                    let memory = match caller.get_export("memory") {
+                        Some(wasmtime::Extern::Memory(mem)) => mem,
+                        _ => panic!("failed to find host memory"),
+                    };
+
+                    let mut result = vec![0; len as usize];
+                    memory.read(&caller, ptr as usize, &mut result).unwrap();
+                    println!("Data {result:?}");
+                    println!("Pointer {ptr}");
+
+                    println!("In chunks of 32 bytes:");
+                    for chunk in result.chunks(32) {
+                        // print each byte in hex, for example
+                        for b in chunk {
+                            print!("{b:?} ");
+                        }
+                        println!(); // newline after each 32‑byte chunk
+                    }
+
+                    println!("--- --- ---\n");
+                },
+            )
+            .unwrap();
+
+        linker
+            .func_wrap(
+                "",
+                "print_address",
+                |mut caller: Caller<'_, ModuleData>, ptr: i32| {
+                    println!("--- address ---\nPointer {ptr}");
+
+                    let memory = match caller.get_export("memory") {
+                        Some(wasmtime::Extern::Memory(mem)) => mem,
+                        _ => panic!("failed to find host memory"),
+                    };
+
+                    let mut result = [0; 32];
+                    memory.read(&caller, ptr as usize, &mut result).unwrap();
+                    println!(
+                        "Data 0x{}",
+                        result[12..]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    );
+                    println!("--- end address ---\n");
+                },
+            )
+            .unwrap();
+
         Self {
             engine,
             linker,
@@ -691,11 +788,32 @@ impl RuntimeSandbox {
         })
     }
 
-    pub fn obtain_uid(&self) -> FixedBytes<32> {
-        let (topic, data) = self.log_events.lock().unwrap().recv().unwrap();
-        assert_eq!(2, topic);
-        assert_eq!(*keccak256(b"NewUID(address)").as_slice(), data[..32]);
-        FixedBytes::<32>::from_slice(&data[32..])
+    pub fn obtain_uid(&self) -> Result<FixedBytes<32>, anyhow::Error> {
+        use std::sync::mpsc::TryRecvError;
+
+        let rx = self.log_events.lock().unwrap();
+        match rx.try_recv() {
+            Ok((topic, data)) => {
+                if topic != 2 {
+                    return Err(anyhow::anyhow!(
+                        "Unexpected event topic: expected 2, got {}",
+                        topic
+                    ));
+                }
+                if *keccak256(b"NewUID(bytes32)").as_slice() != data[..32] {
+                    return Err(anyhow::anyhow!(
+                        "Unexpected event: first 32 bytes do not match NewUID(bytes32) event signature"
+                    ));
+                }
+                Ok(FixedBytes::<32>::from_slice(&data[32..]))
+            }
+            Err(TryRecvError::Empty) => Err(anyhow::anyhow!(
+                "No NewUID(bytes32) event currently available"
+            )),
+            Err(TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("Log event channel is disconnected"))
+            }
+        }
     }
 
     pub fn read_memory_from(

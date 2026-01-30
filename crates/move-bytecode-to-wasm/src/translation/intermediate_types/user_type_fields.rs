@@ -8,7 +8,7 @@ use walrus::{
     ir::{BinaryOp, LoadKind, MemArg, StoreKind},
 };
 
-use crate::{CompilationContext, compilation_context::ModuleData};
+use crate::{CompilationContext, data::RuntimeErrorData};
 
 use super::{IntermediateType, error::IntermediateTypeError};
 
@@ -30,7 +30,7 @@ impl UserTypeFields {
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
         src_ptr: LocalId,
         dst_ptr: LocalId,
         start_offset: u32,
@@ -49,20 +49,10 @@ impl UserTypeFields {
                 | IntermediateType::IU16
                 | IntermediateType::IU32
                 | IntermediateType::IU64 => {
-                    let data_size = field.stack_data_size()?;
-                    let (val, load_kind, store_kind) = if data_size == 8 {
-                        (
-                            val_64,
-                            LoadKind::I64 { atomic: false },
-                            StoreKind::I64 { atomic: false },
-                        )
-                    } else {
-                        (
-                            val_32,
-                            LoadKind::I32 { atomic: false },
-                            StoreKind::I32 { atomic: false },
-                        )
-                    };
+                    let data_size = field.wasm_memory_data_size()?;
+                    let val = if data_size == 8 { val_64 } else { val_32 };
+                    let load_kind = field.load_kind()?;
+                    let store_kind = field.store_kind()?;
 
                     // Load intermediate pointer and value
                     builder
@@ -84,7 +74,7 @@ impl UserTypeFields {
 
                     // Create a pointer for the value
                     builder
-                        .i32_const(data_size as i32)
+                        .i32_const(data_size)
                         .call(compilation_ctx.allocator)
                         .local_tee(ptr_to_data);
 
@@ -118,7 +108,7 @@ impl UserTypeFields {
                         module,
                         builder,
                         compilation_ctx,
-                        module_data,
+                        runtime_error_data,
                         ptr_to_data,
                     )?;
 
@@ -166,7 +156,7 @@ impl UserTypeFields {
         builder: &mut InstrSeqBuilder,
         module: &mut Module,
         compilation_ctx: &CompilationContext,
-        module_data: &ModuleData,
+        runtime_error_data: &mut RuntimeErrorData,
         ptr_1: LocalId,
         ptr_2: LocalId,
     ) -> Result<(), IntermediateTypeError> {
@@ -174,11 +164,11 @@ impl UserTypeFields {
         builder.i32_const(1).local_set(result);
 
         let load_value_to_stack = |field: &IntermediateType, builder: &mut InstrSeqBuilder<'_>| {
-            match field.stack_data_size() {
-                Ok(8) => {
+            match field.load_kind() {
+                Ok(load_kind) => {
                     builder.load(
                         compilation_ctx.memory_id,
-                        LoadKind::I64 { atomic: false },
+                        load_kind,
                         MemArg {
                             align: 0,
                             offset: 0,
@@ -186,16 +176,6 @@ impl UserTypeFields {
                     );
                 }
                 Err(e) => return Err(e),
-                _ => {
-                    builder.load(
-                        compilation_ctx.memory_id,
-                        LoadKind::I32 { atomic: false },
-                        MemArg {
-                            align: 0,
-                            offset: 0,
-                        },
-                    );
-                }
             }
 
             Ok(())
@@ -234,7 +214,7 @@ impl UserTypeFields {
                         module,
                         block,
                         compilation_ctx,
-                        module_data,
+                        runtime_error_data,
                     )?;
 
                     block.if_else(

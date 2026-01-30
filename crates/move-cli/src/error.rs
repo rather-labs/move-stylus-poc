@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 //! This module is in charge of processing the move-bytecode-to-wasm errors
 
 use std::{backtrace::BacktraceStatus, error::Error, process::exit};
@@ -5,7 +8,7 @@ use std::{backtrace::BacktraceStatus, error::Error, process::exit};
 use move_bytecode_to_wasm::error::CompilationError;
 use move_compiler::diagnostics::{Diagnostics, report_diagnostics};
 
-const GITHUB_URL: &str = "https://github.com/rather-labs/move-stylus-poc";
+const GITHUB_URL: &str = "https://github.com/rather-labs/move-stylus";
 
 const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CLI_NAME: &str = env!("CARGO_PKG_NAME");

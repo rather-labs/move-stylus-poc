@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 pub mod constants;
 pub mod wasm_runner;
 
@@ -9,7 +12,6 @@ use wasm_runner::RuntimeSandbox;
 const RESET: &str = "\x1b[0m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 
 pub fn run_tests(
@@ -25,7 +27,7 @@ pub fn run_tests(
 
     let mut compiled_wasm = compiled_modules_path
         .to_path_buf()
-        .join(&module_id.module_name);
+        .join(module_id.module_name.as_str());
     compiled_wasm.set_extension("wasm");
 
     let mut failures = Vec::new();
@@ -40,11 +42,6 @@ pub fn run_tests(
             }
         );
         let runtime = RuntimeSandbox::from_path(&compiled_wasm);
-
-        if test.skip {
-            println!("{YELLOW}SKIPPED{RESET}");
-            continue;
-        }
 
         let result = runtime.call_test_function(&test.name).unwrap();
         match (result.execution_aborted, test.expect_failure) {

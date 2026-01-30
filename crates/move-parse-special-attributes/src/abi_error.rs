@@ -1,9 +1,15 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use move_compiler::{
     diagnostics::codes::{DiagnosticInfo, Severity, custom},
     parser::ast::{Ability_, Attribute_, StructDefinition},
 };
 
-use crate::{SpecialAttributeError, error::SpecialAttributeErrorKind};
+use crate::{
+    SpecialAttributeError,
+    error::{DIAGNOSTIC_CATEGORY, SpecialAttributeErrorKind},
+};
 
 #[derive(Debug)]
 pub struct AbiError {
@@ -28,7 +34,7 @@ pub enum AbiErrorParseError {
 impl From<&AbiErrorParseError> for DiagnosticInfo {
     fn from(value: &AbiErrorParseError) -> Self {
         custom(
-            "Abi error parsing error",
+            DIAGNOSTIC_CATEGORY,
             Severity::BlockingError,
             3,
             3,

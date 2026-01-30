@@ -1,10 +1,14 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use std::collections::HashSet;
 
 use move_compiler::parser::ast::{Function, FunctionBody_, NameAccessChain_, Type_};
+use move_symbol_pool::Symbol;
 
 use crate::{
     ExternalCallFunctionError, SpecialAttributeError, error::SpecialAttributeErrorKind,
-    function_modifiers::FunctionModifier, shared::get_single_type_name,
+    function_modifiers::SolidityFunctionModifier, shared::get_single_type_name,
 };
 
 const FN_RESULT_EMPTY_STRUCT_NAME: &str = "ContractCallEmptyResult";
@@ -52,7 +56,7 @@ fn body_is_native(function: &Function) -> bool {
 
 fn check_first_parameter_is_external_struct(
     function: &Function,
-    external_call_structs: &HashSet<String>,
+    external_call_structs: &HashSet<Symbol>,
 ) -> bool {
     if let Some((_, _, type_)) = function.signature.parameters.first() {
         if let Some(name) = get_single_type_name(&type_.value) {
@@ -67,8 +71,8 @@ fn check_first_parameter_is_external_struct(
 
 pub(crate) fn validate_external_call_function(
     function: &Function,
-    _modifiers: &[FunctionModifier],
-    external_call_structs: &HashSet<String>,
+    _modifiers: &[SolidityFunctionModifier],
+    external_call_structs: &HashSet<Symbol>,
 ) -> Result<(), Vec<SpecialAttributeError>> {
     let mut errors = Vec::new();
 

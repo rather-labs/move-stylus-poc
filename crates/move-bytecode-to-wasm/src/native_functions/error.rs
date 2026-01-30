@@ -1,4 +1,9 @@
+// Copyright (c) 2025 Rather Labs
+// SPDX-License-Identifier: BUSL-1.1
+
 use std::rc::Rc;
+
+use move_symbol_pool::Symbol;
 
 use crate::{
     abi_types::error::AbiError,
@@ -78,7 +83,7 @@ pub enum NativeFunctionError {
 
     // Emit function section
     #[error(r#"trying to emit log with the struct {0} which is not an event"#)]
-    EmitFunctionNoEvent(String),
+    EmitFunctionNoEvent(Symbol),
 
     #[error(r#"invalid event field {0:?}"#)]
     EmitFunctionInvalidEventField(IntermediateType),
@@ -90,7 +95,7 @@ pub enum NativeFunctionError {
 
     // revert function section
     #[error(r#"trying to revert with the struct "{0}" which is not an error"#)]
-    RevertFunctionNoError(String),
+    RevertFunctionNoError(Symbol),
 }
 
 impl From<AbiError> for NativeFunctionError {
